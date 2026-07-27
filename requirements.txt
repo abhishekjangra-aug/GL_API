@@ -1,0 +1,14 @@
+# Python dependencies for the Augmont Gold Loan API test harness (src/maintest.py).
+# Install with:  pip install -r requirements.txt
+#
+# Note: a Node.js runtime with the `crypto-js` package is ALSO required (see package.json / README);
+# it is not a Python dependency and cannot be installed via pip.
+
+# Core — always needed
+httpx==0.28.1        # async HTTP client for all API calls
+PyJWT==2.13.0        # decode the login JWT (internalBranchId / user id)
+
+# Only used to auto-generate placeholder upload assets if they are missing from the repo
+# (dummy_image.png and src/CPV.pdf ship with the project, so these are effectively fallback-only).
+Pillow==12.3.0       # generates dummy_image.png if absent
+reportlab==5.0.0     # generates a placeholder PDF if src/CPV.pdf is absent
