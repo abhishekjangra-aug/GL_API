@@ -17,10 +17,49 @@ import subprocess
 
 class GoldLoanApiTest:
 
+    # --- Environment profiles -----------------------------------------------------------------
+    # The harness runs against either TEST (gfat) or UAT (gfau). EVERYTHING that differs between
+    # the two lives here -- the API host and the login mobiles of every role the flow hands the
+    # loan to. Pick with `--env {test|uat}` or GOLD_LOAN_ENV (default: test).
+    #   role_mobiles         -- internal staff logins (static OTP 1234).
+    #   partner_mobiles      -- partner login used for approval + disbursement, keyed by partner id
+    #                           (Roshan Partner = 152, Arvog = 10).
+    #   partner_user_mobiles -- partner-BRANCH user who receives the packet at submit-packet, keyed
+    #                           by the same partner id. Test only has Roshan's captured.
+    # Anything else that is environment-specific (packet location id, partner branch id) is
+    # resolved live from the API in submit_packet rather than pinned per environment.
+    ENVIRONMENTS = {
+        "test": {
+            "base_url": "https://gold-loan-backend-api.gfat.augmont.com",
+            "role_mobiles": {"admin": "8880008880", "appraiser": "8880008881",
+                             "ops": "8880008882", "bm": "8880008883"},
+            "partner_mobiles": {"152": "8767002003", "10": "9375876473"},
+            "partner_user_mobiles": {"152": "8652849318",   # roshan ghadge (id 170)
+                                     "10": "8899999999"},   # arvog branch user
+        },
+        "uat": {
+            "base_url": "https://gold-loan-backend-api.gfau.augmont.com",
+            "role_mobiles": {"admin": "9990009990", "appraiser": "9990009991",
+                             "ops": "9990009995", "bm": "9990009993"},
+            "partner_mobiles": {"152": "8767002002", "10": "8846651348"},  # ROSHAN PARTNER / ARVOG ARV10
+            "partner_user_mobiles": {"152": "8652849318",   # ROSHAN GHADGE
+                                     "10": "8888888880"},   # ARVOG Qa Test
+        },
+    }
+    DEFAULT_ENV = "test"
+
     def __init__(self):
         # --- Configuration ---
+        # Environment selection first: it supplies the base URL and every role login mobile.
+        # GOLD_LOAN_BASE_URL still wins outright if someone points the run at another host.
+        self.env_name = (os.getenv("GOLD_LOAN_ENV") or self.DEFAULT_ENV).strip().lower()
+        if self.env_name not in self.ENVIRONMENTS:
+            raise ValueError(f"Unknown environment '{self.env_name}'. "
+                             f"Choose one of {sorted(self.ENVIRONMENTS)} "
+                             f"(--env / GOLD_LOAN_ENV).")
+        self.env = self.ENVIRONMENTS[self.env_name]
         self.BASE_URL = os.getenv(
-            "GOLD_LOAN_BASE_URL", "https://gold-loan-backend-api.gfat.augmont.com"
+            "GOLD_LOAN_BASE_URL", self.env["base_url"]
         ).rstrip("/")
         self.HMAC_SECRET = os.getenv(
             "GOLD_LOAN_HMAC_SECRET",
@@ -544,7 +583,7 @@ class GoldLoanApiTest:
         return aadhaar_number
 
     def _encrypt_identity_proof_number(self, value: str) -> str:
-        """Match the CryptoJS encryption used by the gfat web application."""
+        """Match the CryptoJS encryption used by the Augmont gold-loan web application."""
         script = """
         const CryptoJS = require('crypto-js');
         let input = '';
@@ -588,32 +627,51 @@ class GoldLoanApiTest:
     def _round_double(self, value, places):
         return round(value, places)
 
-    # Partner login mobile depends on WHICH partner underwrites the loan (each partner has its own
-    # login for approval + disbursement). Keyed by partner id: Roshan (152), Arvog (10).
-    PARTNER_LOGIN_MOBILES = {"152": "8767002003", "10": "9375876473"}
+    ROSHAN_PARTNER_ID = "152"
+    ARVOG_PARTNER_ID = "10"
+
+    def _partner_key(self) -> str:
+        """Which partner this run is underwritten by, as a key into the environment's partner
+        mobile maps. Keys on self.partner_id (resolved during scheme selection), falling back to
+        GOLD_LOAN_PARTNER_NAME before the partner is known, and defaults to Roshan."""
+        if str(self.partner_id) in (self.ROSHAN_PARTNER_ID, self.ARVOG_PARTNER_ID):
+            return str(self.partner_id)
+        if "ARVOG" in os.getenv("GOLD_LOAN_PARTNER_NAME", "").upper():
+            return self.ARVOG_PARTNER_ID
+        return self.ROSHAN_PARTNER_ID
 
     def _partner_login_mobile(self) -> str:
-        """Return the partner's login mobile for the currently selected partner (used for the
-        approval + disbursement steps). Keys on self.partner_id, falling back to GOLD_LOAN_PARTNER_NAME,
-        and defaults to Roshan's number."""
-        if str(self.partner_id) in self.PARTNER_LOGIN_MOBILES:
-            return self.PARTNER_LOGIN_MOBILES[str(self.partner_id)]
-        if "ARVOG" in os.getenv("GOLD_LOAN_PARTNER_NAME", "").upper():
-            return "9375876473"
-        return "8767002003"  # default: Roshan Partner
+        """Partner login mobile for the currently selected partner (approval + disbursement).
+        Each partner has its own login, and the numbers differ per environment."""
+        mobiles = self.env["partner_mobiles"]
+        key = self._partner_key()
+        if key not in mobiles:
+            raise ValueError(f"No partner login mobile configured for partner {key} in the "
+                             f"'{self.env_name}' environment (known: {sorted(mobiles)}).")
+        return mobiles[key]
+
+    def _partner_user_mobile(self) -> str:
+        """Partner-BRANCH user who receives the packet at submit-packet, for the selected partner
+        and environment. GOLD_LOAN_PARTNER_USER_MOBILE overrides (e.g. a partner whose branch user
+        isn't in the profile yet)."""
+        override = os.getenv("GOLD_LOAN_PARTNER_USER_MOBILE", "").strip()
+        if override:
+            return override
+        users = self.env["partner_user_mobiles"]
+        key = self._partner_key()
+        if key not in users:
+            raise ValueError(f"No partner-branch user mobile configured for partner {key} in the "
+                             f"'{self.env_name}' environment (known: {sorted(users)}). Set "
+                             f"GOLD_LOAN_PARTNER_USER_MOBILE to supply one.")
+        return users[key]
 
     def _get_mobile_number_for_login_type(self, login_type: str) -> str:
-        # Role -> mobile. Static OTP 1234 for all. admin: packet create/assign; bm: BM approval
-        # (loans > 5L); ops: ops rating (final approval). appraiser: the main loan-flow actor.
-        # partner: approval + disbursement, resolved per selected partner (Roshan/Arvog).
+        # Role -> mobile, per environment. Static OTP 1234 for all. admin: packet create/assign;
+        # bm: BM approval (loans > 5L); ops: ops rating (final approval); appraiser: the main
+        # loan-flow actor. partner: approval + disbursement, resolved per selected partner.
         if login_type == "partner":
             return self._partner_login_mobile()
-        mobiles = {
-            "admin": "8880008880",
-            "appraiser": "8880008881",
-            "ops": "8880008882",
-            "bm": "8880008883",
-        }
+        mobiles = self.env["role_mobiles"]
         if login_type not in mobiles:
             raise ValueError(f"Invalid login_type '{login_type}'. Must be one of "
                              f"{sorted(mobiles) + ['partner']}.")
@@ -3355,8 +3413,8 @@ class GoldLoanApiTest:
 
     async def submit_bm_rating_if_required(self):
         """BM approval is only needed when the loan amount exceeds 5L. BM rating must be posted
-        under the BM's own login (8880008883/OTP 1234), so swap to a BM role token for just this
-        call and restore the appraiser session afterwards."""
+        under the BM's own login (per-environment mobile, OTP 1234), so swap to a BM role token for
+        just this call and restore the appraiser session afterwards."""
         amount = float(self.final_loan_amount) if self.final_loan_amount else 0.0
         if amount <= self.BM_RATING_THRESHOLD:
             print(f"BM rating skipped: loan amount {amount:.2f} <= {self.BM_RATING_THRESHOLD} threshold.")
@@ -3370,7 +3428,7 @@ class GoldLoanApiTest:
             self.auth_token = saved_token
 
     async def submit_ops_rating(self):
-        """Ops rating (final approval) must be posted under the Ops login (8880008882/OTP 1234).
+        """Ops rating (final approval) must be posted under the Ops login (per env, OTP 1234).
         Swap to an ops role token for just this call, then restore the appraiser session."""
         saved_token = self.auth_token
         try:
@@ -3990,7 +4048,7 @@ class GoldLoanApiTest:
 
     async def disburse_amount(self):
         """Disburse the loan to the customer's bank account. Runs under the PARTNER login
-        (8767002003, OTP 1234) -- disbursement is the partner's action -- then restores the
+        (per env + selected partner, OTP 1234) -- disbursement is the partner's action -- then restores the
         appraiser session. Body is sourced from disbursement-loan-bank-detail so amounts/scheme
         always match the server's view of this loan."""
         saved_token = self.auth_token
@@ -4119,17 +4177,20 @@ class GoldLoanApiTest:
         print(f"Disbursement successful: {msg}")
 
     # --- Submit packet (appraiser) --------------------------------------------------------------
-    # Environment constants for the partner-branch collection point (from submit-packet HAR / Roshan
-    # partner). The packet is handed to the partner user who signs off with an OTP (static 1234).
-    PACKET_LOCATION_ID = "4"          # Roshan partner collection location
-    PARTNER_USER_MOBILE = "8652849318"  # partner user (roshan ghadge)
-    PARTNER_BRANCH_ID = "146"
+    # The packet is handed over at the partner-branch collection point, to a partner user who signs
+    # off with an OTP (static 1234). The location and branch ids differ per environment/partner, so
+    # they are resolved live (location by name from /api/packet-location, branch from the partner
+    # record) and these values are only fallbacks / overrides.
+    PACKET_LOCATION_NAME = "partner branch in"
+    PACKET_LOCATION_ID = "4"          # fallback: "partner branch in" on test
+    PARTNER_BRANCH_ID = "146"         # fallback: Roshan / Nerul Navi Mumbai on test
 
     async def submit_packet(self):
         """Hand the sealed packet to the partner branch to complete the loan. Runs as the appraiser:
         view packets -> resolve partner location/user -> partner-user OTP (1234) -> submit-packet-
-        location. Uses env constants for the partner collection point (location 4, partner user
-        8652849318, branch 146)."""
+        location. The collection point is resolved from the API for the running environment: the
+        "partner branch in" packet location, the selected partner's branch, and that partner's
+        branch user (per-environment mobile)."""
         await self.update_loan_lock()
 
         # 1. The sealed packet(s) for this loan -> barcode + packetUniqueId for submit-packet-location.
@@ -4143,28 +4204,56 @@ class GoldLoanApiTest:
                     barcodes.append({"Barcode": bc.upper(), "packetId": bc})
         assert barcodes, f"No packets found for masterLoanId {self.master_loan_id}"
 
-        # 2. Partner location details (partnerId + name) for the chosen collection location.
-        await self._make_authenticated_request('GET', "/api/packet-location?search=&from=1&to=-1")
+        # 2. Partner location details (partnerId + name) for the chosen collection location. The
+        #    "partner branch in" location id is looked up by name so it holds on any environment.
+        locs = await self._make_authenticated_request('GET', "/api/packet-location?search=&from=1&to=-1")
+        packet_location_id = os.getenv("GOLD_LOAN_PACKET_LOCATION_ID", "").strip() or self.PACKET_LOCATION_ID
+        for entry in (locs.json().get("data") or []):
+            if str(entry.get("location", "")).strip().lower() == self.PACKET_LOCATION_NAME:
+                packet_location_id = str(entry.get("id"))
+                break
         loc = await self._make_authenticated_request(
             'GET', f"/api/packet-tracking/get-particular-location"
-                   f"?packetLocationId={self.PACKET_LOCATION_ID}&masterLoanId={self.master_loan_id}")
+                   f"?packetLocationId={packet_location_id}&masterLoanId={self.master_loan_id}")
         loc_data = loc.json().get("data", {}) if isinstance(loc.json(), dict) else {}
-        partner_id = loc_data.get("id") or (int(self.partner_id) if str(self.partner_id).isdigit() else 152)
+        default_partner_id = int(self.partner_id) if str(self.partner_id).isdigit() else int(self.ROSHAN_PARTNER_ID)
+        partner_id = loc_data.get("id") or default_partner_id
         partner_name = loc_data.get("name") or "Roshan Partner"
 
-        # 3. Resolve the partner user who receives the packet.
-        un = await self._make_authenticated_request(
-            'GET', f"/api/packet-tracking/user-name?mobileNumber={self.PARTNER_USER_MOBILE}"
-                   f"&receiverType=PartnerUser&partnerBranchId={self.PARTNER_BRANCH_ID}"
-                   f"&masterLoanId={self.master_loan_id}&allUsers=1")
-        un_data = un.json().get("data", {}) if isinstance(un.json(), dict) else {}
+        # 3. Resolve the partner user who receives the packet: the mobile comes from the environment
+        #    profile, the branch from the partner record just fetched (branch ids are env-specific).
+        #    The user only resolves under the branch they belong to, so try the partner's branches in
+        #    order and keep the first that returns a user.
+        partner_user_mobile = self._partner_user_mobile()
+        forced_branch = os.getenv("GOLD_LOAN_PARTNER_BRANCH_ID", "").strip()
+        if forced_branch:
+            branch_candidates = [forced_branch]
+        else:
+            branch_candidates = [str(b.get("id")) for b in (loc_data.get("partnerBranch") or [])
+                                 if b.get("id")] or [self.PARTNER_BRANCH_ID]
+        partner_branch_id, un_data = branch_candidates[0], {}
+        for candidate in branch_candidates:
+            un = await self._make_authenticated_request(
+                'GET', f"/api/packet-tracking/user-name?mobileNumber={partner_user_mobile}"
+                       f"&receiverType=PartnerUser&partnerBranchId={candidate}"
+                       f"&masterLoanId={self.master_loan_id}&allUsers=1")
+            data = un.json().get("data") if isinstance(un.json(), dict) else None
+            if isinstance(data, dict) and data.get("id"):
+                partner_branch_id, un_data = candidate, data
+                break
         partner_receiver_id = un_data.get("id")
         user_full = f"{un_data.get('firstName','')} {un_data.get('lastName','')}".strip()
+        print(f"Packet handover -> location {packet_location_id} ({self.PACKET_LOCATION_NAME}), "
+              f"partner {partner_name}, branch {partner_branch_id}, "
+              f"user {user_full or partner_user_mobile}.")
+        if not partner_receiver_id:
+            print(f"WARNING: no PartnerUser resolved for {partner_user_mobile} in branches "
+                  f"{branch_candidates} — submit-packet will likely be rejected.")
 
         # 4. Partner-user OTP handshake (static OTP 1234).
         send = await self._make_authenticated_request(
             'POST', "/api/partner-user-otp/send-otp",
-            json_data={"mobileNumber": self.PARTNER_USER_MOBILE,
+            json_data={"mobileNumber": partner_user_mobile,
                        "id": int(self.logged_in_user_id) if self.logged_in_user_id else None,
                        "type": "updateLocationCollect", "masterLoanId": int(self.master_loan_id)})
         ref = send.json().get("referenceCode")
@@ -4174,9 +4263,9 @@ class GoldLoanApiTest:
 
         # 5. Submit the packet to the partner location.
         request_body = {
-            "packetLocationId": self.PACKET_LOCATION_ID,
+            "packetLocationId": packet_location_id,
             "barcodeNumber": barcodes,
-            "mobileNumber": self.PARTNER_USER_MOBILE,
+            "mobileNumber": partner_user_mobile,
             "user": user_full,
             "receiverType": "PartnerUser",
             "otp": "1234", "referenceCode": ref,
@@ -4185,7 +4274,7 @@ class GoldLoanApiTest:
             "loanId": int(self.loan_id) if self.loan_id else None,
             "masterLoanId": int(self.master_loan_id) if self.master_loan_id else None,
             "partnerId": partner_id, "partnerName": partner_name,
-            "partnerBranchId": self.PARTNER_BRANCH_ID,
+            "partnerBranchId": partner_branch_id,
             "internalBranchId": None, "deliveryPacketLocationId": None,
             "deliveryInternalBranchId": None, "deliveryPartnerBranchId": None,
             "deliveryPartnerName": None, "id": None, "releaseId": None, "role": None,
@@ -4242,7 +4331,9 @@ class GoldLoanApiTest:
     async def run_e2e_test(self, login_type: str):
         self._banner(
             "GOLD LOAN - END-TO-END API TEST",
-            f"login={login_type}   base={self.BASE_URL}   log={self.log_level}",
+            f"env={self.env_name.upper()}   login={login_type} "
+            f"({self._get_mobile_number_for_login_type(login_type)})   "
+            f"base={self.BASE_URL}   log={self.log_level}",
         )
         try:
             self._log_step("Authentication")
@@ -4328,18 +4419,18 @@ class GoldLoanApiTest:
             await self.fetch_applied_loan_details()
 
             self._log_step("BM Rating (only if loan amount > 5L)")
-            await self.submit_bm_rating_if_required()  # BM login 8880008883, conditional on > 5L
+            await self.submit_bm_rating_if_required()  # BM login (per env), conditional on > 5L
 
             self._log_step("Upload Documents")
             await self.store_loan_documents()
 
             self._log_step("Ops Rating (final approval)")
-            await self.submit_ops_rating()   # Ops login 8880008882
+            await self.submit_ops_rating()   # Ops login (per env)
             await self.fetch_loan_stages()
             await self.fetch_applied_loan_details()
 
             self._log_step("Disbursement (partner login)")
-            await self.disburse_amount()     # Partner login 8767002003
+            await self.disburse_amount()     # Partner login (per env + selected partner)
             await self.fetch_loan_stages()
             await self.fetch_applied_loan_details()
 
@@ -4419,8 +4510,11 @@ def main():
 
     Either way the run goes end-to-end: (customer/KYC ->) appraiser request -> ornaments ->
     scheme/eligibility -> bank details -> assign packet -> ratings -> disbursement -> submit packet
-    -> load loan details. Optional flags below choose the customer, partner/scheme, co-lending, and
-    loan amount.
+    -> load loan details. Optional flags below choose the environment, customer, partner/scheme,
+    co-lending, and loan amount.
+
+    Both modes run on either environment -- `--env test` (gfat, default) or `--env uat` (gfau);
+    the environment selects the base URL and every role/partner login mobile.
     """
     import argparse
     parser = argparse.ArgumentParser(
@@ -4434,8 +4528,13 @@ def main():
                "  python src/maintest.py --partner arvog          # loan under the Arvog (ARV10) partner\n"
                "  python src/maintest.py --co-lender              # pick a co-lender from a menu\n"
                "  python src/maintest.py --co-lender DCB          # co-lending with a named bank\n"
-               "  python src/maintest.py --scheme 853 --amount 550000\n",
+               "  python src/maintest.py --scheme 853 --amount 550000\n"
+               "  python src/maintest.py --env uat                # run the whole flow on UAT (gfau)\n",
     )
+    parser.add_argument("--env", choices=sorted(GoldLoanApiTest.ENVIRONMENTS),
+                        default=os.getenv("GOLD_LOAN_ENV", GoldLoanApiTest.DEFAULT_ENV).strip().lower(),
+                        help="Target environment (default: %(default)s). 'test' = gfat, 'uat' = gfau. "
+                             "Selects the base URL and every role/partner login mobile.")
     parser.add_argument("--customer", metavar="UNIQUE_ID",
                         help="Do a new loan against an EXISTING customer (by its customer unique id). "
                              "Omit this to CREATE A NEW customer and run the whole flow.")
@@ -4456,6 +4555,10 @@ def main():
                         help="Requested loan amount (default 400000; capped at eligibility). "
                              "Over 500000 adds a BM-approval step.")
     args = parser.parse_args()
+
+    # Environment must be set before the suite is constructed -- it picks the base URL and the
+    # login mobiles for every role.
+    os.environ["GOLD_LOAN_ENV"] = args.env
 
     # Map the (single) partner choice to the name filter _fetch_partner_scheme_amount matches against.
     partner_env = {"roshan": "ROSHAN PARTNER", "arvog": "ARVOG"}[args.partner]
@@ -4485,6 +4588,7 @@ def main():
         co_lender_label = args.co_lender
     else:
         co_lender_label = "off"
+    print(f">> Environment: {args.env.upper()} ({suite.BASE_URL})")
     print(f">> Partner: {args.partner} ({partner_env})"
           + (f"  |  scheme: {args.scheme}" if args.scheme else "")
           + f"  |  co-lending: {co_lender_label}")

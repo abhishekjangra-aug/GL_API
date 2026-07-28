@@ -18,15 +18,35 @@ One run walks the complete loan lifecycle:
 The run ends when the loan reaches stage **"packet submitted"**, and prints a **LOAN DETAILS** table
 plus a pass/fail metrics summary (with any failed endpoints listed).
 
+### Environments
+
+The harness runs against either environment, selected with `--env` (default `test`):
+
+| `--env` | Host                                           |
+|---------|------------------------------------------------|
+| `test`  | `https://gold-loan-backend-api.gfat.augmont.com` |
+| `uat`   | `https://gold-loan-backend-api.gfau.augmont.com` |
+
+The environment picks the base URL **and** every login mobile below — the two environments have
+separate users. `GOLD_LOAN_ENV` does the same thing as `--env`; `GOLD_LOAN_BASE_URL` still overrides
+the host outright.
+
 The flow spans several roles; the harness logs into each one as needed (static OTP `1234`):
 
-| Role      | Mobile                    | Used for                                   |
-|-----------|---------------------------|--------------------------------------------|
-| Appraiser | 8880008881                | Main actor — the whole loan flow           |
-| Admin     | 8880008880                | Packet create + assign                     |
-| BM        | 8880008883                | Branch-Manager approval (loans over ₹5L)   |
-| Ops       | 8880008882                | Ops rating / final approval                |
-| Partner   | 8767002003 (Roshan) / 9375876473 (Arvog) | Partner approval + disbursement — the number depends on `--partner` |
+| Role      | Mobile (test)  | Mobile (uat)   | Used for                                 |
+|-----------|----------------|----------------|-------------------------------------------|
+| Appraiser | 8880008881     | 9990009991     | Main actor — the whole loan flow          |
+| Admin     | 8880008880     | 9990009990     | Packet create + assign                    |
+| BM        | 8880008883     | 9990009993     | Branch-Manager approval (loans over ₹5L)  |
+| Ops       | 8880008882     | 9990009995     | Ops rating / final approval               |
+| Partner (Roshan) | 8767002003 | 8767002002  | Partner approval + disbursement — depends on `--partner` |
+| Partner (Arvog)  | 9375876473 | 8846651348  | Partner approval + disbursement — depends on `--partner` |
+| Partner branch user (Roshan) | 8652849318 | 8652849318 | Receives the packet at submit-packet |
+| Partner branch user (Arvog)  | 8899999999 | 8888888880 | Receives the packet at submit-packet |
+
+`GOLD_LOAN_PARTNER_USER_MOBILE` overrides the branch user if one of these ever changes. Everything
+else about the partner handover (packet location, partner branch id) is resolved from the API at
+runtime, so it needs no per-environment config.
 
 ## Prerequisites
 
@@ -56,10 +76,18 @@ python src/maintest.py
 python src/maintest.py --customer MS35QNJP
 ```
 
+Either mode runs on either environment:
+
+```bash
+python src/maintest.py --env uat                     # new customer, on UAT
+python src/maintest.py --env uat --customer MS35QNJP # existing customer, on UAT
+```
+
 ### Optional flags
 
 | Flag                | Default     | Purpose                                                       |
 |---------------------|-------------|---------------------------------------------------------------|
+| `--env test\|uat`   | `test`      | Target environment — sets the host and all role logins.        |
 | `--customer ID`     | *(none)*    | Do a new loan against an existing customer. Omit → create new. |
 | `--partner NAME`    | `roshan`    | Lending partner (one per loan): `roshan` or `arvog`.          |
 | `--scheme ID`       | *(auto)*    | Pin a specific scheme id (e.g. `853`).                        |
@@ -149,10 +177,30 @@ All optional; sensible defaults are baked in. Common ones:
 
 | Variable                              | Purpose                                                    |
 |---------------------------------------|------------------------------------------------------------|
-| `GOLD_LOAN_BASE_URL`                  | API base URL (default: the gfat staging host)              |
+| `GOLD_LOAN_ENV`                       | Target environment, `test` or `uat` (also settable via `--env`) |
+| `GOLD_LOAN_BASE_URL`                  | API base URL — overrides the environment's host            |
+| `GOLD_LOAN_PARTNER_USER_MOBILE`       | Partner-branch user for submit-packet (overrides the environment's) |
 | `GOLD_LOAN_AUTH_TOKEN`                | Supply a JWT to skip login (must contain `internalBranchId`, `id`) |
 | `GOLD_LOAN_AMOUNT`                    | Requested loan amount (also settable via `--amount`)       |
 | `GOLD_LOAN_EXISTING_CUSTOMER_UNIQUE_ID` | Existing-customer unique id (also settable via `--customer`) |
+
+## Running it from Postman instead
+
+The same end-to-end flow is also available as a **Postman collection** (`postman/`) with one
+environment per target:
+
+```
+Import postman/Augmont-GoldLoan-E2E.postman_collection.json
+     + postman/Augmont-GL-TEST.postman_environment.json
+     + postman/Augmont-GL-UAT.postman_environment.json
+Set Postman's working directory to this repository root (uploads use assets/…)
+Pick an environment -> Run the collection
+```
+
+It is generated from this harness (`python tools/build_postman_collection.py`), does the same HMAC
+signing, CryptoJS encryption, role switching and eligibility maths in scripts, and ends at the same
+loan stage. See [postman/README.md](postman/README.md) for the knobs (`flow_mode`, `loan_amount`,
+`partner_key`, `scheme_id_pin`, `co_lender`) and the handful of deliberate differences.
 
 ## Project structure
 
@@ -164,6 +212,10 @@ All optional; sensible defaults are baked in. Common ones:
 ├── .gitignore
 ├── src/
 │   └── maintest.py               The harness — one class, GoldLoanApiTest, with a CLI (main()).
+├── postman/                      Generated Postman collection + TEST/UAT environments (see its README).
+├── tools/
+│   ├── build_postman_collection.py  Generates postman/ from this harness. Edit this, not the JSON.
+│   └── postman_lib.js               Shared collection JavaScript (signing, encryption, helpers).
 ├── assets/                       Files uploaded during the flow (resolved relative to the project root).
 │   ├── AADHAR.png                Real aadhaar image (required for the KYC identity-proof upload).
 │   ├── PAN.png                   PAN card image.
