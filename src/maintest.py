@@ -133,6 +133,8 @@ class GoldLoanApiTest:
         self.co_lender_choice = os.getenv("GOLD_LOAN_CO_LENDER", "").strip()
         self.co_lender_interactive = False  # True => prompt the user to pick a co-lender from a menu
         self._forced_co_lender_id = None  # resolved bank id when co-lending is requested
+        self._role_token_cache = {}  # mobile -> token, so a role (e.g. admin) logs in ONCE per run
+                                     # (the OTP send-endpoint rate-limits repeat requests within a minute)
         self.loan_stage_id = ''
         self.loan_unique_id = ''  # e.g. AUGM-67273, captured at disbursement; used to search loan-details
         self.min_loan_amount = 0
@@ -586,18 +588,35 @@ class GoldLoanApiTest:
     def _round_double(self, value, places):
         return round(value, places)
 
+    # Partner login mobile depends on WHICH partner underwrites the loan (each partner has its own
+    # login for approval + disbursement). Keyed by partner id: Roshan (152), Arvog (10).
+    PARTNER_LOGIN_MOBILES = {"152": "8767002003", "10": "9375876473"}
+
+    def _partner_login_mobile(self) -> str:
+        """Return the partner's login mobile for the currently selected partner (used for the
+        approval + disbursement steps). Keys on self.partner_id, falling back to GOLD_LOAN_PARTNER_NAME,
+        and defaults to Roshan's number."""
+        if str(self.partner_id) in self.PARTNER_LOGIN_MOBILES:
+            return self.PARTNER_LOGIN_MOBILES[str(self.partner_id)]
+        if "ARVOG" in os.getenv("GOLD_LOAN_PARTNER_NAME", "").upper():
+            return "9375876473"
+        return "8767002003"  # default: Roshan Partner
+
     def _get_mobile_number_for_login_type(self, login_type: str) -> str:
         # Role -> mobile. Static OTP 1234 for all. admin: packet create/assign; bm: BM approval
         # (loans > 5L); ops: ops rating (final approval). appraiser: the main loan-flow actor.
+        # partner: approval + disbursement, resolved per selected partner (Roshan/Arvog).
+        if login_type == "partner":
+            return self._partner_login_mobile()
         mobiles = {
             "admin": "8880008880",
             "appraiser": "8880008881",
             "ops": "8880008882",
             "bm": "8880008883",
-            "partner": "8767002003",  # Roshan partner (disburses the loan amount)
         }
         if login_type not in mobiles:
-            raise ValueError(f"Invalid login_type '{login_type}'. Must be one of {sorted(mobiles)}.")
+            raise ValueError(f"Invalid login_type '{login_type}'. Must be one of "
+                             f"{sorted(mobiles) + ['partner']}.")
         return mobiles[login_type]
 
     async def _make_authenticated_request(self, method: str, api_path: str, json_data: dict = None, params: dict = None, files: dict = None, headers: dict = None):
@@ -3380,11 +3399,20 @@ class GoldLoanApiTest:
         return path
 
     async def _role_token(self, login_type: str) -> str:
-        """Authenticate as another ROLE (admin/bm/ops) and return that role's bearer token WITHOUT
-        persisting it or mutating the current session's saved state. Callers swap self.auth_token
-        for this around the role-only calls (admin: packet create/assign; bm: BM approval; ops: ops
-        rating), then restore the appraiser token in a finally. Static OTP 1234 for all roles."""
+        """Authenticate as another ROLE (admin/bm/ops/partner) and return that role's bearer token
+        WITHOUT persisting it or mutating the current session's saved state. Callers swap
+        self.auth_token for this around the role-only calls, then restore the appraiser token in a
+        finally. Static OTP 1234 for all roles.
+
+        Tokens are CACHED per mobile for the run: a role used more than once (admin does customer
+        creation AND packet create/assign) logs in only ONCE. The OTP send endpoint rate-limits
+        repeat requests to the same number ('Please try again after a minute'), and a fast run fires
+        both within that window -- so re-requesting an OTP we already hold would 400."""
         mobile = self._get_mobile_number_for_login_type(login_type)
+        cached = self._role_token_cache.get(mobile)
+        if cached:
+            print(f"{login_type.capitalize()} authenticated (reusing cached role token).")
+            return cached
         r1 = await self._make_authenticated_request(
             'POST', "/api/user-otp/user-send-otp",
             json_data={"mobileNumber": mobile, "type": "login", "id": None},
@@ -3397,6 +3425,7 @@ class GoldLoanApiTest:
             headers={'Content-Type': 'application/json'})
         token = r2.json().get('Token')
         assert token, f"{login_type} verify-login returned no Token: {r2.json()}"
+        self._role_token_cache[mobile] = token
         print(f"{login_type.capitalize()} authenticated (role token, not persisted).")
         return token
 
@@ -3966,6 +3995,8 @@ class GoldLoanApiTest:
         always match the server's view of this loan."""
         saved_token = self.auth_token
         try:
+            print(f"Partner login for disbursement: {self._partner_login_mobile()} "
+                  f"(partnerId {self.partner_id}).")
             self.auth_token = await self._role_token("partner")
             await self.update_loan_lock()          # HAR: partner locks the disbursement stage first
             detail = await self.fetch_disbursement_bank_detail()
@@ -4000,9 +4031,19 @@ class GoldLoanApiTest:
             "partnerId": int(self.partner_id) if self.partner_id and str(self.partner_id).isdigit() else 152,
             "checkPointers": {},
         }
-        response = await self._make_authenticated_request('POST', api_path, json_data=request_body)
-        msg = response.json().get("message") if isinstance(response.json(), dict) else ""
-        print(f"Partner approval successful: {msg}")
+        try:
+            response = await self._make_authenticated_request('POST', api_path, json_data=request_body)
+            msg = response.json().get("message") if isinstance(response.json(), dict) else ""
+            print(f"Partner approval successful: {msg}")
+        except httpx.HTTPStatusError as e:
+            # The loan can already be at "disbursement pending" (the stage this approval moves it to)
+            # -- the server then 400s with a "stage has been changed to: disbursement pending, please
+            # re-visit" notice. That is exactly the state disbursement needs, so treat it as done.
+            body = e.response.text if e.response is not None else ""
+            if e.response is not None and e.response.status_code == 400 and "disbursement pending" in body.lower():
+                print(f"Partner approval: loan already at disbursement-pending (continuing). Server said: {body}")
+            else:
+                raise
 
     async def _post_partner_disbursement(self, detail: dict):
         api_path = "/api/loan-process/partner-wise-disbursement"
@@ -4236,9 +4277,19 @@ class GoldLoanApiTest:
                     self._log_step(f"KYC Process (existing customer, status={self.kyc_status or 'unknown'})")
                     await self._run_full_kyc()
             else:
-                self._log_step("Create Customer / Lead")
-                await self.add_customer()
-                self._log_step("KYC Process")
+                # Customer creation runs under ADMIN — creating the customer as the appraiser hits a
+                # "request already exists" error, which the admin credential avoids. KYC and the
+                # appraiser-request (assigning the appraiser to the loan) then run as the appraiser.
+                # The admin swap only changes self.auth_token; logged_in_user_id stays the appraiser's
+                # (set at login, untouched by _role_token), so the appraiser-request binds correctly.
+                self._log_step("Create Customer / Lead (admin)")
+                saved_token = self.auth_token
+                try:
+                    self.auth_token = await self._role_token("admin")
+                    await self.add_customer()
+                finally:
+                    self.auth_token = saved_token  # back to the appraiser for KYC + appraiser-request
+                self._log_step("KYC Process (appraiser)")
                 await self._run_full_kyc()
 
             self._log_step("Appraiser Request & Loan Basics")

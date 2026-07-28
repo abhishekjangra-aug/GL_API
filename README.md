@@ -20,13 +20,13 @@ plus a pass/fail metrics summary (with any failed endpoints listed).
 
 The flow spans several roles; the harness logs into each one as needed (static OTP `1234`):
 
-| Role      | Mobile       | Used for                                   |
-|-----------|--------------|--------------------------------------------|
-| Appraiser | 8880008881   | Main actor — the whole loan flow           |
-| Admin     | 8880008880   | Packet create + assign                     |
-| BM        | 8880008883   | Branch-Manager approval (loans over ₹5L)   |
-| Ops       | 8880008882   | Ops rating / final approval                |
-| Partner   | 8767002003   | Disbursement                               |
+| Role      | Mobile                    | Used for                                   |
+|-----------|---------------------------|--------------------------------------------|
+| Appraiser | 8880008881                | Main actor — the whole loan flow           |
+| Admin     | 8880008880                | Packet create + assign                     |
+| BM        | 8880008883                | Branch-Manager approval (loans over ₹5L)   |
+| Ops       | 8880008882                | Ops rating / final approval                |
+| Partner   | 8767002003 (Roshan) / 9375876473 (Arvog) | Partner approval + disbursement — the number depends on `--partner` |
 
 ## Prerequisites
 
