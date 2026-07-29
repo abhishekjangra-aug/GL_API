@@ -105,8 +105,9 @@ Deliberate, and none of them change what the backend receives in a passing run:
   four times). Likewise one cheque upload is reused for both passbook-proof slots.
 - **Packet images** are uploaded via `/api/upload-file/base` using a base64 copy of
   `assets/dummy_image.png` embedded in the collection, so that step needs no working directory.
-- **Rounding** uses JS half-up (`Math.round`) where Python uses banker's rounding; they differ only
-  on exact `.005` ties.
+- **Rounding** uses JS half-up (`Math.round`). The Python harness now matches this for
+  `netWtAfterPurity` (via a half-up `Decimal` round), so the two agree even on exact `.005` ties —
+  which matters because the server rounds `nwap` half-up and validates eligibility against it.
 - **No retry/recovery branches.** The harness recovers from "appraiser request already exists" by
   cancelling the prior loan; the collection tolerates the 400 and reuses the existing request, but
   does not cancel. If a customer already has an in-flight loan, finish or cancel it first.

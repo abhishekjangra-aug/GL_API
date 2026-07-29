@@ -13,6 +13,7 @@ import re  # Import regex module
 import jwt  # Import jwt library for decoding
 import mimetypes
 import subprocess
+from decimal import Decimal, ROUND_HALF_UP
 
 
 class GoldLoanApiTest:
@@ -626,6 +627,22 @@ class GoldLoanApiTest:
 
     def _round_double(self, value, places):
         return round(value, places)
+
+    @staticmethod
+    def _round_half_up(value, places=2):
+        """Round HALF-UP, matching the backend's rounding (JS-style), not Python's banker's rounding.
+
+        The server recomputes netWtAfterPurity and validates eligibility against ITS value. Python's
+        round() rounds half-to-even AND is at the mercy of float artifacts, so a value landing exactly
+        on a half-cent tie (e.g. 31.65 * 0.90 = 28.485) rounds to 28.48 here but 28.49 on the server.
+        That 0.01 difference, times the scheme rpg, makes final-loan-details 400 with an eligibility
+        mismatch. Quantizing the decimal string half-up reproduces the server's result exactly.
+        """
+        try:
+            quantum = Decimal(1).scaleb(-places)  # e.g. places=2 -> Decimal("0.01")
+            return float(Decimal(str(value)).quantize(quantum, rounding=ROUND_HALF_UP))
+        except (ValueError, ArithmeticError):
+            return round(value, places)
 
     ROSHAN_PARTNER_ID = "152"
     ARVOG_PARTNER_ID = "10"
@@ -2480,8 +2497,11 @@ class GoldLoanApiTest:
                 ltv_pct_num = float(ltv_percent)
             except (TypeError, ValueError):
                 ltv_pct_num = karat_purity
-            purity_percentage = self._round_double(min(karat_purity, ltv_pct_num), 2)  # capped at LTV%
-            net_wt_after_purity = self._round_double(net_weight * (purity_percentage / 100), 2)
+            purity_percentage = self._round_half_up(min(karat_purity, ltv_pct_num), 2)  # capped at LTV%
+            # Round HALF-UP like the server: on a half-cent tie (e.g. 31.65*0.90=28.485) Python's
+            # round() gives 28.48 but the server recomputes 28.49, and it validates eligibility against
+            # ITS value -> final-loan-details 400. See _round_half_up.
+            net_wt_after_purity = self._round_half_up(net_weight * (purity_percentage / 100), 2)
 
             ornament_image_response = await self._upload_file(
                 "loan", file_type="image", file_path_override=self.ORNAMENT_IMAGE_PATH)
