@@ -100,6 +100,10 @@ python src/maintest.py --env uat --customer MS35QNJP # existing customer, on UAT
 ```bash
 python src/maintest.py --customer MS35QNJP
 ```
+The lookup searches the logged-in user's customers first and then *all* customers, so a customer
+created by another user (the harness creates them as admin) is still found. If it reports
+**"was not found"**, the id either doesn't exist on that host or belongs to the other environment —
+check `--env`.
 
 **`--partner <roshan|arvog>`** — which lending partner underwrites the loan. **A loan is underwritten
 by exactly one partner** — you pick one, not both:

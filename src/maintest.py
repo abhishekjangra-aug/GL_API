@@ -945,22 +945,34 @@ class GoldLoanApiTest:
                     return record
         return None
 
+    async def _search_customers(self, filters: dict) -> dict:
+        """GET /api/customer with `filters`, widening the scope when the user's own list is empty.
+
+        `viewAllCustomer=false` only lists customers belonging to the logged-in user/branch. The
+        harness creates customers under the ADMIN token, so a customer from an earlier run is often
+        absent from the appraiser's own list even though the record exists — retry with
+        `viewAllCustomer=true` before concluding it isn't there.
+        """
+        payload = {}
+        for view_all in ("false", "true"):
+            params = {"viewAllCustomer": view_all, "from": "1", "to": "100", **filters}
+            api_path = "/api/customer?" + urllib.parse.urlencode(params)
+            response = await self._make_authenticated_request('GET', api_path)
+            payload = response.json()
+            rows = payload.get("data") if isinstance(payload, dict) else None
+            if rows:
+                if view_all == "true":
+                    print("Customer is outside this user's own list — found with viewAllCustomer=true.")
+                return payload
+        return payload
+
     async def _fetch_customer_unique_id(self) -> None:
-        params = {
-            "viewAllCustomer": "false",
-            "from": "1",
-            "to": "100",
-        }
-
         if self.customer_unique_id:
-            params["customerUniqueId"] = self.customer_unique_id
+            filters = {"customerUniqueId": self.customer_unique_id}
         else:
-            params["mobileNumber"] = self.mobile_number
+            filters = {"mobileNumber": self.mobile_number}
 
-        api_path = "/api/customer?" + urllib.parse.urlencode(params)
-
-        response = await self._make_authenticated_request('GET', api_path)
-        customer = self._find_customer_record(response.json(), self.customer_id)
+        customer = self._find_customer_record(await self._search_customers(filters), self.customer_id)
 
         assert customer, (
             f"Customer {self.customer_id} was not found in the customer lookup response."
@@ -1107,11 +1119,8 @@ class GoldLoanApiTest:
         if self.customer_unique_id and (
             not self.customer_id or not self.mobile_number or not self.first_name or not self.last_name
         ):
-            api_path = (
-                "/api/customer?viewAllCustomer=false&from=1&to=100&customerUniqueId="
-                f"{urllib.parse.quote(self.customer_unique_id)}"
-            )
-            response = await self._make_authenticated_request('GET', api_path)
+            payload = await self._search_customers({"customerUniqueId": self.customer_unique_id})
+
             def find_by_unique_id(value):
                 if isinstance(value, dict):
                     unique_id = value.get("customerUniqueId") or value.get("uniqueId")
@@ -1128,8 +1137,14 @@ class GoldLoanApiTest:
                             return record
                 return None
 
-            customer = find_by_unique_id(response.json())
-            assert customer, f"Customer {self.customer_unique_id} was not found."
+            customer = find_by_unique_id(payload)
+            other_env = "uat" if self.env_name == "test" else "test"
+            assert customer, (
+                f"Customer {self.customer_unique_id} was not found on "
+                f"{self.env_name.upper()} ({self.BASE_URL}) — searched this user's list and all "
+                f"customers. Check the unique id, or try the other environment "
+                f"(--env {other_env})."
+            )
             self.customer_id = str(customer.get("id") or customer.get("customerId"))
             self.mobile_number = self.mobile_number or str(customer.get("mobileNumber") or "")
             self.first_name = self.first_name or str(customer.get("firstName") or "")

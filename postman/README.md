@@ -110,5 +110,8 @@ Deliberate, and none of them change what the backend receives in a passing run:
 - **No retry/recovery branches.** The harness recovers from "appraiser request already exists" by
   cancelling the prior loan; the collection tolerates the 400 and reuses the existing request, but
   does not cancel. If a customer already has an in-flight loan, finish or cancel it first.
+- **Customer lookups use `viewAllCustomer=true`** where the harness tries the user-scoped list
+  first and widens only if it comes back empty. Both match on an exact id, so the result is the
+  same — the collection just skips the retry request.
 - **No `loan_calc_debug.json` dump.** On an eligibility 400 the test script logs the sent total,
   the rpg and the three things to check, instead of writing a file.

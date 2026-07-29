@@ -867,7 +867,7 @@
                 "value": "Bearer {{token}}"
               }
             ],
-            "url": "{{base_url}}/api/customer?viewAllCustomer=false&from=1&to=100&mobileNumber={{customer_mobile}}"
+            "url": "{{base_url}}/api/customer?viewAllCustomer=true&from=1&to=100&mobileNumber={{customer_mobile}}"
           },
           "event": [
             {
@@ -921,7 +921,7 @@
                 "value": "Bearer {{token}}"
               }
             ],
-            "url": "{{base_url}}/api/customer?viewAllCustomer=false&from=1&to=100&customerUniqueId={{customer_unique_id}}"
+            "url": "{{base_url}}/api/customer?viewAllCustomer=true&from=1&to=100&customerUniqueId={{customer_unique_id}}"
           },
           "event": [
             {

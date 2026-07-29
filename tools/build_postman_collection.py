@@ -254,7 +254,9 @@ def folder_new_customer():
                   "GL.log('customer', GL.get('customer_id'), GL.get('customer_unique_id'));"),
             json_body=True),
         req("Resolve customer unique id",
-            "GET", "/api/customer?viewAllCustomer=false&from=1&to=100&mobileNumber={{customer_mobile}}",
+            # viewAllCustomer=true: the customer was created under the ADMIN login, so it is not in
+            # the appraiser's own list. The walk below still matches on the exact customer id.
+            "GET", "/api/customer?viewAllCustomer=true&from=1&to=100&mobileNumber={{customer_mobile}}",
             pre="GL.role('appraiser'); GL.sign();",
             test=("GL.ok('customer lookup');\n"
                   "if (!GL.get('customer_unique_id')) {\n"
@@ -283,7 +285,9 @@ def folder_new_customer():
 def folder_existing_customer():
     items = [
         req("Find customer by unique id",
-            "GET", "/api/customer?viewAllCustomer=false&from=1&to=100&customerUniqueId={{customer_unique_id}}",
+            # viewAllCustomer=true — a customer from an earlier run belongs to whoever created it
+            # (usually admin), so the appraiser's own list would not contain it.
+            "GET", "/api/customer?viewAllCustomer=true&from=1&to=100&customerUniqueId={{customer_unique_id}}",
             pre=("GL.role('appraiser');\n"
                  "if (!GL.get('customer_unique_id')) {\n"
                  "  throw new Error('flow_mode=existing requires the customer_unique_id variable.');\n"
