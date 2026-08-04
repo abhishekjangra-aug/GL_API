@@ -11,7 +11,8 @@ One run walks the complete loan lifecycle:
 ```
 (create customer + KYC)  ->  appraiser request  ->  loan basics  ->  nominee  ->  ornaments
    ->  scheme / eligibility  ->  final loan details  ->  bank details  ->  assign packet
-   ->  ratings (appraiser / BM if > 5L / ops)  ->  loan documents
+   ->  ratings (appraiser / BM if > 5L)  ->  loan documents
+   ->  manual bank verification (ops)  ->  ops rating
    ->  partner approval  ->  disbursement  ->  submit packet  ->  load loan details
 ```
 

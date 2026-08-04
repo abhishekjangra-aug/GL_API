@@ -4202,7 +4202,12 @@
                   "// even on a fully successful verification.",
                   "var txn = GL.findKey(GL.json(), 'bankTxnStatus');",
                   "GL.set('bank_account_verified', txn ? 'true' : 'false');",
-                  "GL.log('bankTxnStatus =', txn);"
+                  "// bankTxnStatus true does NOT mean verified: the server compares the bank's",
+                  "// account name with the customer's, so it answers isVerified false /",
+                  "// forOpsApproval true -> the 'OPS: manual bank verification' request clears it.",
+                  "GL.set('bank_for_ops_approval', GL.json().forOpsApproval ? 'true' : 'false');",
+                  "GL.log('bankTxnStatus =', txn, 'isVerified =', GL.json().isVerified,",
+                  "       'forOpsApproval =', GL.json().forOpsApproval);"
                 ]
               }
             }
@@ -5250,6 +5255,70 @@
     {
       "name": "11 - Ops rating (final approval)",
       "item": [
+        {
+          "name": "OPS: manual bank verification",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/loan-process/bank-verification-manual",
+            "description": "Ops-side MANUAL approval of the customer bank account. Without it the bank detail stays 'pending' and the loan cannot be disbursed.",
+            "body": {
+              "mode": "raw",
+              "raw": "{{__body}}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "eval(pm.collectionVariables.get(\"GL_LIB\"));",
+                  "GL.role('ops');",
+                  "GL.body({",
+                  "  accountNumber: GL.get('bank_account_number'),",
+                  "  accountHolderName: GL.get('account_holder_name'),",
+                  "  ifscCode: GL.get('bank_ifsc_code'), detailsFor: 'customer',",
+                  "  customerId: GL.int(GL.get('customer_id')),",
+                  "  masterLoanId: GL.int(GL.get('master_loan_id')),",
+                  "  loanId: GL.int(GL.get('loan_id')),",
+                  "  status: 'approved', requestFrom: 'loan',",
+                  "  incompleteReason: '', approvalReason: 'test'",
+                  "});"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "GL.ok('bank-verification-manual');",
+                  "// Verdict lives one level down, under data.",
+                  "var d = GL.json().data || {};",
+                  "GL.set('bank_manually_verified', d.isManuallyVerified ? 'true' : 'false');",
+                  "GL.set('bank_for_ops_approval', d.forOpsApproval ? 'true' : 'false');",
+                  "GL.log('isManuallyVerified =', d.isManuallyVerified,",
+                  "       'forOpsApproval =', d.forOpsApproval);"
+                ]
+              }
+            }
+          ]
+        },
         {
           "name": "OPS: rating",
           "request": {

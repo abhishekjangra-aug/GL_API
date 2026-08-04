@@ -1308,7 +1308,12 @@ def folder_bank():
                   "// even on a fully successful verification.\n"
                   "var txn = GL.findKey(GL.json(), 'bankTxnStatus');\n"
                   "GL.set('bank_account_verified', txn ? 'true' : 'false');\n"
-                  "GL.log('bankTxnStatus =', txn);"),
+                  "// bankTxnStatus true does NOT mean verified: the server compares the bank's\n"
+                  "// account name with the customer's, so it answers isVerified false /\n"
+                  "// forOpsApproval true -> the 'OPS: manual bank verification' request clears it.\n"
+                  "GL.set('bank_for_ops_approval', GL.json().forOpsApproval ? 'true' : 'false');\n"
+                  "GL.log('bankTxnStatus =', txn, 'isVerified =', GL.json().isVerified,\n"
+                  "       'forOpsApproval =', GL.json().forOpsApproval);"),
             json_body=True,
             description="MUST run before POST bank-details, else that call 400s with 'bank details "
                         "is not verified'."),
@@ -1576,6 +1581,33 @@ def folder_documents():
 
 def folder_ops():
     return folder("11 - Ops rating (final approval)", [
+        # The penny-drop reaches the bank (bankTxnStatus true) but the server still parks the bank
+        # detail as bankVerificationStatus 'pending' (isVerified false / forOpsApproval true),
+        # because the test account name 'LIC MUTUAL FUND' does not match the customer's name.
+        # Ops must approve it manually before the loan can be disbursed.
+        req("OPS: manual bank verification", "POST",
+            "/api/loan-process/bank-verification-manual",
+            pre=("GL.role('ops');\n"
+                 "GL.body({\n"
+                 "  accountNumber: GL.get('bank_account_number'),\n"
+                 "  accountHolderName: GL.get('account_holder_name'),\n"
+                 "  ifscCode: GL.get('bank_ifsc_code'), detailsFor: 'customer',\n"
+                 "  customerId: GL.int(GL.get('customer_id')),\n"
+                 "  masterLoanId: GL.int(GL.get('master_loan_id')),\n"
+                 "  loanId: GL.int(GL.get('loan_id')),\n"
+                 "  status: 'approved', requestFrom: 'loan',\n"
+                 "  incompleteReason: '', approvalReason: 'test'\n"
+                 "});"),
+            test=("GL.ok('bank-verification-manual');\n"
+                  "// Verdict lives one level down, under data.\n"
+                  "var d = GL.json().data || {};\n"
+                  "GL.set('bank_manually_verified', d.isManuallyVerified ? 'true' : 'false');\n"
+                  "GL.set('bank_for_ops_approval', d.forOpsApproval ? 'true' : 'false');\n"
+                  "GL.log('isManuallyVerified =', d.isManuallyVerified,\n"
+                  "       'forOpsApproval =', d.forOpsApproval);"),
+            json_body=True,
+            description="Ops-side MANUAL approval of the customer bank account. Without it the bank "
+                        "detail stays 'pending' and the loan cannot be disbursed."),
         req("OPS: rating", "POST", "/api/loan-process/ops-rating",
             pre=("GL.role('ops');\n"
                  "GL.body({\n"

@@ -209,6 +209,15 @@ class GoldLoanApiTest:
         self.bank_branch_name = ''
         self.account_holder_name = ''
         self.passbook_proofs = []  # Uploaded passbook proof paths
+        # Bank verification state, captured from validate-account / bank-verification-manual.
+        # bank_account_verified  -> penny-drop reached the bank (data.bankTxnStatus)
+        # bank_system_verified   -> the server accepted it outright (isVerified)
+        # bank_manually_verified -> an ops user approved it manually (isManuallyVerified)
+        # bank_for_ops_approval  -> the record is PENDING an ops manual approval (forOpsApproval)
+        self.bank_account_verified = False
+        self.bank_system_verified = False
+        self.bank_manually_verified = False
+        self.bank_for_ops_approval = False
         # The downstream E2E request payloads are scoped to this internal branch.
         # Keep the token scope and payload scope in sync.
         self.internal_branch_id = os.getenv("GOLD_LOAN_INTERNAL_BRANCH_ID", "1")
@@ -3325,6 +3334,10 @@ class GoldLoanApiTest:
             # If validate-account's penny-drop succeeded (bankTxnStatus True) send it as system-verified;
             # otherwise mark it MANUALLY verified (no penny-drop API for our dummy account) so the flow
             # proceeds -- manual entry is acceptable here per the test's ops-rating stage.
+            # NOTE: the server OVERRIDES these flags with its own validate-account verdict -- the
+            # stored record comes back isVerified false / forOpsApproval true / bankVerificationStatus
+            # "pending" whatever we send here, because the account name does not match the customer.
+            # ops_manual_bank_verification() clears that pending state in the Ops stage.
             "isManuallyVerified": not getattr(self, "bank_account_verified", False),
             "isVerified": True,
             "isDummyDetails": False,
@@ -3469,6 +3482,81 @@ class GoldLoanApiTest:
         try:
             self.auth_token = await self._role_token("ops")
             await self.add_ops_rating()
+        finally:
+            self.auth_token = saved_token
+
+    async def ops_manual_bank_verification(self, force: bool = False):
+        """MANUAL bank verification by the OPS team -- clears the pending bank-verification state.
+
+        Why this exists: validate-account's penny-drop succeeds (bankTxnStatus true) but the server
+        still refuses to mark the account verified because the bank's account name
+        ("LIC MUTUAL FUND") does not match the customer's name, so it answers
+        `isVerified:false, isManuallyVerified:false, forOpsApproval:true` and stores the bank detail
+        with `bankVerificationStatus:"pending"` (CONFIRMED in `ops complete.har` -> single-loan
+        `data.loanBankDetail`). The loan then cannot be disbursed until an ops user approves the
+        account manually.
+
+        In the real ops session (`ops complete.har`, entries 35/41) the order is:
+        validate-account -> POST /api/loan-process/bank-verification-manual (status "approved")
+        -> update-processing-charge -> ops-rating. This mirrors that, and like every other role call
+        it swaps to the OPS role token for the duration and restores the appraiser session after.
+
+        Set `force=True` (or leave the state unknown) to send the approval regardless of the flags
+        captured by validate_account.
+        """
+        if not force and self.bank_manually_verified and not self.bank_for_ops_approval:
+            print("Manual bank verification skipped: account is already manually verified.")
+            return
+        if not force and self.bank_system_verified and not self.bank_for_ops_approval:
+            print("Manual bank verification skipped: account is already system-verified.")
+            return
+
+        api_path = "/api/loan-process/bank-verification-manual"
+        request_body = {
+            "accountNumber": self.bank_account_number or "00000036150491589",
+            "accountHolderName": self.account_holder_name or f"{self.first_name} {self.last_name}",
+            "ifscCode": self.bank_ifsc_code or "SBIN0011777",
+            "detailsFor": "customer",
+            "customerId": int(self.customer_id) if self.customer_id else None,
+            "masterLoanId": int(self.master_loan_id) if self.master_loan_id else None,
+            "loanId": int(self.loan_id) if self.loan_id else None,
+            "status": "approved",
+            "requestFrom": "loan",
+            "incompleteReason": "",
+            "approvalReason": "test",
+        }
+        saved_token = self.auth_token
+        try:
+            self.auth_token = await self._role_token("ops")
+            response = await self._make_authenticated_request('POST', api_path, json_data=request_body)
+            payload = response.json()
+            # Response shape: {"message":"success","data":{... isVerified, isManuallyVerified,
+            # forOpsApproval ...}} -- the verification verdict lives one level down, under "data".
+            result = payload.get('data') if isinstance(payload.get('data'), dict) else payload
+            self.bank_manually_verified = bool(result.get('isManuallyVerified'))
+            self.bank_system_verified = bool(result.get('isVerified')) or self.bank_system_verified
+            self.bank_for_ops_approval = bool(result.get('forOpsApproval'))
+            print(f"Manual bank verification submitted by ops (isManuallyVerified="
+                  f"{self.bank_manually_verified}, isVerified={self.bank_system_verified}, "
+                  f"forOpsApproval={self.bank_for_ops_approval}).")
+            assert self.bank_manually_verified or self.bank_system_verified, (
+                "Ops manual bank verification did not verify the account: "
+                f"{json.dumps(payload)[:500]}")
+            assert not self.bank_for_ops_approval, (
+                "Bank detail is still pending ops approval after bank-verification-manual: "
+                f"{json.dumps(payload)[:500]}")
+        except httpx.HTTPStatusError as e:
+            body = e.response.text or ""
+            # Approving a bank detail that ops already approved comes back as a 400; that is the
+            # state we wanted, so treat it as done rather than failing the run.
+            if e.response.status_code == 400 and "already" in body.lower():
+                self.bank_manually_verified = True
+                self.bank_for_ops_approval = False
+                print(f"Manual bank verification already done: {body}")
+            else:
+                print(self._c(f"Manual bank verification FAILED: {e.response.status_code} - {body}",
+                              "red"))
+                raise
         finally:
             self.auth_token = saved_token
 
@@ -3938,15 +4026,40 @@ class GoldLoanApiTest:
         }
         try:
             response = await self._make_authenticated_request('POST', api_path, json_data=request_body)
-            # Penny-drop result: data.bankTxnStatus True means the account really verified (CONFIRMED
-            # for the SBI test account 00000036150491589), so bank-details goes in system-verified.
+            data = response.json()
+            # Penny-drop result: data.bankTxnStatus True means the transaction reached the bank
+            # (CONFIRMED for the SBI test account 00000036150491589).
             # NOTE: the response's top-level "message" can read "Something went wrong" even on success
-            # -- rely on bankTxnStatus, not the message. Falls back to manual only if this is False.
-            txn = self._find_key_recursive(response.json(), 'bankTxnStatus')
-            self.bank_account_verified = bool(txn)
-            print(f"Validate account successful (bankTxnStatus={txn}).")
+            # -- rely on bankTxnStatus, not the message.
+            #
+            # bankTxnStatus True does NOT mean the account is VERIFIED. The server also compares the
+            # bank's account name against the customer name; our test account is "LIC MUTUAL FUND"
+            # while the customer is a random name, so it answers
+            #   bankTxnStatus: true, isVerified: false, isManuallyVerified: false, forOpsApproval: true
+            # i.e. the bank detail is parked as "bankVerificationStatus: pending" awaiting an OPS
+            # manual approval (see ops_manual_bank_verification). Reading only bankTxnStatus here used
+            # to make the run believe the account was verified and fail later in the flow.
+            self.bank_account_verified = bool(data.get('data', {}).get('bankTxnStatus')
+                                              if isinstance(data.get('data'), dict)
+                                              else self._find_key_recursive(data, 'bankTxnStatus'))
+            self.bank_system_verified = bool(data.get('isVerified'))
+            self.bank_manually_verified = bool(data.get('isManuallyVerified'))
+            self.bank_for_ops_approval = bool(data.get('forOpsApproval'))
+            print(f"Validate account successful (bankTxnStatus={self.bank_account_verified}, "
+                  f"isVerified={self.bank_system_verified}, "
+                  f"isManuallyVerified={self.bank_manually_verified}, "
+                  f"forOpsApproval={self.bank_for_ops_approval}).")
+            if self.bank_for_ops_approval or not (self.bank_system_verified or self.bank_manually_verified):
+                name_as_per_system = data.get('nameAsPerSystem')
+                print(self._c("  Bank account is NOT verified yet (nameAsPerSystem="
+                              f"{name_as_per_system!r} vs accountHolderName="
+                              f"{request_body['accountHolderName']!r}); it needs the OPS manual "
+                              "verification step.", "yellow"))
         except httpx.HTTPStatusError as e:
             self.bank_account_verified = False
+            self.bank_system_verified = False
+            self.bank_manually_verified = False
+            self.bank_for_ops_approval = True
             print(f"Validate account failed (non-fatal): {e.response.status_code} - {e.response.text}")
 
     async def upload_income_document(self) -> str:
@@ -4458,6 +4571,14 @@ class GoldLoanApiTest:
 
             self._log_step("Upload Documents")
             await self.store_loan_documents()
+
+            self._log_step("Manual Bank Verification (ops approval)")
+            # The penny-drop leaves the bank detail "pending" because the test account's name does
+            # not match the customer, so ops must approve it manually before the loan can disburse
+            # (order taken from the real ops session: validate-account -> bank-verification-manual
+            # -> ops-rating). The penny-drop result is already stored against the loan (the manual
+            # approval echoes the same bankRRN), so validate-account is not re-run here.
+            await self.ops_manual_bank_verification()
 
             self._log_step("Ops Rating (final approval)")
             await self.submit_ops_rating()   # Ops login (per env)
