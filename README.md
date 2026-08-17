@@ -94,6 +94,8 @@ python src/maintest.py --env uat --customer MS35QNJP # existing customer, on UAT
 | `--scheme ID`       | *(auto)*    | Pin a specific scheme id (e.g. `853`).                        |
 | `--co-lender [NAME\|ID]` | off    | Co-lending: pass a bank, or pass it bare to pick from a menu. |
 | `--amount N`        | `400000`    | Requested loan amount in rupees (capped at eligibility).      |
+| `--kyc MODE`        | `manual`    | Identity mode: `manual`, `auto` or `ovd` — see below.         |
+| `--kyc-profile PATH`| `config/kyc_identity.json` | Real identity data for `auto`/`ovd`.           |
 | `--login ROLE`      | `appraiser` | Login role for the main flow.                                 |
 
 **`--customer <UNIQUE_ID>`** — run a loan against a customer that already exists and is KYC-approved
@@ -105,6 +107,41 @@ The lookup searches the logged-in user's customers first and then *all* customer
 created by another user (the harness creates them as admin) is still found. If it reports
 **"was not found"**, the id either doesn't exist on that host or belongs to the other environment —
 check `--env`.
+
+**`--kyc <manual|auto|ovd>`** — how the customer's identity is established.
+
+| Mode | Identity used | Verification calls | Needs real data |
+|------|---------------|--------------------|-----------------|
+| `manual` (**default**) | generated dummy PAN + Aadhaar | none — relies on the server's manual-validation fallback | no |
+| `auto` | **real** PAN + **real** offline-Aadhaar XML | `POST /api/e-kyc/verify-pan`, `POST /api/e-kyc/offline-aadhaar-xml` | yes |
+| `ovd`  | **real** Voter ID or Driving Licence, **no PAN**, plus Form 97 | `POST /api/e-kyc/v2/verify-voter-id`, `POST /api/e-kyc/v2/verify-dl` | yes |
+
+```bash
+python src/maintest.py --kyc auto
+python src/maintest.py --kyc ovd
+```
+
+`auto` and `ovd` need genuine documents — the verification APIs check them against the issuing
+authority, so numbers cannot be generated. Supply them in **`config/kyc_identity.json`** (copy
+`config/kyc_identity.example.json`) or via `GOLD_LOAN_KYC_*` env vars. `config/` is gitignored
+because it holds real PII; only the example file is tracked.
+
+Two behaviours worth knowing:
+
+- **Fallback.** The server counts consecutive verification failures and returns `switchToManual:true`
+  on the third. The harness honours that signal, falls back to the manual data path so the run still
+  reaches disbursement, and reports `requested: auto → effective: manual (DEGRADED)`. A degraded run
+  can never be mistaken for a verified one.
+- **Duplicates stop the run.** If any KYC document (PAN, Aadhaar, DL, Voter ID) is already registered
+  against another customer, the run **aborts immediately** with `KycDocumentAlreadyExistsError`
+  rather than degrading — continuing would report a pass for a document that can never be used.
+  Use an unregistered document, or point the run at the customer that already owns it via
+  `--customer`.
+
+`ovd` mode is the CR-2 "PAN not available" path: `panType: "ovd"`, `panCardNumber: null`, an OVD scan
+and a Form 97 PDF. Only **Voter ID** is fully capture-verified; the `ovdType` *string* for Driving
+Licence is inferred and can be overridden with `GOLD_LOAN_KYC_OVD_TYPE_STRING`. Passport and NREGA
+appear in CR-2 but have no captured endpoint, so they are rejected rather than guessed.
 
 **`--partner <roshan|arvog>`** — which lending partner underwrites the loan. **A loan is underwritten
 by exactly one partner** — you pick one, not both:
@@ -188,6 +225,82 @@ All optional; sensible defaults are baked in. Common ones:
 | `GOLD_LOAN_AUTH_TOKEN`                | Supply a JWT to skip login (must contain `internalBranchId`, `id`) |
 | `GOLD_LOAN_AMOUNT`                    | Requested loan amount (also settable via `--amount`)       |
 | `GOLD_LOAN_EXISTING_CUSTOMER_UNIQUE_ID` | Existing-customer unique id (also settable via `--customer`) |
+| `GOLD_LOAN_KYC_MODE`                  | `manual` / `auto` / `ovd` (also settable via `--kyc`)       |
+| `GOLD_LOAN_KYC_TYPE`                  | `kycType` on the v2 endpoints (default `RE_KYC`)           |
+| `GOLD_LOAN_KYC_PROFILE`               | Path to the real-identity JSON (default `config/kyc_identity.json`) |
+
+Every field of the identity profile also has an env override, so a run can be driven without the
+file at all:
+
+| Variable | Field |
+|----------|-------|
+| `GOLD_LOAN_KYC_FIRST_NAME` / `GOLD_LOAN_KYC_LAST_NAME` | customer name (must match the documents) |
+| `GOLD_LOAN_KYC_DOB`                   | date of birth, `YYYY-MM-DD`                       |
+| `GOLD_LOAN_KYC_GENDER`                | `m` / `f` / `o`                                    |
+| `GOLD_LOAN_KYC_PAN`                   | real PAN (`auto`)                                  |
+| `GOLD_LOAN_KYC_AADHAAR`               | real 12-digit Aadhaar (`auto`)                     |
+| `GOLD_LOAN_KYC_AADHAAR_XML`           | UIDAI offline e-KYC XML file (`auto`)              |
+| `GOLD_LOAN_KYC_OVD_TYPE`              | `voterId` or `drivingLicense` (`ovd`)              |
+| `GOLD_LOAN_KYC_OVD_NUMBER`            | EPIC / DL number (`ovd`)                           |
+| `GOLD_LOAN_KYC_OVD_IMAGE`             | OVD scan (`ovd`)                                   |
+| `GOLD_LOAN_KYC_FORM97`                | Form 97 PDF (`ovd`)                                |
+| `GOLD_LOAN_KYC_OVD_TYPE_STRING`       | Override the submitted `ovdType` string            |
+| `GOLD_LOAN_KYC_IDENTITY_TYPE_ID`      | Override `identityTypeId` (default 5 = Aadhaar)    |
+
+Paths may be relative to the **project root** or absolute; relative ones are anchored at the repo
+root, so a run works from any working directory.
+
+## KYC on its own
+
+`src/test_kyc.py` runs the **complete KYC journey and nothing else** — useful for seeding customers,
+exercising a verification mode, or re-KYC'ing an existing customer without the loan process.
+
+```bash
+python src/test_kyc.py                      # manual KYC, one new customer
+python src/test_kyc.py --kyc auto           # real PAN + real Aadhaar XML
+python src/test_kyc.py --kyc ovd            # real OVD + Form 97, no PAN
+python src/test_kyc.py --count 5            # seed 5 KYC'd customers (manual only)
+python src/test_kyc.py --customer MS35QNJP  # Re-KYC an existing customer
+python src/test_kyc.py --skip-ops-approval  # submit but leave the KYC pending
+```
+
+It covers customer creation (admin) → basic info + PAN/OVD verification → consent OTP → master data
+→ address/identity → personal details → `submit-all-kyc-info` → ops approval, and finishes by
+printing the command to create a loan against each customer it produced:
+
+```
+■ NEXT: create a loan against these customers
+  python src/maintest.py --customer MSCUST01 --env test
+```
+
+`--count > 1` is only allowed in `manual` mode: the identity profile holds one real person's
+documents, and a document can be registered against only one customer.
+
+## Packets on their own
+
+`src/test_create_packets.py` creates empty packets as admin and assigns each to the appraiser —
+the packet half of the flow, without a loan.
+
+```bash
+python src/test_create_packets.py                # 5 packets, assigned to the appraiser
+python src/test_create_packets.py --count 20     # 20 packets
+python src/test_create_packets.py --no-assign    # create only, leave unassigned
+```
+
+## Tests
+
+`tests/test_harness.py` is an offline regression suite — **no network, no extra dependencies**
+(there is no pytest in this project). Request bodies are byte-compared against the captured HARs in
+`reference/`, and the control flow is checked with mocks.
+
+```bash
+python tests/test_harness.py            # everything
+python tests/test_harness.py kyc        # just the KYC groups
+python tests/test_harness.py duplicate  # one group
+```
+
+A pass means "the requests we build match the ones the browser sent, and the control flow behaves" —
+**not** "the server accepted it". Node.js is required (the CryptoJS tests shell out to it).
 
 ## Running it from Postman instead
 
@@ -216,7 +329,16 @@ loan stage. See [postman/README.md](postman/README.md) for the knobs (`flow_mode
 ├── package.json                  The single Node dependency (crypto-js).
 ├── .gitignore
 ├── src/
-│   └── maintest.py               The harness — one class, GoldLoanApiTest, with a CLI (main()).
+│   ├── maintest.py               The harness — one class, GoldLoanApiTest, with a CLI (main()).
+│   ├── test_kyc.py               KYC-only runner (all three identity modes, no loan process).
+│   └── test_create_packets.py    Bulk packet creation + appraiser assignment (admin).
+├── tests/
+│   └── test_harness.py           Offline regression suite (no network, no extra dependencies).
+├── config/                       REAL identity data for --kyc auto/ovd. GIT-IGNORED except the
+│   ├── kyc_identity.example.json   template — copy it to kyc_identity.json and fill it in.
+│   ├── kyc_identity.json         Your real PAN / Aadhaar / OVD numbers (never committed).
+│   ├── offline_aadhar.xml        UIDAI offline e-KYC XML (--kyc auto).
+│   └── form-97.pdf               Form 97 upload (--kyc ovd).
 ├── postman/                      Generated Postman collection + TEST/UAT environments (see its README).
 ├── tools/
 │   ├── build_postman_collection.py  Generates postman/ from this harness. Edit this, not the JSON.
@@ -229,10 +351,12 @@ loan stage. See [postman/README.md](postman/README.md) for the knobs (`flow_mode
 │   ├── CPV.pdf                   PDF used for document uploads (loan docs, income, CPV).
 │   └── dummy_image.png           Generic image placeholder for uploads.
 ├── reference/
-│   └── gold-loan-e2e-flow.har    Consolidated HAR of the complete flow (API-only) — the ground-truth
-│                                 reference for request/response shapes. Each entry's `comment` tags
-│                                 its stage: A = customer/KYC/loan/bank/packet/docs,
-│                                 B0 = partner approval, B = disbursement, C = submit-packet/load-details.
+│   ├── gold-loan-e2e-flow.har    Consolidated HAR of the complete flow (API-only) — the ground-truth
+│   │                             reference for request/response shapes. Each entry's `comment` tags
+│   │                             its stage: A = customer/KYC/loan/bank/packet/docs,
+│   │                             B0 = partner approval, B = disbursement, C = submit-packet/load-details.
+│   └── ovd-kyc-flow.har          KYC via an OVD instead of PAN (verify-dl / verify-voter-id,
+│                                 panType "ovd", Form 97). Ground truth for --kyc ovd.
 └── .claude/
     └── skills/gold-loan-api-test/
         └── SKILL.md              Deep architecture + domain notes (invariants, gotchas, formulas).
@@ -256,5 +380,12 @@ Generated at runtime, in the project root (git-ignored): `loan_calc_debug.json`,
   returns — not hardcoded — so runs adapt to whatever scheme/loan is selected.
 - `gold-loan-e2e-flow.har` is a **step reference**, not a single live session: it's merged from
   captures with different customer/loan ids. Use it to check the shape of any call, not to replay.
+- **KYC caveat:** `manual` and `ovd` (Voter ID) are byte-verified against captures. Two things are
+  *not* capture-confirmed and only a live run will settle them: the `ovdType` string for **Driving
+  Licence** (inferred — override with `GOLD_LOAN_KYC_OVD_TYPE_STRING`), and the loan steps
+  **after** KYC on the OVD path, where `panCardNumber` is null (`ovd-kyc-flow.har` ends at the
+  consent OTP). The Postman collection models the `manual` path only.
+- The Postman collection is regenerated from the harness and currently matches it byte-for-byte;
+  re-run `python tools/build_postman_collection.py` after any change to a request body or ordering.
 - For the deep "why", the hard-won domain rules, and per-endpoint gotchas, read
   `.claude/skills/gold-loan-api-test/SKILL.md`.

@@ -9,6 +9,35 @@ Single-file async Python harness that drives the **Augmont Gold Loan (GL) backen
 
 **Read this file first.** It captures the architecture, invariants, and hard-won domain rules so you don't re-analyze `src/maintest.py` (~4500 lines) each time. When a detail here conflicts with the code, the code wins — re-verify with Grep/Read and update this skill.
 
+## Standalone runners & tests (siblings of maintest.py)
+
+Three files wrap `GoldLoanApiTest` rather than subclassing it, so every request body, signature and
+domain rule stays defined once in `maintest.py` and cannot drift:
+
+- **`src/test_kyc.py`** — the complete KYC journey and nothing else, in any identity mode.
+  `--kyc {manual,auto,ovd} --kyc-profile --kyc-type --customer --count --skip-ops-approval`.
+  `_run_kyc` mirrors `_run_full_kyc` step for step (a test asserts step parity by AST, so adding a
+  step to one and not the other fails). Prints the `maintest.py --customer <uniqueId>` command to
+  create a loan afterwards. `--count > 1` is refused for auto/ovd — one real person's documents can
+  only be registered against one customer. Batch runs call `_reset_for_next_customer()`
+  (`PER_CUSTOMER_STATE`) so a customer never inherits the previous PAN/`customerKycId`/verdicts,
+  and a `KycDocumentAlreadyExistsError` stops the whole batch, not just one customer.
+- **`src/test_create_packets.py`** — bulk packet create + appraiser assign as admin
+  (`--count --no-assign --appraiser-id --delay --listing-size`). Logs in as the appraiser only to
+  read its user id + branch, then swaps to a cached admin token for the batch. Two independent
+  guards stop a stale re-assign: `create_one` clears `available_packet` before each create (the real
+  `create_packet` leaves the PREVIOUS packet in place when its listing lookup fails), and it
+  cross-checks the listed `packetUniqueId` against the one just generated.
+- **`tests/test_harness.py`** — offline regression suite, **no network and no extra deps** (there is
+  no pytest here). `python tests/test_harness.py [group-prefix]`. Request bodies are byte-compared
+  against `reference/*.har`; control flow is mock-driven. 33 tests, groups: `kyc-body`, `kyc-verify`,
+  `duplicate`, `profile`, `packets`, `kyc-runner`. Node is required (CryptoJS tests).
+  **This suite was mutation-tested** — the code was deliberately broken to confirm each test fails.
+  When adding a KYC behaviour, add a test AND check a mutation trips it; the first version of the
+  `switchToManual` test passed even with the signal handling disabled, because it fired the flag on
+  attempt 3 (the retry ceiling too) — the fix was to fire it on attempt 1 and assert the attempt
+  COUNT, which is the only thing distinguishing "honoured the signal" from "ran out of retries".
+
 ## Layout & entrypoint
 
 - **`src/maintest.py`** — everything lives here. One class: `GoldLoanApiTest`, driven by an argparse CLI (`main()`). Mode is decided by presence of `--customer`:
@@ -19,7 +48,8 @@ Single-file async Python harness that drives the **Augmont Gold Loan (GL) backen
   python src/maintest.py --env uat            # same flow against UAT (gfau); --env test (default) = gfat
   ```
   No `--customer` → `main()` clears `existing_customer_unique_id` so `run_e2e_test` takes the create-customer + full-KYC path. With `--customer` → resolves that customer and skips KYC if already approved. `--amount` sets `GOLD_LOAN_AMOUNT`. Both modes run the identical end-to-end flow through disbursement → submit-packet → load-loan-details. (The constructor default for `GOLD_LOAN_EXISTING_CUSTOMER_UNIQUE_ID` is now `""` — the bare command creates a new customer, it no longer defaults to MS35QNJP.) **Every run logs in fresh — there is no session/token persistence.**
-- **Reference/ground-truth data (do NOT modify): `reference/gold-loan-e2e-flow.har`** — one consolidated HAR of the complete journey (customer/KYC → appraiser → ornaments → scheme → final-loan → bank details → assign packet → ratings → loan documents → partner approval → disbursement → submit packet → load details), 244 API calls. Each entry's `comment` tags its stage (A = customer/KYC/loan/bank/packet/docs, B0 = partner approval, B = disbursement, C = submit-packet/load-details). Merged from four captures, so ids differ across stages — it's a step reference, not one live session. The older per-stage HARs / Postman collection / loan-flow JSON were consolidated into this file and removed.
+- **Reference/ground-truth data (do NOT modify): `reference/gold-loan-e2e-flow.har` and `reference/ovd-kyc-flow.har`** (the latter captures KYC via an OVD instead of PAN: `verify-dl`/`verify-voter-id`, `panType:"ovd"`, Form 97; it ends at the consent OTP).
+  `gold-loan-e2e-flow.har` is one consolidated HAR of the complete journey (customer/KYC → appraiser → ornaments → scheme → final-loan → bank details → assign packet → ratings → loan documents → partner approval → disbursement → submit packet → load details), 244 API calls. Each entry's `comment` tags its stage (A = customer/KYC/loan/bank/packet/docs, B0 = partner approval, B = disbursement, C = submit-packet/load-details). Merged from four captures, so ids differ across stages — it's a step reference, not one live session. The older per-stage HARs / Postman collection / loan-flow JSON were consolidated into this file and removed.
 - Assets (required at runtime, do NOT delete) live in **`assets/`**, resolved via a project-root anchor computed from `__file__` (so CWD-independent): `assets/AADHAR.png` (REAL aadhaar image, 1150x337 — required for KYC upload), `assets/PAN.png`, `assets/scale.jpg` (ornament), `assets/cancelled-cheque-1.png` (bank cheque), `assets/CPV.pdf` (PDF uploads), `assets/dummy_image.png`.
 - Generated at runtime (project root): `loan_calc_debug.json` (eligibility diagnostics dump — read this when debugging final-loan-details). **No session/token files are written — session persistence was removed (it caused stale-state bugs, e.g. a restored `random_pan` → "PAN already exists"; every run logs in fresh).**
 
@@ -38,6 +68,11 @@ Single-file async Python harness that drives the **Augmont Gold Loan (GL) backen
 | `GOLD_LOAN_SCHEME_ID` | Pin one scheme id (e.g. `853`); empty = auto-pick within partner. CLI: `--scheme` |
 | `GOLD_LOAN_CO_LENDER` | Co-lender bank name/id to apply (co-lending); empty = none. CLI: `--co-lender` |
 | `GOLD_LOAN_AMOUNT` | Target loan amount |
+| `GOLD_LOAN_KYC_MODE` | Identity mode: `manual` (default) / `auto` / `ovd`. CLI: `--kyc` |
+| `GOLD_LOAN_KYC_PROFILE` | Real-identity JSON (default `config/kyc_identity.json`). CLI: `--kyc-profile` |
+| `GOLD_LOAN_KYC_*` | Per-field overrides of the identity profile — see `KYC_PROFILE_ENV_KEYS` (`_PAN`, `_AADHAAR`, `_AADHAAR_XML`, `_OVD_TYPE`, `_OVD_NUMBER`, `_OVD_IMAGE`, `_FORM97`, `_DOB`, …) |
+| `GOLD_LOAN_KYC_OVD_TYPE_STRING` | Override the `ovdType` string sent on submit-basic-info |
+| `GOLD_LOAN_KYC_IDENTITY_TYPE_ID` | Override `identityTypeId` (default 5 = Aadhaar) |
 | `GOLD_LOAN_LOG_LEVEL` | `quiet` \| `normal` \| `verbose` |
 | `GOLD_LOAN_HTTP_LOG` | `false` → quiet |
 | `GOLD_LOAN_COLOR` | `auto`/on/off ANSI color |
@@ -92,18 +127,75 @@ Don't add per-endpoint auth or retry logic — change it here.
 - In `submit_all_kyc_info`, `customerKycPersonal` must encrypt the `identityProof` / `unMaskedIdentityProof` **file paths** (not just numbers) — plaintext paths → "Invalid unMasked Identity Proof file". `customerKycBasicDetails` keeps plaintext.
 - **Requires a working `node` on PATH.**
 
+## KYC identity modes (manual / auto / ovd) — `--kyc`, `GOLD_LOAN_KYC_MODE`
+
+`GoldLoanApiTest.KYC_MODES = (manual, auto, ovd)`. Default **manual** — the long-standing behaviour,
+byte-identical to the original capture (17/17 fields on submit-basic-info), so the Postman collection
+and every prior run are unaffected.
+
+| Mode | Identity | Verification | submit-basic-info |
+|---|---|---|---|
+| `manual` | generated dummy PAN + Aadhaar | none (server's manual-validation fallback) | `panType:"pan"`, all `is*Verified:false` |
+| `auto` | REAL PAN + REAL offline-Aadhaar XML | `POST /api/e-kyc/verify-pan`, `POST /api/e-kyc/offline-aadhaar-xml` | `isPanVerified` from the API |
+| `ovd` | REAL Voter ID / DL, **no PAN**, + Form 97 | `POST /api/e-kyc/v2/verify-voter-id`, `POST /api/e-kyc/v2/verify-dl` | `panType:"ovd"`, `panCardNumber:null`, `isOvdVerified:true`, `isAutoApproved:true` |
+
+- **Real identity data is SUPPLIED, never generated** — the APIs check numbers against the issuing
+  authority. `_load_kyc_profile()` reads `config/kyc_identity.json` (`GOLD_LOAN_KYC_PROFILE`), with
+  per-field `GOLD_LOAN_KYC_*` overrides winning. `config/` is gitignored except the example.
+  `_validate_kyc_profile()` fails fast at construction and **resolves every file path against the
+  PROJECT ROOT** (`_resolve_profile_path`) so runs are cwd-independent like the rest of the harness.
+- **Captured OVD contract (`reference/ovd-kyc-flow.har`).** `OVD_CATALOG` maps each OVD to its
+  `ovdType` string, `/api/identity-type` id, endpoint, number field and whether it needs a DOB:
+  `verify-voter-id {epicNo, customerId}`; `verify-dl {dlNo, dob, customerId}`. A success returns
+  `isVerified`, `isDocumentValid`, a `nameComparison` block (customerName / ovdName /
+  nameMatchScore / isNameMatch) and a `data` block (name, gender, dob, address…).
+  **Only Voter ID (`"VoterID"`) is capture-confirmed**; `"DrivingLicense"` is inferred from the
+  identity-type name — override with `GOLD_LOAN_KYC_OVD_TYPE_STRING`. Passport/NREGA have no
+  captured endpoint and are rejected rather than guessed.
+- **The two e-KYC endpoints disagree on DOB format** — `verify-pan` takes ISO
+  (`1982-08-30T00:00:00.000Z`, `_kyc_iso_dob`), `verify-dl` takes `25-11-1996` (`_kyc_ddmmyyyy_dob`).
+  Two helpers exist for exactly this reason; don't unify them.
+- **`offline-aadhaar-xml` body:** `{file: "data:application/xml;base64,<xml>", customerId,
+  aadhaarNumber: <CryptoJS-encrypted>, maskedAadhaarNumber: "XXXXXXXX"+last4}`. The XML and the
+  number must be the same person or it 400s "Aadhaar number does not match with the XML data".
+  UIDAI's `referenceId` starts with the Aadhaar's last 4 digits — a cheap way to check a profile.
+- **`switchToManual` is the server's, not ours.** It counts consecutive failures and flips the flag
+  on the third. `KYC_VERIFY_MAX_ATTEMPTS = 3` mirrors that; the harness honours the signal the
+  moment it appears (it does NOT just exhaust retries), degrades to the manual data path, and
+  records `kyc_mode_requested` vs `kyc_mode_effective` so a degraded run can never read as verified.
+- **DO NOT put the OVD number in `identityProofNumber`.** The address / submit-all section validates
+  it as an **Aadhaar** regardless of the OVD chosen on basic-info — sending the EPIC number 400s
+  **"Invalid Adhaar card format!"** on BOTH `customer-kyc-address` and `submit-all-kyc-info` (a real
+  failure, fixed). OVD mode therefore generates an Aadhaar there exactly like manual, and
+  `kyc_identity_type_id` stays **5 (Aadhaar)** so number, images and type id agree.
+  `ovd-kyc-flow.har` ends at the consent OTP, so it does not cover that step; `OVD_CATALOG` keeps
+  the per-document ids (Voter ID 2, DL 3) and `GOLD_LOAN_KYC_IDENTITY_TYPE_ID` overrides, for when
+  a capture exists. **The loan steps after KYC on the OVD path are likewise uncaptured** —
+  `store_loan_documents` sends `panCardNumber`, which is null there.
+- **A duplicate document ABORTS the run.** `_make_authenticated_request` (the single chokepoint)
+  raises **`KycDocumentAlreadyExistsError`** — a module-level exception, deliberately NOT an
+  `httpx.HTTPStatusError` subclass, so the verify steps' fallback handlers cannot swallow it — when
+  a KYC path returns "already registered / already exists". Checked BEFORE `switchToManual`, so a
+  duplicate never degrades into a dummy-data pass. Scoped by `_kyc_document_label()`: only KYC paths
+  (verify-*, submit-basic-info, customer-kyc-address, submit-all-kyc-info, `/api/customer`) abort —
+  a packet "already exists" must not.
+- **Real-identity runs use the profile's NAME for the customer** (`add_customer`), because the APIs
+  compare it against the issuing authority's record. `save_customer_personal_details` no longer
+  regenerates DOB/gender when a profile supplies them (the usual downstream-clobber trap).
+
 ## KYC flow — v2 (current)
 
 Migrated to `/api/kyc/v2/*` (stage A of `gold-loan-e2e-flow.har`). `_run_full_kyc` order:
 `get_customer_by_id` → `get_kyc_customer_detail` (**`/api/kyc/v2/get-customer-detail`**, body `{customerId, moduleId, kycType}`; captures an existing `customerKycId` from `customerInfo.customerKycPersonal`) → `submit_basic_info` (**`/api/kyc/v2/submit-basic-info`**, replaces old `customer-info`; records PAN, returns/creates `customerKycId` in `data`) → `_kyc_consent_otp` (**new mandatory step**: `/api/customer-otp/send-otp` `{type:"kycConsent", customerId}` → `referenceCode`, then `/api/customer-otp/verify-otp-admin` `{type:"kycConsent", referenceCode, otp:"123456"}`) → `load_kyc_master_data` → `save_customer_address` (**`/api/kyc/v2/customer-kyc-address`**, encrypted identity/address proofs, `isAutoApproved:false`; non-fatal) → `save_customer_personal_details` (**`/api/kyc/v2/customer-kyc-personal`**) → `submit_all_kyc_info` (`/api/kyc/submit-all-kyc-info`, still non-v2, authoritative) → `kyc_ops_approval` (`/api/classification/ops-team`, `userType:"Individual"`).
 - `kyc_type` = `GOLD_LOAN_KYC_TYPE` (default `RE_KYC`). All v2 bodies carry `kycType`.
-- No `PUT /api/kyc/initiate` and no PAN/Aadhaar auto-verify in v2 (`verify-pan` 503s, `offline-aadhaar-xml` 400s → manual path). `initiate_kyc`/`_safe_initiate_kyc` are now unused.
+- `PUT /api/kyc/initiate` is unused by `_run_full_kyc` (`initiate_kyc`/`_safe_initiate_kyc` remain but are not called); `ovd-kyc-flow.har` does still show the UI calling it first.
+- **Auto-verification EXISTS and is now implemented** — see "KYC identity modes" above. The default `manual` mode still skips it (matching the original capture, where `verify-pan` 503s and `offline-aadhaar-xml` 400s and the flow falls through to the manual path); `--kyc auto`/`--kyc ovd` exercise it.
 - Loan side confirmed unchanged by this HAR (Roshan 853, rpg 4533, 400k < 5L). Keep `GOLD_LOAN_AMOUNT` < 500000.
 
 ## KYC flow — domain rules learned the hard way
 
 - **Manual-validation fallback:** on the real UI, after aadhaar/PAN auto-verification fails 3×, the system accepts any number. The harness relies on this — it does NOT call `customer-kyc-address` (that endpoint auto-verifies and rejects). `save_customer_address` is **prepare-only**; KYC is submitted via `submit_all_kyc_info` (the manual path).
-- Masked aadhaar upload must use the real `src/AADHAR.png` image (via `_upload_file(..., file_path_override=...)`) — a dummy PDF gives "Invalid identityProof file".
+- Masked aadhaar upload must use the real `assets/AADHAR.png` image (via `_upload_file(..., file_path_override=...)`) — a dummy PDF gives "Invalid identityProof file".
 - `initiate_kyc` is wrapped by **`_safe_initiate_kyc`** which swallows 400/404 "already submitted/initiated".
 - Existing-customer path uses item-level `id` from the appraiser-request list, NOT the nested customer id (that bug caused "Your loan already initiated").
 
@@ -201,5 +293,6 @@ Authentication → (Create Customer **or** Load Existing Customer) → KYC Proce
 
 Auth/env: `login` (fresh login each run, static OTP 1234), `_role_token` (admin/bm/ops/partner token swap), `_get_mobile_number_for_login_type`, `_partner_key`, `_partner_login_mobile`, `_partner_user_mobile`, `_make_authenticated_request`, `_generate_signature`, `_js_number_normalize`. (Session persistence was removed — no `_save/_load_storage_state`, `_verify_session`, or `_is_token_expired`.)
 Customer/KYC: `add_customer`, `initiate_kyc`/`_safe_initiate_kyc`, `get_customer_by_id`, `get_kyc_customer_detail`, `save_customer_info`, `save_customer_personal_details`, `save_customer_address`, `submit_all_kyc_info`, `kyc_ops_approval`, `_use_existing_customer`, `_run_full_kyc`, `_existing_customer_kyc_ready`, `_prepare_loan_fields_from_existing`.
+KYC modes/verification: `_load_kyc_profile`, `_validate_kyc_profile`, `_resolve_profile_path`, `_verify_pan_auto`, `_verify_aadhaar_xml_auto`, `_verify_ovd_auto`, `_kyc_iso_dob`, `_kyc_ddmmyyyy_dob`, `_kyc_note`, `_kyc_degrade_to_manual`, `_kyc_document_label`, `_is_duplicate_document_error`, `_abort_on_duplicate_document`, `_duplicate_reason`, `_safe_json`, `_age_from_dob`, `_print_kyc_mode_header`, `_print_kyc_verification_summary`; properties `kyc_identity_type_id`, `kyc_uses_real_identity`; constants `KYC_MODES`, `OVD_CATALOG`, `PAN_TYPES`, `KYC_PROFILE_ENV_KEYS`, `KYC_MODE_REQUIRED_FIELDS`, `DUPLICATE_DOCUMENT_MARKERS`; exception `KycDocumentAlreadyExistsError`.
 Loan: `create_appraiser_request`, `_fetch_existing_appraiser_request`, `store_loan_basic_details`, `store_nominee_details`, `store_ornament_details`, `_fetch_gold_rate`, `_fetch_partner_scheme_amount`, `_apply_scheme`, `fetch_co_lender_banks`, `choose_co_lender_interactive`, `check_loan_type`, `get_interest_rate`, `generate_interest_table`, `get_final_loan_details`, `_dump_loan_calc_diagnostics`, `store_bank_details`, `add_*_rating`/`submit_bm_rating_if_required`/`submit_ops_rating`, `add_packet_images`/`create_packet`/`assign_packet`, `update_loan_lock`, `validate_account`, `ops_manual_bank_verification`, `store_loan_documents`, `disburse_amount`/`_partner_disbursement_status`/`_post_partner_disbursement`, `submit_packet`, `fetch_loan_details`.
 Crypto/util: `_encrypt_identity_proof_number`, `_upload_file`, `_round_double`, `_find_key_recursive`.

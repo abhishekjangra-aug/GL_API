@@ -12,6 +12,11 @@ loan_calc_debug.json
 npm-debug.log*
 package-lock.json
 
+# REAL identity data for --kyc auto/ovd (real PAN / Aadhaar / OVD numbers and scans).
+# Never commit these. config/kyc_identity.example.json is the safe template and IS tracked.
+/config/*
+!/config/kyc_identity.example.json
+
 # Editor / OS junk
 .vscode/*
 .idea/

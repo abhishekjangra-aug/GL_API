@@ -16,6 +16,17 @@ import subprocess
 from decimal import Decimal, ROUND_HALF_UP
 
 
+class KycDocumentAlreadyExistsError(Exception):
+    """A KYC document (PAN / Aadhaar / OVD) is already registered against another customer.
+
+    This ABORTS the run instead of degrading to the manual data path. Retrying cannot help -- the
+    number is taken in the database -- and silently continuing would turn a real-identity test into
+    a dummy-data one that reports success, hiding the fact that the document was never usable.
+    Fix the data (use an unregistered document, or point the run at the customer that already owns
+    it with --customer) and re-run.
+    """
+
+
 class GoldLoanApiTest:
 
     # --- Environment profiles -----------------------------------------------------------------
@@ -48,6 +59,71 @@ class GoldLoanApiTest:
         },
     }
     DEFAULT_ENV = "test"
+
+    # --- KYC verification modes ---------------------------------------------------------------
+    # How the customer's identity is established. Chosen with --kyc / GOLD_LOAN_KYC_MODE.
+    #   manual -- generated dummy PAN + Aadhaar, no verification calls. The long-standing default;
+    #             relies on the server's manual-validation fallback, which accepts any number.
+    #   auto   -- REAL PAN and REAL offline-Aadhaar XML, verified through /api/e-kyc/verify-pan
+    #             and /api/e-kyc/offline-aadhaar-xml.
+    #   ovd    -- REAL PAN plus a REAL Officially Valid Document (driving licence / voter id /
+    #             passport / NREGA) instead of Aadhaar -- the CR-2 "PAN & Other OVD" path.
+    # auto and ovd need genuine identity data, which cannot be invented: the verification APIs
+    # check the numbers against the issuing authority. See _load_kyc_profile for how it is supplied.
+    KYC_MODE_MANUAL = "manual"
+    KYC_MODE_AUTO = "auto"
+    KYC_MODE_OVD = "ovd"
+    KYC_MODES = (KYC_MODE_MANUAL, KYC_MODE_AUTO, KYC_MODE_OVD)
+    # The SERVER counts consecutive verification failures and flips `switchToManual` to true on the
+    # third ("pan API failed 3 time(s) in a row -> switching to manual KYC"). We retry to the same
+    # ceiling so the harness reproduces the real UI's behaviour rather than inventing its own.
+    KYC_VERIFY_MAX_ATTEMPTS = 3
+    # OVD catalogue, from ovd.har. Per OVD: the string submit-basic-info expects in `ovdType`, the
+    # /api/identity-type id, the verification endpoint, the field the number goes in, and whether
+    # that endpoint also wants a date of birth.
+    #   Voter ID       -- fully capture-confirmed (verify-voter-id 200, submit-basic-info 200).
+    #   Driving Licence-- endpoint + body confirmed (verify-dl); its `ovdType` STRING is inferred
+    #                     from the identity-type name "Driving License" with the space removed,
+    #                     the same rule that turns "Voter ID" into the confirmed "VoterID". The
+    #                     captured DL call 400'd ("already registered with another customer"), so
+    #                     submit-basic-info was never exercised with DL. Override with
+    #                     GOLD_LOAN_KYC_OVD_TYPE_STRING if the server disagrees.
+    # Passport / NREGA appear in CR-2 but have no captured endpoint, so they are not offered here
+    # rather than being guessed.
+    OVD_CATALOG = {
+        "voterId": {"ovdType": "VoterID", "identityTypeId": 2,
+                    "path": "/api/e-kyc/v2/verify-voter-id", "number_field": "epicNo",
+                    "needs_dob": False, "confirmed": True},
+        "drivingLicense": {"ovdType": "DrivingLicense", "identityTypeId": 3,
+                           "path": "/api/e-kyc/v2/verify-dl", "number_field": "dlNo",
+                           "needs_dob": True, "confirmed": False},
+    }
+    OVD_TYPES = tuple(OVD_CATALOG)
+    # panType on submit-basic-info: 'pan' and 'form60' are the pre-existing values; 'ovd' is what
+    # the OVD path sends (captured), alongside panCardNumber=null and a Form 97 upload.
+    PAN_TYPES = ("pan", "form60", "ovd")
+    # Real identity fields, and the env var that overrides each one from the profile file.
+    KYC_PROFILE_ENV_KEYS = {
+        "firstName": "GOLD_LOAN_KYC_FIRST_NAME",
+        "lastName": "GOLD_LOAN_KYC_LAST_NAME",
+        "dateOfBirth": "GOLD_LOAN_KYC_DOB",              # YYYY-MM-DD
+        "gender": "GOLD_LOAN_KYC_GENDER",                # m | f | o
+        "panCardNumber": "GOLD_LOAN_KYC_PAN",
+        "aadhaarNumber": "GOLD_LOAN_KYC_AADHAAR",        # 12 digits, must match the XML
+        "aadhaarXmlPath": "GOLD_LOAN_KYC_AADHAAR_XML",   # UIDAI offline e-KYC XML on disk
+        "ovdType": "GOLD_LOAN_KYC_OVD_TYPE",
+        "ovdNumber": "GOLD_LOAN_KYC_OVD_NUMBER",
+        "ovdImagePath": "GOLD_LOAN_KYC_OVD_IMAGE",
+        "form97Path": "GOLD_LOAN_KYC_FORM97",
+    }
+    # Fields each mode cannot run without. OVD is the CR-2 "PAN not available" path -- the captured
+    # submit-basic-info sends panCardNumber=null / isPanVerified=false -- so no PAN is required.
+    # DL additionally needs dateOfBirth; that is enforced per-OVD in _validate_kyc_profile.
+    KYC_MODE_REQUIRED_FIELDS = {
+        KYC_MODE_MANUAL: (),
+        KYC_MODE_AUTO: ("panCardNumber", "dateOfBirth", "aadhaarNumber", "aadhaarXmlPath"),
+        KYC_MODE_OVD: ("ovdType", "ovdNumber"),
+    }
 
     def __init__(self):
         # --- Configuration ---
@@ -233,6 +309,30 @@ class GoldLoanApiTest:
         # a fresh customer's KYC also flows through the same v2 endpoints.
         self.kyc_type = os.getenv("GOLD_LOAN_KYC_TYPE", "RE_KYC")
         self.kyc_reference_code = ""  # OTP consent reference (send-otp -> verify-otp-admin)
+        # --- KYC verification mode + real identity data ----------------------------------------
+        self.kyc_mode = (os.getenv("GOLD_LOAN_KYC_MODE", self.KYC_MODE_MANUAL) or "").strip().lower()
+        if self.kyc_mode not in self.KYC_MODES:
+            raise ValueError(f"Unknown KYC mode '{self.kyc_mode}'. Choose one of "
+                             f"{list(self.KYC_MODES)} (--kyc / GOLD_LOAN_KYC_MODE).")
+        # Requested vs effective: an auto/ovd run degrades to manual when the server signals
+        # switchToManual, and the summary must not claim a verification that never happened.
+        self.kyc_mode_requested = self.kyc_mode
+        self.kyc_mode_effective = self.kyc_mode
+        # Verification outcomes, sent on submit-basic-info / customer-kyc-address and reported.
+        self.pan_verified = False
+        self.aadhaar_verified = False
+        self.ovd_verified = False
+        self.kyc_verification_log = []  # (step, outcome, detail) trail shown in the run summary
+        self.ovd_type = ""            # the string submit-basic-info expects, e.g. "VoterID"
+        self.ovd_number = ""          # epic/DL number as issued
+        self.ovd_image = ""           # uploaded OVD scan path
+        self.ovd_name = ""            # name as returned by the OVD API (CR-2 name reconciliation)
+        self.ovd_verification_data = {}  # full `data` block from the verify response
+        self.form97_image = ""        # Form 97 PDF path (replaces Form 60 under IT Rules 2026)
+        # Must come AFTER the ovd_* defaults above: _validate_kyc_profile resolves ovd_type /
+        # ovd_number from the profile, and initialising them afterwards would wipe those values.
+        self.kyc_profile = self._load_kyc_profile()
+        self._validate_kyc_profile()
         self.supplied_auth_token = os.getenv("GOLD_LOAN_AUTH_TOKEN", "")
         self.logged_in_mobile_number = '' # New instance variable
         self.logged_in_appraiser_name = ''
@@ -555,6 +655,13 @@ class GoldLoanApiTest:
 
         return {"age": str(age_val), "dob": dob_date.isoformat()}
 
+    @staticmethod
+    def _age_from_dob(dob: str) -> int:
+        """Whole years between a YYYY-MM-DD date of birth and today."""
+        born = datetime.date.fromisoformat(str(dob)[:10])
+        today = datetime.date.today()
+        return today.year - born.year - ((today.month, today.day) < (born.month, born.day))
+
     def _generate_random_aadhaar_number(self) -> str:
         # Aadhaar uses the Verhoeff checksum; generate eleven random digits and
         # append a valid check digit so the KYC API accepts the format.
@@ -753,8 +860,54 @@ class GoldLoanApiTest:
                 request=response.request,
                 response=response,
             )
+        # Any KYC document already on file for another customer ends the run HERE. Raised from the
+        # chokepoint rather than per-endpoint so it cannot be missed, and as its own exception type
+        # so the verify steps' `except httpx.HTTPStatusError` fallback handlers do not swallow it.
+        if response.status_code >= 400 and self._is_duplicate_document_error(response.text):
+            document = self._kyc_document_label(api_path)
+            if document:
+                self._abort_on_duplicate_document(document, self._duplicate_reason(response))
         response.raise_for_status()
         return response
+
+    @staticmethod
+    def _kyc_document_label(api_path: str) -> str:
+        """Name the document a KYC endpoint deals with, or '' if the path is not KYC-related.
+
+        Scoped deliberately: an "already exists" from an unrelated endpoint (a packet, say) must
+        not abort the run as though a KYC document were duplicated.
+        """
+        path = (api_path or "").lower()
+        for marker, label in (
+            ("verify-pan", "PAN"),
+            ("offline-aadhaar-xml", "Aadhaar"),
+            ("verify-dl", "Driving Licence"),
+            ("verify-voter-id", "Voter ID"),
+            ("verify-passport", "Passport"),
+            ("submit-basic-info", "identity document"),
+            ("customer-kyc-address", "identity document"),
+            ("submit-all-kyc-info", "identity document"),
+            ("customer-kyc-personal", "identity document"),
+        ):
+            if marker in path:
+                return label
+        # Customer creation rejects a duplicate PAN with "PAN Card already exists!".
+        if re.fullmatch(r"/api/customer/?", path.split("?")[0]):
+            return "PAN"
+        return ""
+
+    @classmethod
+    def _duplicate_reason(cls, response) -> str:
+        """Pull the server's own wording out of a duplicate-document rejection."""
+        try:
+            payload = response.json()
+            if isinstance(payload, dict):
+                for key in ("message", "reason", "error"):
+                    if payload.get(key):
+                        return str(payload[key])
+        except (ValueError, json.JSONDecodeError):
+            pass
+        return (response.text or "")[:200]
 
     # --- API Call Methods ---
 
@@ -1200,6 +1353,7 @@ class GoldLoanApiTest:
         existing ones. Mirrors the captured v2 flow: get-customer-detail -> submit-basic-info ->
         consent OTP -> customer-kyc-address -> customer-kyc-personal -> submit-all-kyc-info ->
         ops-team approval. (No PUT /kyc/initiate and no PAN/Aadhaar auto-verification in v2.)"""
+        self._print_kyc_mode_header()
         await self.get_customer_by_id()
         try:
             await self.get_kyc_customer_detail()  # v2: also captures an existing customerKycId
@@ -1215,6 +1369,45 @@ class GoldLoanApiTest:
         await self.submit_all_kyc_info()
         await self.kyc_ops_approval()
         await self.get_customer_by_id()           # Refresh customer data after KYC approval.
+        self._print_kyc_verification_summary()
+
+    def _print_kyc_mode_header(self) -> None:
+        """State up front which identity path this run takes and what it is using."""
+        described = {
+            self.KYC_MODE_MANUAL: "generated dummy PAN + Aadhaar, no verification calls",
+            self.KYC_MODE_AUTO: "REAL PAN + REAL offline-Aadhaar XML, verified via /api/e-kyc",
+            self.KYC_MODE_OVD: "REAL OVD (no PAN) + Form 97, verified via /api/e-kyc/v2",
+        }[self.kyc_mode]
+        details = {"Mode": f"{self.kyc_mode}  -  {described}"}
+        if self.kyc_mode == self.KYC_MODE_AUTO:
+            pan = self.kyc_profile.get("panCardNumber", "")
+            aadhaar = re.sub(r"\D", "", str(self.kyc_profile.get("aadhaarNumber", "")))
+            details["PAN"] = f"{pan[:2]}{'*' * 6}{pan[-2:]}" if len(pan) >= 4 else "(set)"
+            details["Aadhaar"] = f"XXXXXXXX{aadhaar[-4:]}"
+            details["Aadhaar XML"] = self.kyc_profile.get("aadhaarXmlPath")
+        elif self.kyc_mode == self.KYC_MODE_OVD:
+            details["OVD type"] = f"{self.kyc_profile.get('ovdType')} -> ovdType={self.ovd_type!r}"
+            details["OVD number"] = self.ovd_number
+            details["Endpoint"] = self.OVD_CATALOG[self.kyc_profile["ovdType"]]["path"]
+            details["Form 97"] = self.kyc_profile.get("form97Path") or "(dummy PDF)"
+        self._print_summary_table("KYC IDENTITY MODE", details)
+
+    def _print_kyc_verification_summary(self) -> None:
+        """Close the KYC step with what actually verified, so a run that fell back to the manual
+        data path can never be mistaken for a successful real-identity run."""
+        degraded = self.kyc_mode_effective != self.kyc_mode_requested
+        details = {
+            "Requested mode": self.kyc_mode_requested,
+            "Effective mode": self.kyc_mode_effective + ("  (DEGRADED)" if degraded else ""),
+            "PAN verified": self.pan_verified,
+            "Aadhaar verified": self.aadhaar_verified,
+            "OVD verified": self.ovd_verified,
+        }
+        if self.ovd_verified and self.ovd_name:
+            details["Name on OVD"] = f"{self.ovd_name}  (customer: {self.first_name} {self.last_name})"
+        self._print_summary_table("KYC VERIFICATION RESULT", details)
+        for step, outcome, detail in self.kyc_verification_log:
+            print(f"    {self._G['dot']} {step}: {outcome}" + (f" - {detail}" if detail else ""))
 
     async def _existing_customer_kyc_ready(self) -> bool:
         """Return True if the existing customer's KYC is already approved (loan can proceed)."""
@@ -1274,9 +1467,15 @@ class GoldLoanApiTest:
 
     async def add_customer(self):
         api_path = "/api/customer"
+        # On a real-identity run the customer must BE the person the documents belong to: the
+        # verification APIs compare the submitted name against the issuing authority's record
+        # (verify-voter-id returns a nameComparison block), so a random name would not reconcile.
         random_names = self._generate_random_name()
-        self.first_name = random_names['firstName']
-        self.last_name = random_names['lastName']
+        self.first_name = self.kyc_profile.get("firstName") or random_names['firstName']
+        self.last_name = self.kyc_profile.get("lastName") or random_names['lastName']
+        if self.kyc_uses_real_identity and self.kyc_profile.get("firstName"):
+            print(f"Using the identity profile's name for the new customer: "
+                  f"{self.first_name} {self.last_name}")
         self.random_pincode = self._generate_random_pincode()
         # Always mint a FRESH PAN for a new customer. A loaded session may have restored a PAN from a
         # prior run that is already registered on the server -> "PAN Card already exists!". Generating
@@ -1339,29 +1538,446 @@ class GoldLoanApiTest:
         print(f'Customer created successfully. Customer ID: {self.customer_id}')
 
 
+    # --- KYC identity profile + auto-verification -------------------------------------------------
+
+    def _load_kyc_profile(self) -> dict:
+        """Real identity data for the auto/ovd KYC modes.
+
+        Real PAN / Aadhaar / OVD numbers cannot be generated -- the verification APIs check them
+        against the issuing authority, so they must be SUPPLIED. Two sources, env wins over file:
+          1. a JSON file at GOLD_LOAN_KYC_PROFILE (default <project-root>/config/kyc_identity.json)
+          2. per-field GOLD_LOAN_KYC_* overrides (see KYC_PROFILE_ENV_KEYS)
+        The file holds real PII, so config/ is gitignored; keep it off the repo and out of shell
+        history. Returns {} in manual mode -- nothing real is needed there.
+        """
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        default_path = os.path.join(project_root, "config", "kyc_identity.json")
+        path = os.getenv("GOLD_LOAN_KYC_PROFILE", default_path)
+        profile = {}
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    loaded = json.load(fh)
+                if not isinstance(loaded, dict):
+                    raise ValueError("the KYC profile file must contain a JSON object")
+                profile = {k: v for k, v in loaded.items() if v not in (None, "")}
+                print(f"Loaded KYC identity profile from {path} ({len(profile)} field(s)).")
+            except (OSError, ValueError, json.JSONDecodeError) as e:
+                raise ValueError(f"Could not read the KYC identity profile at {path}: {e}") from e
+        # Per-field env overrides win over the file.
+        for field, env_key in self.KYC_PROFILE_ENV_KEYS.items():
+            value = os.getenv(env_key, "").strip()
+            if value:
+                profile[field] = value
+        # Accept friendly spellings of the OVD type and normalise to an OVD_CATALOG key.
+        if profile.get("ovdType"):
+            aliases = {t.lower(): t for t in self.OVD_TYPES}
+            aliases.update({
+                "dl": "drivingLicense", "drivinglicense": "drivingLicense",
+                "drivinglicence": "drivingLicense", "driving_license": "drivingLicense",
+                "voter": "voterId", "voterid": "voterId", "voter_id": "voterId",
+                "epic": "voterId",
+            })
+            key = str(profile["ovdType"]).strip().lower().replace(" ", "").replace("-", "")
+            profile["ovdType"] = aliases.get(key, profile["ovdType"])
+        return profile
+
+    @staticmethod
+    def _resolve_profile_path(path: str) -> str:
+        """Resolve a profile file path against the PROJECT ROOT, not the current directory.
+
+        Every other asset in the harness is anchored to the project root (see __init__) so a run
+        works from any cwd; profile paths must behave the same, otherwise a perfectly correct
+        "assets/voter-card.jpg" resolves from the repo root and fails from anywhere else.
+        Absolute paths are left alone.
+        """
+        path = str(path or "").strip()
+        if not path or os.path.isabs(path):
+            return path
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        anchored = os.path.join(project_root, path)
+        # Prefer the project-root reading, but honour a file that really is relative to the cwd.
+        return anchored if os.path.exists(anchored) or not os.path.exists(path) else os.path.abspath(path)
+
+    def _validate_kyc_profile(self) -> None:
+        """Fail fast at startup when the chosen mode is missing identity data, rather than after a
+        login + customer creation. Also resolves every file path in the profile to an absolute one
+        (anchored at the project root) so a typo surfaces now and the run is cwd-independent."""
+        for key in ("aadhaarXmlPath", "ovdImagePath", "form97Path"):
+            if self.kyc_profile.get(key):
+                self.kyc_profile[key] = self._resolve_profile_path(self.kyc_profile[key])
+        required = self.KYC_MODE_REQUIRED_FIELDS[self.kyc_mode]
+        missing = [f for f in required if not self.kyc_profile.get(f)]
+        if missing:
+            hints = ", ".join(f"{f} ({self.KYC_PROFILE_ENV_KEYS[f]})" for f in missing)
+            raise ValueError(
+                f"KYC mode '{self.kyc_mode}' needs real identity data, but these fields are "
+                f"missing: {hints}.\n"
+                f"Supply them in a JSON profile (GOLD_LOAN_KYC_PROFILE, default "
+                f"config/kyc_identity.json) or via the GOLD_LOAN_KYC_* env vars. "
+                f"Use --kyc manual to run with generated dummy data instead."
+            )
+        if self.kyc_mode == self.KYC_MODE_AUTO:
+            xml_path = self.kyc_profile.get("aadhaarXmlPath")
+            if not os.path.exists(xml_path):
+                raise ValueError(f"Aadhaar offline e-KYC XML not found: {xml_path} "
+                                 f"(GOLD_LOAN_KYC_AADHAAR_XML).")
+            digits = re.sub(r"\D", "", str(self.kyc_profile.get("aadhaarNumber", "")))
+            if len(digits) != 12:
+                raise ValueError(f"aadhaarNumber must be 12 digits, got {len(digits)} "
+                                 f"(GOLD_LOAN_KYC_AADHAAR).")
+            self.kyc_profile["aadhaarNumber"] = digits
+        if self.kyc_mode == self.KYC_MODE_OVD:
+            ovd_type = self.kyc_profile.get("ovdType")
+            if ovd_type not in self.OVD_CATALOG:
+                raise ValueError(
+                    f"ovdType '{ovd_type}' is not supported. Captured OVD endpoints exist for "
+                    f"{list(self.OVD_CATALOG)} (GOLD_LOAN_KYC_OVD_TYPE). Passport and NREGA appear "
+                    f"in CR-2 but have no captured verification call yet.")
+            spec = self.OVD_CATALOG[ovd_type]
+            if spec["needs_dob"] and not self.kyc_profile.get("dateOfBirth"):
+                raise ValueError(f"OVD type '{ovd_type}' verifies against a date of birth; set "
+                                 f"dateOfBirth (GOLD_LOAN_KYC_DOB, YYYY-MM-DD).")
+            # The captured OVD ovdType string is only confirmed for Voter ID; allow an override
+            # rather than making a wrong guess unfixable without a code change.
+            override = os.getenv("GOLD_LOAN_KYC_OVD_TYPE_STRING", "").strip()
+            self.ovd_type = override or spec["ovdType"]
+            self.ovd_number = str(self.kyc_profile["ovdNumber"]).strip()
+            if not spec["confirmed"] and not override:
+                print(f"  NOTE: ovdType string {self.ovd_type!r} for '{ovd_type}' is inferred from "
+                      f"the identity-type name, not captured. Override with "
+                      f"GOLD_LOAN_KYC_OVD_TYPE_STRING if the server rejects it.")
+            for key, env_key in (("ovdImagePath", "GOLD_LOAN_KYC_OVD_IMAGE"),
+                                 ("form97Path", "GOLD_LOAN_KYC_FORM97")):
+                path_value = self.kyc_profile.get(key)
+                if path_value and not os.path.exists(path_value):
+                    raise ValueError(f"{key} file not found: {path_value} ({env_key}).")
+
+    @property
+    def kyc_identity_type_id(self) -> int:
+        """/api/identity-type id of the document standing as identity proof in the KYC address /
+        submit-all section: Aadhaar Card = 5.
+
+        This stays Aadhaar on the OVD path too, and deliberately so. That section validates
+        identityProofNumber as an Aadhaar -- an OVD number there is rejected with "Invalid Adhaar
+        card format!" -- so the number, the uploaded masked/unmasked images and this type id must
+        all remain Aadhaar and agree with each other. The OVD is carried on submit-basic-info,
+        which is the only place ovd.har actually shows it.
+
+        GOLD_LOAN_KYC_IDENTITY_TYPE_ID overrides it if a future capture shows otherwise; the
+        catalogue's per-OVD ids (Voter ID 2, Driving License 3) are kept in OVD_CATALOG for when
+        that capture exists.
+        """
+        override = os.getenv("GOLD_LOAN_KYC_IDENTITY_TYPE_ID", "").strip()
+        if override.isdigit():
+            return int(override)
+        return 5  # Aadhaar Card
+
+    @property
+    def kyc_uses_real_identity(self) -> bool:
+        """True while the run is still on a real-data path (i.e. has not degraded to manual)."""
+        return self.kyc_mode_effective in (self.KYC_MODE_AUTO, self.KYC_MODE_OVD)
+
+    def _kyc_note(self, step: str, ok: bool, detail: str = "") -> None:
+        """Record + print one verification outcome. The trail is reprinted in the run summary so a
+        run that quietly degraded is visible at a glance."""
+        self.kyc_verification_log.append((step, "verified" if ok else "not verified", detail))
+        glyph = self._G["ok"] if ok else self._G["warn"]
+        colour = "green" if ok else "yellow"
+        print(self._c(f"  {glyph} {step}: {'verified' if ok else 'NOT verified'}"
+                      + (f" - {detail}" if detail else ""), colour))
+
+    def _kyc_degrade_to_manual(self, reason: str) -> None:
+        """The server told us to switch to manual (3 consecutive failures), so stop pretending the
+        identity was verified: fall back to the dummy-data path but keep the requested mode on
+        record. Loud on purpose -- a silently-degraded run looks like a passing auto run."""
+        if self.kyc_mode_effective == self.KYC_MODE_MANUAL:
+            return
+        self.kyc_mode_effective = self.KYC_MODE_MANUAL
+        print(self._c(f"  {self._G['warn']} KYC AUTO-VERIFICATION UNAVAILABLE -> falling back to "
+                      f"MANUAL data path", "yellow", "bold"))
+        print(self._c(f"     reason: {reason}", "yellow"))
+        self.kyc_verification_log.append(("mode", "degraded to manual", reason))
+
+    @staticmethod
+    def _kyc_iso_dob(dob: str) -> str:
+        """DOB in the form verify-pan expects: 1982-08-30 -> 1982-08-30T00:00:00.000Z."""
+        dob = str(dob or "").strip()
+        if not dob:
+            return None
+        return dob if "T" in dob else f"{dob[:10]}T00:00:00.000Z"
+
+    async def _verify_pan_auto(self) -> bool:
+        """POST /api/e-kyc/verify-pan -- verify a REAL PAN against the issuing authority.
+
+        Captured body: {customerId, panCardNumber, dateOfBirth}. The response carries
+        `switchToManual` / `switchToManualReason`; the server counts the attempts itself and flips
+        the flag on the third consecutive failure. We retry to the same ceiling and honor that
+        signal instead of imposing our own policy. Returns True only on a genuine verification.
+        """
+        pan = self.kyc_profile.get("panCardNumber") or self.random_pan
+        dob = self._kyc_iso_dob(self.kyc_profile.get("dateOfBirth"))
+        body = {
+            "customerId": int(self.customer_id) if str(self.customer_id).isdigit() else self.customer_id,
+            "panCardNumber": pan,
+            "dateOfBirth": dob,
+        }
+        for attempt in range(1, self.KYC_VERIFY_MAX_ATTEMPTS + 1):
+            try:
+                response = await self._make_authenticated_request(
+                    'POST', "/api/e-kyc/verify-pan", json_data=body)
+                payload = response.json() if response.content else {}
+                if payload.get("switchToManual"):
+                    self._kyc_note("PAN", False, payload.get("switchToManualReason") or "")
+                    self._kyc_degrade_to_manual(
+                        payload.get("switchToManualReason") or "PAN verification switched to manual")
+                    return False
+                self.pan_verified = True
+                self._kyc_note("PAN", True, f"{pan} (attempt {attempt})")
+                return True
+            except httpx.HTTPStatusError as e:
+                payload = self._safe_json(e.response)
+                reason = (payload.get("switchToManualReason") or payload.get("reason")
+                          or payload.get("message") or e.response.text[:120])
+                print(f"  verify-pan attempt {attempt}/{self.KYC_VERIFY_MAX_ATTEMPTS} "
+                      f"-> {e.response.status_code}: {reason}")
+                if payload.get("switchToManual"):
+                    self._kyc_note("PAN", False, reason)
+                    self._kyc_degrade_to_manual(reason)
+                    return False
+        # Ran out of attempts without the server ever setting switchToManual.
+        self._kyc_note("PAN", False, f"failed {self.KYC_VERIFY_MAX_ATTEMPTS} attempt(s)")
+        self._kyc_degrade_to_manual(
+            f"verify-pan failed {self.KYC_VERIFY_MAX_ATTEMPTS} time(s) without a switchToManual signal")
+        return False
+
+    async def _verify_aadhaar_xml_auto(self) -> bool:
+        """POST /api/e-kyc/offline-aadhaar-xml -- verify the UIDAI offline e-KYC XML.
+
+        Captured body: {file: "data:application/xml;base64,<xml>", customerId,
+        aadhaarNumber: <CryptoJS-encrypted>, maskedAadhaarNumber: "XXXXXXXX" + last 4}. The XML and
+        the Aadhaar number must belong to the same person -- a mismatch is rejected with "Aadhaar
+        number does not match with the XML data", which is exactly what the captured (deliberately
+        mismatched) session shows. Same 3-attempt switchToManual contract as verify-pan.
+        """
+        import base64
+        aadhaar = re.sub(r"\D", "", str(self.kyc_profile.get("aadhaarNumber", "")))
+        xml_path = self.kyc_profile.get("aadhaarXmlPath")
+        with open(xml_path, "rb") as fh:
+            encoded = base64.b64encode(fh.read()).decode("ascii")
+        body = {
+            "file": f"data:application/xml;base64,{encoded}",
+            "customerId": int(self.customer_id) if str(self.customer_id).isdigit() else self.customer_id,
+            # Same CryptoJS envelope every other identity number uses.
+            "aadhaarNumber": self._encrypt_identity_proof_number(aadhaar),
+            "maskedAadhaarNumber": f"XXXXXXXX{aadhaar[-4:]}",
+        }
+        for attempt in range(1, self.KYC_VERIFY_MAX_ATTEMPTS + 1):
+            try:
+                response = await self._make_authenticated_request(
+                    'POST', "/api/e-kyc/offline-aadhaar-xml", json_data=body)
+                payload = response.json() if response.content else {}
+                if payload.get("switchToManual"):
+                    self._kyc_note("Aadhaar XML", False, payload.get("reason") or "")
+                    self._kyc_degrade_to_manual(payload.get("reason") or "Aadhaar switched to manual")
+                    return False
+                self.aadhaar_verified = True
+                # A verified XML is authoritative for the name (CR-1: Aadhaar name overrides LOS).
+                data = payload.get("data") if isinstance(payload, dict) else None
+                if isinstance(data, dict) and data.get("name"):
+                    self.name_as_per_aadhaar = str(data["name"])
+                self._kyc_note("Aadhaar XML", True, f"XXXXXXXX{aadhaar[-4:]} (attempt {attempt})")
+                return True
+            except httpx.HTTPStatusError as e:
+                payload = self._safe_json(e.response)
+                reason = (payload.get("reason") or payload.get("message") or e.response.text[:120])
+                print(f"  offline-aadhaar-xml attempt {attempt}/{self.KYC_VERIFY_MAX_ATTEMPTS} "
+                      f"-> {e.response.status_code}: {reason}")
+                if payload.get("switchToManual"):
+                    self._kyc_note("Aadhaar XML", False, reason)
+                    self._kyc_degrade_to_manual(reason)
+                    return False
+        self._kyc_note("Aadhaar XML", False, f"failed {self.KYC_VERIFY_MAX_ATTEMPTS} attempt(s)")
+        self._kyc_degrade_to_manual(
+            f"offline-aadhaar-xml failed {self.KYC_VERIFY_MAX_ATTEMPTS} time(s) "
+            f"without a switchToManual signal")
+        return False
+
+    @staticmethod
+    def _kyc_ddmmyyyy_dob(dob: str) -> str:
+        """DOB in the form verify-dl expects: 1996-11-25 -> 25-11-1996.
+
+        Note this differs from verify-pan, which takes an ISO timestamp -- the two e-KYC endpoints
+        genuinely disagree on the format, so both helpers exist.
+        """
+        dob = str(dob or "").strip()[:10]
+        if not dob:
+            return None
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", dob):
+            y, m, d = dob.split("-")
+            return f"{d}-{m}-{y}"
+        return dob  # already DD-MM-YYYY
+
+    async def _verify_ovd_auto(self) -> bool:
+        """Verify the supplied Officially Valid Document (the CR-2 'PAN not available' path).
+
+        One endpoint per document type -- see OVD_CATALOG:
+            Voter ID       POST /api/e-kyc/v2/verify-voter-id  {epicNo, customerId}
+            Driving Licence POST /api/e-kyc/v2/verify-dl       {dlNo, dob (DD-MM-YYYY), customerId}
+
+        A success carries isVerified/isDocumentValid plus a `nameComparison` block
+        (customerName vs ovdName, nameMatchScore, isNameMatch) and the same
+        switchToManual/reason/attemptCount contract as verify-pan, so the retry policy is shared.
+        The verified document's own name is recorded for the CR-2 name-reconciliation trail.
+        """
+        spec = self.OVD_CATALOG[self.kyc_profile["ovdType"]]
+        body = {
+            spec["number_field"]: self.ovd_number,
+            "customerId": int(self.customer_id) if str(self.customer_id).isdigit() else self.customer_id,
+        }
+        if spec["needs_dob"]:
+            body["dob"] = self._kyc_ddmmyyyy_dob(self.kyc_profile.get("dateOfBirth"))
+        label = f"OVD {self.ovd_type}"
+        for attempt in range(1, self.KYC_VERIFY_MAX_ATTEMPTS + 1):
+            try:
+                response = await self._make_authenticated_request('POST', spec["path"], json_data=body)
+                payload = response.json() if response.content else {}
+                if payload.get("switchToManual"):
+                    self._kyc_note(label, False, payload.get("reason") or "")
+                    self._kyc_degrade_to_manual(payload.get("reason") or "OVD switched to manual")
+                    return False
+                # A 200 that is not actually a verification must not be read as one.
+                if payload.get("isVerified") is False:
+                    self._kyc_note(label, False, payload.get("message") or "isVerified=false")
+                    self._kyc_degrade_to_manual(payload.get("message") or "OVD not verified")
+                    return False
+                self.ovd_verified = True
+                self.ovd_verification_data = payload.get("data") or {}
+                name_cmp = payload.get("nameComparison") or {}
+                self.ovd_name = str(name_cmp.get("ovdName") or self.ovd_verification_data.get("name") or "")
+                detail = f"{self.ovd_number} (attempt {attempt})"
+                if name_cmp:
+                    detail += (f"; name match {name_cmp.get('isNameMatch')} "
+                               f"score={name_cmp.get('nameMatchScore')} "
+                               f"({name_cmp.get('customerName')!r} vs {name_cmp.get('ovdName')!r})")
+                self._kyc_note(label, True, detail)
+                return True
+            except httpx.HTTPStatusError as e:
+                payload = self._safe_json(e.response)
+                reason = (payload.get("reason") or payload.get("message") or e.response.text[:120])
+                print(f"  {spec['path']} attempt {attempt}/{self.KYC_VERIFY_MAX_ATTEMPTS} "
+                      f"-> {e.response.status_code}: {reason}")
+                if payload.get("switchToManual"):
+                    self._kyc_note(label, False, reason)
+                    self._kyc_degrade_to_manual(reason)
+                    return False
+        self._kyc_note(label, False, f"failed {self.KYC_VERIFY_MAX_ATTEMPTS} attempt(s)")
+        self._kyc_degrade_to_manual(f"OVD verification failed {self.KYC_VERIFY_MAX_ATTEMPTS} time(s)")
+        return False
+
+    # Server phrasings that mean "this document is already in the database against someone else".
+    # Captured: verify-dl -> "This DL number is already registered with another customer.";
+    # customer creation -> "PAN Card already exists!".
+    DUPLICATE_DOCUMENT_MARKERS = (
+        "already registered",
+        "already exists",
+        "already linked",
+        "already associated",
+        "already mapped",
+        "already used",
+        "already taken",
+        "is already in use",
+    )
+
+    @classmethod
+    def _is_duplicate_document_error(cls, text: str) -> bool:
+        """True when a rejection means the document is already on file for another customer."""
+        low = str(text or "").lower()
+        return any(marker in low for marker in cls.DUPLICATE_DOCUMENT_MARKERS)
+
+    def _abort_on_duplicate_document(self, document: str, reason: str) -> None:
+        """Stop the run the instant a document turns out to be already registered.
+
+        Requested behaviour: any KYC document already present in the DB ends the test immediately
+        rather than falling back to manual, because a run that quietly degrades would report a pass
+        for a document that can never be used.
+        """
+        self._kyc_note(document, False, reason)
+        self.kyc_verification_log.append(("mode", "aborted", f"{document} already registered"))
+        print(self._c(f"  {self._G['fail']} {document.upper()} ALREADY REGISTERED - STOPPING THE RUN",
+                      "red", "bold"))
+        raise KycDocumentAlreadyExistsError(
+            f"{document} is already registered in the KYC database: {reason}\n"
+            f"  The run stops here rather than falling back to dummy data.\n"
+            f"  Use a document that is not yet registered, or run against the customer that "
+            f"already owns it (--customer <uniqueId>)."
+        )
+
+    @staticmethod
+    def _safe_json(response) -> dict:
+        """Parse a response body as JSON, returning {} instead of raising on a non-JSON error page."""
+        try:
+            payload = response.json()
+        except (ValueError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
     async def submit_basic_info(self):
             # KYC v2: submit-basic-info replaces the old /api/kyc/customer-info. It records the PAN/
             # basic details and returns the customerKycId (creating the KYC record for a fresh
             # customer). PAN auto-verification (/api/e-kyc/verify-pan) is skipped -- it 503s in the
             # captured flow and the manual path continues with isPanVerified=false.
             api_path = "/api/kyc/v2/submit-basic-info"
-            if not self.random_pan:
-                self.random_pan = self._generate_random_pan()
-            if not self.pan_type:
-                self.pan_type = os.getenv("GOLD_LOAN_PAN_TYPE", "pan").lower()
-            if self.pan_type not in {"pan", "form60"}:
-                raise ValueError("GOLD_LOAN_PAN_TYPE must be either 'pan' or 'form60'.")
 
-            if self.pan_type == "pan" and not self.pan_image:
-                upload_result = await self._upload_file(
-                    "lead", file_type="image", file_path_override=self.PAN_IMAGE_PATH)
-                self.pan_image = upload_result['uploadFile']['path']
-                self.form60_image = None
-            elif self.pan_type != "pan" and not self.form60_image:
-                upload_result = await self._upload_file("lead", file_type="pdf")
-                self.form60_image = upload_result['uploadFile']['path']
+            if self.kyc_mode == self.KYC_MODE_OVD:
+                # CR-2 "PAN not available" path (ovd.har): panType 'ovd', panCardNumber null, an OVD
+                # scan and a Form 97 PDF uploaded, and the OVD verified through its own endpoint.
+                self.pan_type = "ovd"
+                self.random_pan = None
                 self.pan_image = None
+                self.form60_image = None
+                if not self.ovd_image:
+                    ovd_src = self.kyc_profile.get("ovdImagePath")
+                    upload_result = await self._upload_file(
+                        "lead", file_type="image",
+                        **({"file_path_override": ovd_src} if ovd_src else {}))
+                    self.ovd_image = upload_result['uploadFile']['path']
+                if not self.form97_image:
+                    form97_src = self.kyc_profile.get("form97Path")
+                    upload_result = await self._upload_file(
+                        "lead", file_type="pdf",
+                        **({"file_path_override": form97_src} if form97_src else {}))
+                    self.form97_image = upload_result['uploadFile']['path']
+                await self._verify_ovd_auto()
+            else:
+                # PAN path. In auto mode the PAN is the real one from the identity profile and is
+                # verified against the issuing authority; in manual mode it stays generated and
+                # unverified, relying on the server's manual-validation fallback.
+                if self.kyc_mode == self.KYC_MODE_AUTO and self.kyc_profile.get("panCardNumber"):
+                    self.random_pan = self.kyc_profile["panCardNumber"]
+                if not self.random_pan:
+                    self.random_pan = self._generate_random_pan()
+                if not self.pan_type or self.pan_type == "ovd":
+                    self.pan_type = os.getenv("GOLD_LOAN_PAN_TYPE", "pan").lower()
+                if self.pan_type not in self.PAN_TYPES:
+                    raise ValueError(f"GOLD_LOAN_PAN_TYPE must be one of {list(self.PAN_TYPES)}.")
 
+                if self.pan_type == "pan" and not self.pan_image:
+                    upload_result = await self._upload_file(
+                        "lead", file_type="image", file_path_override=self.PAN_IMAGE_PATH)
+                    self.pan_image = upload_result['uploadFile']['path']
+                    self.form60_image = None
+                elif self.pan_type != "pan" and not self.form60_image:
+                    upload_result = await self._upload_file("lead", file_type="pdf")
+                    self.form60_image = upload_result['uploadFile']['path']
+                    self.pan_image = None
+
+                if self.kyc_mode == self.KYC_MODE_AUTO:
+                    await self._verify_pan_auto()
+
+            # isAutoApproved tracks whether an identity document actually verified (captured: true
+            # on the successful OVD submission, false on the manual PAN one).
+            is_auto_approved = bool(self.pan_verified or self.ovd_verified)
             request_body = {
                 "id": int(self.customer_id) if self.customer_id and str(self.customer_id).isdigit() else self.customer_id,
                 "moduleId": str(self.module_id),
@@ -1371,16 +1987,20 @@ class GoldLoanApiTest:
                 "panCardNumber": self.random_pan,
                 "panImage": self.pan_image,
                 "panImg": f"{self.BASE_URL}/{self.pan_image}" if self.pan_image else None,
-                "ovdImage": None,
-                "ovdImg": None,
-                "ovdNumber": None,
-                "ovdType": None,
+                "ovdImage": self.ovd_image or None,
+                "ovdImg": f"{self.BASE_URL}/{self.ovd_image}" if self.ovd_image else None,
+                "ovdNumber": self.ovd_number or None,
+                "ovdType": self.ovd_type or None,
                 "dateOfBirth": None,
-                "isAutoApproved": False,
-                "isPanVerified": False,
-                "isOvdVerified": False,
+                "isAutoApproved": is_auto_approved,
+                "isPanVerified": self.pan_verified,
+                "isOvdVerified": self.ovd_verified,
                 "kycType": self.kyc_type,
             }
+            # Form 97 replaces Form 60 under IT Rules 2026 and rides along on the OVD path only.
+            if self.form97_image:
+                request_body["form97Image"] = self.form97_image
+                request_body["form97Img"] = f"{self.BASE_URL}/{self.form97_image}"
             response = await self._make_authenticated_request(
                 'POST',
                 api_path,
@@ -1524,10 +2144,22 @@ class GoldLoanApiTest:
 
     async def save_customer_personal_details(self):
         api_path = "/api/kyc/v2/customer-kyc-personal"  # v2 endpoint
-        dob_and_age = self._generate_random_dob_and_age()
-        self.age = int(dob_and_age['age'])
-        self.dob = dob_and_age['dob']
-        self.gender = self.random.choice(["m", "f", "o"])
+        # DOB/gender: a real identity profile is authoritative -- regenerating them here would
+        # contradict the PAN/Aadhaar/OVD the run just verified against those very values.
+        profile_dob = self.kyc_profile.get("dateOfBirth") if self.kyc_uses_real_identity else None
+        if profile_dob:
+            self.dob = str(profile_dob)[:10]
+            self.age = self._age_from_dob(self.dob)
+        else:
+            dob_and_age = self._generate_random_dob_and_age()
+            self.age = int(dob_and_age['age'])
+            self.dob = dob_and_age['dob']
+        profile_gender = self.kyc_profile.get("gender") if self.kyc_uses_real_identity else None
+        # A verified OVD reports the holder's gender ("M"/"F"); prefer it over a random pick.
+        ovd_gender = str(self.ovd_verification_data.get("gender") or "").strip().lower()[:1]
+        self.gender = (str(profile_gender).strip().lower()[:1] if profile_gender
+                       else (ovd_gender if ovd_gender in ("m", "f", "o")
+                             else self.random.choice(["m", "f", "o"])))
         self.martial_status = self.random.choice(["single", "married", "divorced"])
         spouse_names = self._generate_random_name()
         self.spouse_name = f"{spouse_names['firstName']} {spouse_names['lastName']}"
@@ -1639,13 +2271,30 @@ class GoldLoanApiTest:
         # captured working KYC flow (which never calls customer-kyc-address).
         await self._fetch_address_proof_types()
 
-        self.identity_proof_number = self._generate_random_aadhaar_number()
+        # The identity proof depends on the KYC mode:
+        #   auto   -- the REAL Aadhaar from the profile, verified against its offline e-KYC XML.
+        #   ovd    -- the verified OVD number stands in for Aadhaar (CR-2 'PAN not available').
+        #   manual -- a generated Aadhaar, accepted by the server's manual-validation fallback.
+        if self.kyc_mode == self.KYC_MODE_AUTO:
+            self.identity_proof_number = self.kyc_profile["aadhaarNumber"]
+            await self._verify_aadhaar_xml_auto()
+        else:
+            # Both manual AND ovd generate an Aadhaar here. The identity/address section validates
+            # identityProofNumber as an AADHAAR regardless of the OVD selected on the basic-info
+            # step: sending the OVD number (e.g. the EPIC "IRU0628347") is rejected by BOTH
+            # customer-kyc-address and submit-all-kyc-info with "Invalid Adhaar card format!".
+            # ovd.har stops at the consent OTP, so it does not cover this step -- until a capture
+            # of customer-kyc-address on the OVD path exists, the proven manual behaviour stands.
+            self.identity_proof_number = self._generate_random_aadhaar_number()
         # Do not encrypt file paths, only sensitive numbers
         self.encrypted_identity_proof_number = self._encrypt_identity_proof_number(
             self.identity_proof_number
         )
         same_as_permanent = self.random.choice([True, False])
-        self.name_as_per_aadhaar = f"{self.first_name} {self.last_name}"
+        # A verified document's own name is authoritative (CR-1: Aadhaar name overrides the LOS
+        # name; CR-2: the OVD/PAN name drives reconciliation in the fallback paths).
+        if not self.name_as_per_aadhaar:
+            self.name_as_per_aadhaar = self.ovd_name or f"{self.first_name} {self.last_name}"
 
         # The Aadhaar masking service needs a real Aadhaar *image* (not the dummy PDF); masking a
         # dummy PDF yields an invalid masked file that customer-kyc-address rejects with
@@ -1726,13 +2375,13 @@ class GoldLoanApiTest:
             v2_body = {
                 "customerId": int(self.customer_id) if str(self.customer_id).isdigit() else self.customer_id,
                 "customerKycId": int(self.customer_kyc_id) if str(self.customer_kyc_id).isdigit() else self.customer_kyc_id,
-                "identityTypeId": 5,
+                "identityTypeId": self.kyc_identity_type_id,
                 "identityProof": [enc(self.masked_identity_proof)] if self.masked_identity_proof else [],
                 "unMaskedIdentityProof": [enc(self.unmasked_identity_proof)] if self.unmasked_identity_proof else [],
                 "identityProofImg": [enc(f"{self.BASE_URL}/{self.masked_identity_proof}")] if self.masked_identity_proof else [],
                 "identityProofFileName": [enc(self.masked_identity_proof)] if self.masked_identity_proof else [],
                 "identityProofNumber": self.encrypted_identity_proof_number,
-                "isAutoApproved": False,
+                "isAutoApproved": bool(self.aadhaar_verified or self.ovd_verified),
                 "nameAsPerAadhaar": self.name_as_per_aadhaar,
                 "file": None,
                 "xmlFileName": None,
@@ -1740,12 +2389,14 @@ class GoldLoanApiTest:
                 "latitude": self.latitude,
                 "longitude": self.longitude,
                 "isCityEdit": False,
-                "isAahaarVerified": False,
+                "isAahaarVerified": self.aadhaar_verified,  # server's spelling, not a typo here
                 "kycType": self.kyc_type,
             }
             await self._make_authenticated_request('POST', "/api/kyc/v2/customer-kyc-address", json_data=v2_body)
             print('Submitted customer-kyc-address (v2).')
         except httpx.HTTPStatusError as e:
+            # A duplicate document never reaches here: _make_authenticated_request raises
+            # KycDocumentAlreadyExistsError, which this handler deliberately does not catch.
             print(f"customer-kyc-address (v2) rejected (continuing via submit-all-kyc-info): "
                   f"{e.response.status_code} - {e.response.text[:120]}")
 
@@ -1787,7 +2438,7 @@ class GoldLoanApiTest:
         # just like identityProofNumber. Sending plaintext paths here makes the server reject them
         # with "Invalid (unMasked) Identity Proof file". customerKycBasicDetails keeps plaintext.
         kyc_personal.update({
-            "identityTypeId": 5,
+            "identityTypeId": self.kyc_identity_type_id,
             "identityProof": [self._encrypt_identity_proof_number(self.masked_identity_proof)] if self.masked_identity_proof else [],
             "unMaskedIdentityProof": [self._encrypt_identity_proof_number(self.unmasked_identity_proof)] if self.unmasked_identity_proof else [],
             "identityProofNumber": self.encrypted_identity_proof_number,
@@ -1813,7 +2464,7 @@ class GoldLoanApiTest:
             "form60": None,
             "panImage": self.pan_image,
             "panImg": f"{self.BASE_URL}/{self.pan_image}" if self.pan_image else None,
-            "identityTypeId": 5,
+            "identityTypeId": self.kyc_identity_type_id,
             "identityProof": [self.masked_identity_proof],
             "unMaskedIdentityProof": [self.unmasked_identity_proof],
             "identityProofFileName": None,
@@ -4705,6 +5356,19 @@ def main():
                         help="Apply co-lending. Give a bank name/id (e.g. 'DCB' or 4), OR pass "
                              "--co-lender with NO value to choose from a menu of available co-lenders. "
                              "Omit the flag entirely for NO co-lending.")
+    parser.add_argument("--kyc", choices=list(GoldLoanApiTest.KYC_MODES),
+                        default=os.getenv("GOLD_LOAN_KYC_MODE", GoldLoanApiTest.KYC_MODE_MANUAL),
+                        help="How the customer's identity is established (default: %(default)s). "
+                             "'manual' = generated dummy PAN/Aadhaar, no verification calls. "
+                             "'auto' = REAL PAN + REAL offline-Aadhaar XML, verified via "
+                             "/api/e-kyc/verify-pan and /api/e-kyc/offline-aadhaar-xml. "
+                             "'ovd' = REAL Officially Valid Document instead of PAN (Voter ID or "
+                             "Driving Licence) + Form 97, verified via /api/e-kyc/v2. "
+                             "auto and ovd need real identity data -- see --kyc-profile.")
+    parser.add_argument("--kyc-profile", metavar="PATH",
+                        help="JSON file holding the REAL identity data for --kyc auto/ovd "
+                             "(default: config/kyc_identity.json). Real numbers cannot be "
+                             "generated, so they are supplied here or via GOLD_LOAN_KYC_* env vars.")
     parser.add_argument("--login", default="appraiser",
                         help="Login role for the main flow (default: appraiser).")
     parser.add_argument("--amount", type=float,
@@ -4715,6 +5379,10 @@ def main():
     # Environment must be set before the suite is constructed -- it picks the base URL and the
     # login mobiles for every role.
     os.environ["GOLD_LOAN_ENV"] = args.env
+    # KYC mode + identity profile are read by the constructor, so set them before it runs.
+    os.environ["GOLD_LOAN_KYC_MODE"] = args.kyc
+    if args.kyc_profile:
+        os.environ["GOLD_LOAN_KYC_PROFILE"] = args.kyc_profile
 
     # Map the (single) partner choice to the name filter _fetch_partner_scheme_amount matches against.
     partner_env = {"roshan": "ROSHAN PARTNER", "arvog": "ARVOG"}[args.partner]
@@ -4745,6 +5413,9 @@ def main():
     else:
         co_lender_label = "off"
     print(f">> Environment: {args.env.upper()} ({suite.BASE_URL})")
+    print(f">> KYC mode: {args.kyc}"
+          + ("  (real identity data)" if args.kyc != GoldLoanApiTest.KYC_MODE_MANUAL
+             else "  (generated dummy data)"))
     print(f">> Partner: {args.partner} ({partner_env})"
           + (f"  |  scheme: {args.scheme}" if args.scheme else "")
           + f"  |  co-lending: {co_lender_label}")
