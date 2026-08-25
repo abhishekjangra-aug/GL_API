@@ -1,0 +1,275 @@
+{
+  "_comment": "LIC collection accounts used as the customer’s payout account on the loan application. Taken from LIST-OF-ALL-BANK-DETAILS-UPDATED26112019.pdf, every account it lists. The penny-drop (validate-account) reaches the real bank and rejects accounts unpredictably, so specs walk this list in order and keep the first that verifies. Accounts observed to verify come first so a run settles on one immediately, then pool accounts, then scheme-specific ones.",
+  "accounts": [
+    {
+      "label": "HDFC — LIC MF LIQUID FUND",
+      "ifscCode": "HDFC0000060",
+      "accountNumber": "00600350006733"
+    },
+    {
+      "label": "ICICI — LIC MUTUAL FUND",
+      "ifscCode": "ICIC0000004",
+      "accountNumber": "000405007942"
+    },
+    {
+      "label": "AXIS — LIC MUTUAL FUND POOL A/C.",
+      "ifscCode": "UTIB0000004",
+      "accountNumber": "173010200004886"
+    },
+    {
+      "label": "KOTAK — LIC MUTUAL FUND POOL A/C.",
+      "ifscCode": "KKBK0000958",
+      "accountNumber": "0711993660"
+    },
+    {
+      "label": "KOTAK — LIC MUTUAL FUND ONLINE A/C",
+      "ifscCode": "KKBK0000958",
+      "accountNumber": "0711993677"
+    },
+    {
+      "label": "YES — LIC MUTUAL FUND POOL A/C.",
+      "ifscCode": "YESB0000004",
+      "accountNumber": "000485700000677"
+    },
+    {
+      "label": "SCB — LIC MUTUAL FUND",
+      "ifscCode": "SCBL0036001",
+      "accountNumber": "22205277507"
+    },
+    {
+      "label": "IDBI — LIC MUTUAL FUND",
+      "ifscCode": "IBKL0000004",
+      "accountNumber": "0142005048200"
+    },
+    {
+      "label": "CITI — LIC MUTUAL FUND",
+      "ifscCode": "CITI0100000",
+      "accountNumber": "0002711001"
+    },
+    {
+      "label": "CORP — LIC MUTUAL FUND CASH COLLECTION A/C",
+      "ifscCode": "CORP0000221",
+      "accountNumber": "510101006089320"
+    },
+    {
+      "label": "CORP — LIC MUTUAL FUND POOL A/C.",
+      "ifscCode": "CORP0000221",
+      "accountNumber": "510101006089304"
+    },
+    {
+      "label": "INDUSIND — LIC MUTUAL FUND POOL A/C.",
+      "ifscCode": "INDB0000006",
+      "accountNumber": "201000696127"
+    },
+    {
+      "label": "SBI — LIC MUTUAL FUND POOL A/C.",
+      "ifscCode": "SBIN0011777",
+      "accountNumber": "00000036150491589"
+    },
+    {
+      "label": "RBL — LIC MF POOL A/C",
+      "ifscCode": "RATN0000070",
+      "accountNumber": "409000559756"
+    },
+    {
+      "label": "PNB — LIC MUTUAL FUND POOL A/C.",
+      "ifscCode": "PUNB0006200",
+      "accountNumber": "0062002100154881"
+    },
+    {
+      "label": "KARNATAKA — LIC MUTUAL FUND POOL A/C.",
+      "ifscCode": "KARB0000101",
+      "accountNumber": "1012000100641501"
+    },
+    {
+      "label": "IDFC — LIC MF POOL A/C.",
+      "ifscCode": "IDFB0040101",
+      "accountNumber": "10030515103"
+    },
+    {
+      "label": "RBL — LIC MF LIQUID FUND A/C",
+      "ifscCode": "RATN0000070",
+      "accountNumber": "409000581588"
+    },
+    {
+      "label": "ICICI — LIC MF LIQUID FUND COLL A/C",
+      "ifscCode": "ICIC0000004",
+      "accountNumber": "000405007899"
+    },
+    {
+      "label": "ICICI — LIC MF BANKING & PSU DEBT FUND",
+      "ifscCode": "ICIC0000004",
+      "accountNumber": "039305002135"
+    },
+    {
+      "label": "ICICI — LIC MF SAVINGS FUND COLLECTION A/C",
+      "ifscCode": "ICIC0000004",
+      "accountNumber": "039305002649"
+    },
+    {
+      "label": "AXIS — LIC MF LIQUID FUND",
+      "ifscCode": "UTIB0000004",
+      "accountNumber": "173010200000374"
+    },
+    {
+      "label": "AXIS — LIC MF BANKING & PSU DEBT FUND",
+      "ifscCode": "UTIB0000004",
+      "accountNumber": "173010200008358"
+    },
+    {
+      "label": "AXIS — LIC MF SAVINGS FUND",
+      "ifscCode": "UTIB0000004",
+      "accountNumber": "173010200015738"
+    },
+    {
+      "label": "KOTAK — LIC MF LIQUID FUND COLLECTION A/C",
+      "ifscCode": "KKBK0000958",
+      "accountNumber": "7811721148"
+    },
+    {
+      "label": "KOTAK — LIC MF BOND FUND COLLECTION A/C",
+      "ifscCode": "KKBK0000958",
+      "accountNumber": "7811721155"
+    },
+    {
+      "label": "KOTAK — LIC MF GOVT. SECURITIES FUND COLLECTION A/C.",
+      "ifscCode": "KKBK0000958",
+      "accountNumber": "7811721162"
+    },
+    {
+      "label": "YES — LIC MF LIQUID FUND COLLECTION A/C.",
+      "ifscCode": "YESB0000004",
+      "accountNumber": "000485700000781"
+    },
+    {
+      "label": "SARASWAT — LIC MF LIQUID FUND COLLECTION A/C",
+      "ifscCode": "SRCB0000369",
+      "accountNumber": "369100100000183"
+    },
+    {
+      "label": "HSBC — LIC MF LIQUID FUND COLLECTION A/C",
+      "ifscCode": "HSBC0400002",
+      "accountNumber": "006-089866-001"
+    },
+    {
+      "label": "HDFC — LIC MF TAX PLAN",
+      "ifscCode": "HDFC0000060",
+      "accountNumber": "00600350000426"
+    },
+    {
+      "label": "HDFC — LIC MF BOND FUND",
+      "ifscCode": "HDFC0000060",
+      "accountNumber": "00600350000453"
+    },
+    {
+      "label": "HDFC — LIC MF GOVT. SECURITIES FUND",
+      "ifscCode": "HDFC0000060",
+      "accountNumber": "00600350000556"
+    },
+    {
+      "label": "HDFC — LIC MF CHILDRENS GIFT FUND",
+      "ifscCode": "HDFC0000060",
+      "accountNumber": "00600350003356"
+    },
+    {
+      "label": "HDFC — LIC MF ULIS",
+      "ifscCode": "HDFC0000060",
+      "accountNumber": "00600350003469"
+    },
+    {
+      "label": "HDFC — LIC MF MULTICAP FUND",
+      "ifscCode": "HDFC0000060",
+      "accountNumber": "00600350005410"
+    },
+    {
+      "label": "HDFC — LIC MF INDEX SENSEX PLAN",
+      "ifscCode": "HDFC0000060",
+      "accountNumber": "00600350005948"
+    },
+    {
+      "label": "HDFC — LIC MF SAVINGS FUND",
+      "ifscCode": "HDFC0000060",
+      "accountNumber": "00600350007950"
+    },
+    {
+      "label": "HDFC — LIC MF DEBT HYBRID FUND",
+      "ifscCode": "HDFC0000060",
+      "accountNumber": "00600350007960"
+    },
+    {
+      "label": "HDFC — LIC MF LARGE CAP FUND",
+      "ifscCode": "HDFC0000060",
+      "accountNumber": "00600350008934"
+    },
+    {
+      "label": "HDFC — LIC MF EQUITY HYBRID FUND",
+      "ifscCode": "HDFC0000060",
+      "accountNumber": "00600350009557"
+    },
+    {
+      "label": "HDFC — LIC MF INDEX NIFTY PLAN",
+      "ifscCode": "HDFC0000060",
+      "accountNumber": "00600350009660"
+    },
+    {
+      "label": "HDFC — LIC MF BANKING & PSU DEBT FUND",
+      "ifscCode": "HDFC0000060",
+      "accountNumber": "00600350035355"
+    },
+    {
+      "label": "HDFC — LIC MF INFRASTRUCTURE FUND COLL A/C",
+      "ifscCode": "HDFC0000060",
+      "accountNumber": "00600350094541"
+    },
+    {
+      "label": "HDFC — LIC MF GSEC LT ETF COLLECTION A/C",
+      "ifscCode": "HDFC0000060",
+      "accountNumber": "00600350133931"
+    },
+    {
+      "label": "HDFC — LIC MF LARGE & MIDCAP FUND",
+      "ifscCode": "HDFC0000060",
+      "accountNumber": "00600350135287"
+    },
+    {
+      "label": "HDFC — LIC MF BANKING AND FINANCIAL SERVICES FUND COLLECTION A/C",
+      "ifscCode": "HDFC0000060",
+      "accountNumber": "00600350135909"
+    },
+    {
+      "label": "HDFC — LIC MF ETF SENSEX COLLECTION A/C",
+      "ifscCode": "HDFC0000060",
+      "accountNumber": "00600350142055"
+    },
+    {
+      "label": "HDFC — LIC MF ETF NIFTY 50 COLLECTION A/C",
+      "ifscCode": "HDFC0000060",
+      "accountNumber": "00600350142089"
+    },
+    {
+      "label": "HDFC — LIC MF ETF NIFTY 100 COLLECTION A/C.",
+      "ifscCode": "HDFC0000060",
+      "accountNumber": "00600350143506"
+    },
+    {
+      "label": "HDFC — LIC MF ARBITRAGE FUND",
+      "ifscCode": "HDFC0000060",
+      "accountNumber": "57500000317178"
+    },
+    {
+      "label": "HDFC — LIC MF SHORT TERM DEBT FUND",
+      "ifscCode": "HDFC0000060",
+      "accountNumber": "57500000317270"
+    },
+    {
+      "label": "HDFC — LIC MF OVERNIGHT FUND",
+      "ifscCode": "HDFC0000060",
+      "accountNumber": "00600350133560"
+    },
+    {
+      "label": "HDFC — LIC MF ULTRA SHORT TERM FUND",
+      "ifscCode": "HDFC0000060",
+      "accountNumber": "00600350133533"
+    }
+  ]
+}

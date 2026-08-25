@@ -153,6 +153,11 @@ class GoldLoanApiTest:
         self.PAN_IMAGE_PATH = os.path.join(_assets, "PAN.png")                   # KYC PAN card
         self.ORNAMENT_IMAGE_PATH = os.path.join(_assets, "scale.jpg")           # loan ornament image (gold on scale)
         self.CHEQUE_IMAGE_PATH = os.path.join(_assets, "cancelled-cheque-1.png")  # bank details (cancelled cheque)
+        # Candidate customer payout accounts for the penny-drop (see _load_bank_accounts).
+        self.BANK_ACCOUNTS_PATH = os.path.join("reference", "bank_accounts.json")
+        self.DEFAULT_BANK_ACCOUNT = {"label": "SBI - LIC MUTUAL FUND POOL A/C.",
+                                    "ifscCode": "SBIN0011777",
+                                    "accountNumber": "00000036150491589"}
 
         self.log_http = os.getenv("GOLD_LOAN_HTTP_LOG", "true").lower() not in {"0", "false", "no"}
         # Console verbosity: quiet | normal | verbose. Back-compat: HTTP_LOG=false => quiet.
@@ -223,6 +228,17 @@ class GoldLoanApiTest:
         self.customer_details = {}  # To store the full customer KYC review object
         self.appraiser_id = ''
         self.appraiser_request_id = ''
+        # An already-existing appraiser request is RESUMED by default; --fresh-request /
+        # GOLD_LOAN_FRESH_APPRAISER_REQUEST=true cancels it and creates a new one instead.
+        self.reuse_existing_request = os.getenv("GOLD_LOAN_FRESH_APPRAISER_REQUEST", "").lower() not in ("1", "true", "yes")
+        self._existing_request_status = ''
+        self._existing_process_complete = False
+        self._existing_loan_completed = False
+        self._existing_request_appraiser_id = None
+        self._branch_attempts = []  # per-attempt results of the alternate-branch create ladder
+        self.bank_account_label = ''
+        # How many candidate payout accounts the penny-drop may walk (each one hits a real bank).
+        self.bank_account_attempts = int(os.getenv("GOLD_LOAN_BANK_ACCOUNT_ATTEMPTS", "12") or 0)
         self.master_loan_id = ''
         self.loan_id = ''
         self.reference_code = ''
@@ -2574,36 +2590,110 @@ class GoldLoanApiTest:
         self.loan_id = str(loan_id or master_loan.get("id"))
         return True
 
-    async def _fetch_existing_appraiser_request(self) -> None:
-        api_path = (
-            "/api/appraiser-request/view-all?from=1&to=25&search="
-            f"{urllib.parse.quote(self.customer_unique_id)}"
-        )
-        response = await self._make_authenticated_request('GET', api_path)
-        data = response.json().get("data") if isinstance(response.json(), dict) else None
-        items = data if isinstance(data, list) else []
+    async def _list_appraiser_requests(self, search: str = "", max_pages: int = 8, page_size: int = 25):
+        """Page through /appraiser-request/view-all and return every item.
 
-        # Match by the item's *own* customer, then use the item-level id (the appraiser request id).
-        # NOTE: item["customer"]["id"] is the CUSTOMER id, not the request id — do not use it here.
-        match = None
+        `search` is optional: the server's search filter does not reliably cover
+        customerUniqueId, so callers fall back to an unfiltered scan.
+        """
+        items = []
+        for page in range(max_pages):
+            frm = page * page_size + 1
+            to = frm + page_size - 1
+            api_path = f"/api/appraiser-request/view-all?from={frm}&to={to}"
+            if search:
+                api_path += f"&search={urllib.parse.quote(str(search))}"
+            response = await self._make_authenticated_request('GET', api_path)
+            body = response.json() if response.content else {}
+            body = body if isinstance(body, dict) else {}
+            page_items = body.get("data")
+            page_items = page_items if isinstance(page_items, list) else []
+            items.extend(x for x in page_items if isinstance(x, dict))
+            pagination = body.get("pagination") if isinstance(body.get("pagination"), dict) else {}
+            if not page_items or not pagination.get("hasMore"):
+                break
+        return items
+
+    def _match_appraiser_request(self, items):
+        """Pick the item belonging to the current customer.
+
+        Match by the item's *own* customer, then use the item-level id (the appraiser
+        request id). NOTE: item["customer"]["id"] is the CUSTOMER id, not the request
+        id — do not use it here.
+        """
         for item in items:
-            if not isinstance(item, dict):
-                continue
             customer = item.get("customer") if isinstance(item.get("customer"), dict) else {}
             uid = str(customer.get("customerUniqueId") or item.get("customerUniqueId") or "")
             cid = str(item.get("customerId") or customer.get("id") or "")
             if (self.customer_unique_id and uid == str(self.customer_unique_id)) or \
                (self.customer_id and cid == str(self.customer_id)):
-                match = item
-                break
+                return item
+        return None
 
-        assert match and match.get("id"), (
-            f"No existing appraiser request found for {self.customer_unique_id}."
-        )
+    async def _lookup_appraiser_request(self):
+        """Find this customer's appraiser-request item using the CURRENT token, or None.
+
+        The `search` filter is not guaranteed to index customerUniqueId, so try the cheap
+        filtered lookups first and fall back to an unfiltered scan before giving up.
+        """
+        attempts = []
+        if self.customer_unique_id:
+            attempts.append(str(self.customer_unique_id))
+        if self.mobile_number and str(self.mobile_number) not in attempts:
+            attempts.append(str(self.mobile_number))
+        attempts.append("")  # unfiltered scan
+
+        for search in attempts:
+            items = await self._list_appraiser_requests(search=search)
+            match = self._match_appraiser_request(items)
+            if match and match.get("id"):
+                if not search:
+                    print("Found the appraiser request only via an unfiltered view-all scan "
+                          "(the search filter did not return it).")
+                return match
+        return None
+
+    async def _fetch_existing_appraiser_request(self, required: bool = True) -> bool:
+        """Resolve this customer's existing appraiser request id (and any master loan).
+
+        Returns True when a request was found. With required=False a miss returns
+        False instead of raising, so callers can report a better diagnosis.
+        """
+        match = await self._lookup_appraiser_request()
+
+        if not match:
+            # view-all is scoped to the logged-in user, so a request raised by another
+            # appraiser/branch is invisible to us. Admin sees every branch (the same reason
+            # add_customer and packet create/assign run as admin), so retry under that token.
+            print("Appraiser request not visible to this login — retrying the lookup as admin.")
+            saved_token = self.auth_token
+            try:
+                self.auth_token = await self._role_token("admin")
+                match = await self._lookup_appraiser_request()
+            except Exception as e:  # a failed admin login must not mask the real diagnosis
+                print(f"Admin-scoped appraiser-request lookup failed: {e}")
+                match = None
+            finally:
+                self.auth_token = saved_token
+            if match:
+                print(f"Found appraiser request {match.get('id')} under the ADMIN scope "
+                      f"(appraiserId={match.get('appraiserId')}, branch={match.get('internalBranchId')}).")
+
+        if not match:
+            if not required:
+                return False
+            raise AssertionError(
+                f"No existing appraiser request found for {self.customer_unique_id} "
+                f"(customerId={self.customer_id}) on env '{self.env_name}' — searched by unique id, "
+                "by mobile number, and with an unfiltered view-all scan, under both the appraiser "
+                "and the admin scope."
+            )
+
         self.appraiser_request_id = str(match["id"])
         # Capture the request/loan state so the caller can decide resume-vs-recreate.
         self._existing_request_status = str(match.get("status") or "").lower()
         self._existing_process_complete = bool(match.get("isProcessComplete"))
+        self._existing_request_appraiser_id = match.get("appraiserId")
         ml = match.get("masterLoan") if isinstance(match.get("masterLoan"), dict) else {}
         self._existing_loan_completed = bool(ml.get("isLoanCompleted"))
         # If a loan was already initiated for this request, capture its ids so we can skip re-init.
@@ -2611,12 +2701,101 @@ class GoldLoanApiTest:
         print(
             f"Using existing appraiser request {self.appraiser_request_id} "
             f"(status={self._existing_request_status or 'unknown'}, "
-            f"processComplete={self._existing_process_complete}, loanCompleted={self._existing_loan_completed})"
+            f"processComplete={self._existing_process_complete}, loanCompleted={self._existing_loan_completed}, "
+            f"appraiserId={self._existing_request_appraiser_id})"
             + (f" — existing loan {self.loan_id}/{self.master_loan_id}" if captured else "")
             + "."
         )
+        return True
+
+    def _existing_request_is_mine(self) -> bool:
+        """True when the existing request is assigned to the appraiser we are logged in as.
+
+        Every loan-process call on someone else's request 400s with
+        "This customer is not assign to you", so a request owned by another appraiser
+        cannot be resumed -- it has to be cancelled and recreated under our own id.
+        """
+        owner = self._existing_request_appraiser_id
+        if owner in (None, ""):
+            return False  # unassigned: nothing binds it to us, so recreate rather than resume
+        mine = {str(x) for x in (self.logged_in_user_id, self.appraiser_id) if x not in (None, "")}
+        return str(owner) in mine
+
+    def _existing_request_is_reusable(self) -> bool:
+        """True when the already-existing request is still mid-flight AND is ours, so we can resume.
+
+        A request whose loan is finished cannot carry a new Fresh Loan, and one assigned to a
+        different appraiser is unusable from this login; both have to be cancelled and recreated.
+        """
+        if self._existing_process_complete or self._existing_loan_completed:
+            return False
+        return self._existing_request_is_mine()
 
 
+    async def _fetch_my_branches(self) -> list:
+        """GET /api/user/get-my-branches -> the internal branches this login can act in.
+
+        Shape (captured): {"data": [{"name": "Augmont", "id": 1, "internalBranchUniqueId": ...}, ...]}
+        """
+        try:
+            response = await self._make_authenticated_request('GET', "/api/user/get-my-branches")
+            data = response.json().get("data") if response.content else None
+        except httpx.HTTPStatusError as e:
+            print(f"Could not list this user's branches: {e.response.status_code} - {e.response.text[:120]}")
+            return []
+        if not isinstance(data, list):
+            return []
+        return [b for b in data if isinstance(b, dict) and b.get("id")]
+
+    def _branch_attempt_summary(self) -> str:
+        """Render what the alternate-branch ladder tried, for an error message."""
+        if not self._branch_attempts:
+            return " (no alternate branch was available to try)"
+        return " (tried " + "; ".join(self._branch_attempts) + ")"
+
+    async def _create_request_in_another_branch(self, request_body, max_branches: int = 3):
+        """Retry the appraiser-request create in another branch, keeping OUR OWN appraiserId.
+
+        The non-destructive answer to "This product Request already Exists" on a request owned
+        by someone else: rather than cancelling their loan (which the server refuses with 403
+        "You are not allowed to cencel this loan" even under the admin token), ask for a fresh
+        request in a different branch. This only works if the server's uniqueness key includes
+        the branch; every attempt's response is printed either way, so a failed ladder says
+        exactly what the server objected to.
+
+        Returns the successful response, or None. On success `self.internal_branch_id` is
+        updated so every later branch-scoped call agrees with the request we just created.
+        """
+        self._branch_attempts = []
+        branches = await self._fetch_my_branches()
+        current = str(self.internal_branch_id or "")
+        candidates = [b for b in branches if str(b.get("id")) != current]
+        if not candidates:
+            print("No alternate branch is available to this login, so the create cannot be retried elsewhere.")
+            return None
+        if len(candidates) > max_branches:
+            print(f"Retrying the create in {max_branches} of {len(candidates)} alternate branches "
+                  f"(the remaining {len(candidates) - max_branches} are not attempted).")
+            candidates = candidates[:max_branches]
+
+        for branch in candidates:
+            branch_id = int(branch["id"])
+            body = {**request_body, "internalBranchId": branch_id}
+            print(f"Retrying the appraiser request in branch {branch_id} ({branch.get('name')!r}) "
+                  f"as appraiser {request_body.get('appraiserId')}.")
+            try:
+                response = await self._make_authenticated_request(
+                    'POST', "/api/appraiser-request", json_data=body)
+            except httpx.HTTPStatusError as e:
+                detail = (e.response.text or "").strip()[:120]
+                self._branch_attempts.append(f"branch {branch_id} -> {e.response.status_code} {detail}")
+                print(f"  branch {branch_id} rejected it: {e.response.status_code} - {detail}")
+                continue
+            self.internal_branch_id = str(branch_id)
+            print(f"Created the appraiser request in branch {branch_id}; using that branch for the "
+                  "rest of the run.")
+            return response
+        return None
 
     async def create_appraiser_request(self):
         api_path = "/api/appraiser-request"
@@ -2634,38 +2813,93 @@ class GoldLoanApiTest:
             "loanType": "Fresh Loan",  # From collection example
             "trackProccesingTime": True,
         }
-        # Create the appraiser request. If one already exists for the customer: a finished loan
-        # (past the upload-documents stage) is left untouched; a loan still WITHIN the
-        # upload-documents stage is deleted (cancelled) and a FRESH request is created (attempt 1).
+        # Create the appraiser request. If one already exists for this customer, REUSE it when
+        # it is still mid-flight (nothing to gain from destroying work the server already has);
+        # only a finished request is cancelled and recreated. `--fresh-request` forces the
+        # cancel-and-recreate path.
         response = None
         for attempt in range(2):
             try:
                 response = await self._make_authenticated_request('POST', api_path, json_data=request_body)
                 if attempt > 0:
-                    print("Created a fresh appraiser request after deleting the prior loan.")
+                    print("Created a fresh appraiser request.")
                 break
             except httpx.HTTPStatusError as e:
                 text = e.response.text or ""
                 if e.response.status_code == 400 and "already Exists" in text:
-                    print(f"Appraiser request for customer {self.customer_unique_id} already exists — "
-                          "deleting it and creating a new one.")
-                    if attempt == 0:
-                        # Delete the existing loan (frees the customer), then retry to create fresh.
-                        await self._fetch_existing_appraiser_request()  # get loan ids to cancel
+                    print(f"Appraiser request for customer {self.customer_unique_id} already exists.")
+                    found = await self._fetch_existing_appraiser_request(required=False)
+                    if not found:
+                        # The server rejects the create but the request is invisible even to
+                        # admin, so there is nothing to reuse and a plain retry would fail
+                        # identically. Still worth trying another branch before giving up.
+                        branch_response = await self._create_request_in_another_branch(request_body)
+                        if branch_response is not None:
+                            response = branch_response
+                            break
+                        raise RuntimeError(
+                            f"Server rejected the appraiser request for {self.customer_unique_id} "
+                            f"(customerId={self.customer_id}) with 'already Exists', but no matching "
+                            f"request is visible on env '{self.env_name}' via view-all (searched by "
+                            "unique id, mobile and unfiltered, under both the appraiser and the admin "
+                            "scope), and no alternate branch accepted a new one"
+                            + self._branch_attempt_summary() + "."
+                        ) from e
+
+                    mine = self._existing_request_is_mine()
+                    if attempt == 0 and self.reuse_existing_request and self._existing_request_is_reusable():
+                        # Resume: keep the request id and any master loan it already carries.
+                        # store_loan_basic_details re-resolves the ids on "Your loan already
+                        # initiated", so an in-progress loan continues from where it stopped.
+                        print(f"Reusing appraiser request {self.appraiser_request_id} "
+                              "(still in progress, assigned to this appraiser) instead of recreating it.")
+                        return
+
+                    if attempt == 0 and mine:
+                        # OUR OWN request: cancelling its loan frees the customer and is ours to do.
+                        reason = ("--fresh-request was given" if not self.reuse_existing_request
+                                  else "the existing request is already complete")
+                        print(f"Cancelling our existing loan and creating a fresh request ({reason}).")
                         if self.loan_id and self.master_loan_id:
                             try:
                                 await self._cancel_existing_loan()  # clears loan ids on success
+                                if self.loan_id:
+                                    await self._cancel_existing_loan(as_admin=True)
                             except httpx.HTTPStatusError as ce:
                                 print(f"Could not cancel existing loan: {ce.response.status_code} - {ce.response.text[:120]}")
                         self.loan_id = ''
                         self.master_loan_id = ''
                         continue  # retry the POST to create a fresh request
-                    # Still rejected after deleting: server keeps the request; reuse it with a fresh loan.
-                    print("Appraiser request persists after deleting the loan; reusing it with a fresh loan downstream.")
-                    await self._fetch_existing_appraiser_request()
-                    self.loan_id = ''
-                    self.master_loan_id = ''
-                    return
+
+                    if mine:
+                        # Still refused after the cancel, but the request IS ours, so resuming it
+                        # with a fresh loan downstream is safe.
+                        print("Appraiser request persists after cancelling the loan; reusing our own "
+                              "request with a fresh loan downstream.")
+                        self.loan_id = ''
+                        self.master_loan_id = ''
+                        return
+
+                    # The request belongs to a DIFFERENT appraiser. Do NOT cancel it: the server
+                    # refuses anyway (403 "You are not allowed to cencel this loan", even under the
+                    # admin token) and destroying someone else's in-progress loan is not ours to do.
+                    # Try to create OUR OWN request in another branch this user has access to
+                    # instead -- non-destructive, and it succeeds if the server's uniqueness key
+                    # includes the branch.
+                    branch_response = await self._create_request_in_another_branch(request_body)
+                    if branch_response is not None:
+                        response = branch_response
+                        break
+                    raise RuntimeError(
+                        f"Appraiser request {self.appraiser_request_id} for {self.customer_unique_id} "
+                        f"is assigned to appraiser {self._existing_request_appraiser_id}, not to this "
+                        f"login ({self.logged_in_user_id}), so it cannot be used -- every loan-process "
+                        "call on it 400s 'This customer is not assign to you'. It was left untouched "
+                        "(cancelling another appraiser's loan is refused with 403 'You are not allowed "
+                        "to cencel this loan'), and no alternate branch accepted a new request"
+                        + self._branch_attempt_summary() + ". Reassign or close the request from the "
+                        "owning appraiser's login, or run with a different --customer."
+                    ) from e
                 if e.response.status_code == 400 and "Not Eligible For New Loan" in text:
                     customer_response = await self.get_customer_by_id()
                     customer = customer_response.get("singleCustomer", {}) if isinstance(customer_response, dict) else {}
@@ -2687,9 +2921,7 @@ class GoldLoanApiTest:
 
         # The create response shape is unreliable and can echo the customer id. Resolve the
         # appraiser request id authoritatively from view-all (which also captures any masterLoan).
-        try:
-            await self._fetch_existing_appraiser_request()
-        except AssertionError:
+        if not await self._fetch_existing_appraiser_request(required=False):
             self.appraiser_request_id = parsed_id  # view-all not indexed yet; fall back to parsed id
         if not self.appraiser_request_id:
             self.appraiser_request_id = parsed_id
@@ -2736,25 +2968,18 @@ class GoldLoanApiTest:
             print("Cannot find existing loan IDs: customer_id is not set.")
             return
 
-        # Attempt 1: Try to find loan details from the appraiser requests list
-        api_path = (
-            "/api/appraiser-request/view-all?from=1&to=25&search="
-            f"{urllib.parse.quote(self.customer_unique_id)}"
-        )
+        # Attempt 1: Try to find loan details from the appraiser requests list. Go through the
+        # same search-then-unfiltered-scan lookup as _fetch_existing_appraiser_request, because
+        # the server's search filter does not reliably index customerUniqueId.
         try:
-            response = await self._make_authenticated_request('GET', api_path)
-            data = response.json()
-            items = data.get('data', [])
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                customer_dict = item.get("customer") if isinstance(item.get("customer"), dict) else {}
-                uid = str(customer_dict.get("customerUniqueId") or "")
-                cid = str(item.get("customerId") or customer_dict.get("id") or "")
-                if uid == str(self.customer_unique_id) or (self.customer_id and cid == str(self.customer_id)):
-                    if self._extract_master_loan_ids(item.get("masterLoan")):
-                        print(f"Successfully retrieved existing loan IDs from appraiser request list: Loan ID={self.loan_id}, Master Loan ID={self.master_loan_id}")
-                        return
+            for search in (str(self.customer_unique_id or ''), str(self.mobile_number or ''), ''):
+                items = await self._list_appraiser_requests(search=search)
+                item = self._match_appraiser_request(items)
+                if item and self._extract_master_loan_ids(item.get("masterLoan")):
+                    print(f"Successfully retrieved existing loan IDs from appraiser request list: Loan ID={self.loan_id}, Master Loan ID={self.master_loan_id}")
+                    return
+                if item:
+                    break  # request found but it has no master loan yet
         except Exception as e:
             print(f"An unexpected error occurred while finding existing loan IDs via appraiser request list: {e}")
 
@@ -2793,7 +3018,23 @@ class GoldLoanApiTest:
             print(f"WARNING: Could not find loan IDs for customer {self.customer_id} after all attempts.")
 
 
-    async def _cancel_existing_loan(self):
+    async def _cancel_existing_loan(self, as_admin: bool = False):
+        """Cancel an existing loan, optionally under the ADMIN token.
+
+        A loan raised by a different appraiser cannot be cancelled with our own token -- every
+        loan-process call on it 400s "This customer is not assign to you" -- and admin sees
+        every branch, so the caller passes as_admin=True for a request it does not own.
+        """
+        if not as_admin:
+            return await self._cancel_existing_loan_call()
+        saved_token = self.auth_token
+        try:
+            self.auth_token = await self._role_token("admin")
+            return await self._cancel_existing_loan_call()
+        finally:
+            self.auth_token = saved_token
+
+    async def _cancel_existing_loan_call(self):
         """
         Cancels an existing loan using the fetched loan_id and master_loan_id.
         """
@@ -3908,11 +4149,14 @@ class GoldLoanApiTest:
 
     async def store_bank_details(self):
         api_path = "/api/loan-process/bank-details"
-        bank_name = "STATE BANK OF INDIA"  # Example from collection
-        account_number = "00000036150491589"  # Example from collection
-        ifsc_code = "SBIN0011777"  # Example from collection
-        account_holder_name = "LIC MUTUAL FUND"  # Example from collection
-        bank_branch_name = "SBI CAPITAL MARKET BRANCH, MUMBAI"
+        # Use whatever account validate_account settled on (it walks reference/bank_accounts.json
+        # until the penny-drop accepts one). The hard-coded SBI account is only the fallback for
+        # when validate_account never ran or every candidate failed.
+        account_number = self.bank_account_number or self.DEFAULT_BANK_ACCOUNT["accountNumber"]
+        ifsc_code = self.bank_ifsc_code or self.DEFAULT_BANK_ACCOUNT["ifscCode"]
+        bank_name = self.bank_name or "STATE BANK OF INDIA"          # from the IFSC lookup
+        bank_branch_name = self.bank_branch_name or "SBI CAPITAL MARKET BRANCH, MUMBAI"
+        account_holder_name = self.account_holder_name or "LIC MUTUAL FUND"
 
         # Bank proof = cancelled cheque image (both proof slots use it).
         passbook_proof_1 = (await self._upload_file(
@@ -3953,7 +4197,7 @@ class GoldLoanApiTest:
             "customerName": f"{self.first_name} {self.last_name}",
             "paymentMultiSelect": {"multiSelect": ["bank"]},
             "accountHolderName": account_holder_name,
-            "bankBranchName": "SBI CAPITAL MARKET BRANCH, MUMBAI",  # Example
+            "bankBranchName": bank_branch_name,
             "passbookProof": [passbook_proof_1, passbook_proof_2],
             "passbookProofImage": [f"{self.BASE_URL}/{passbook_proof_1}", f"{self.BASE_URL}/{passbook_proof_2}"],
             "passbookProofImageName": [os.path.basename(passbook_proof_1), os.path.basename(passbook_proof_2)],
@@ -4021,11 +4265,33 @@ class GoldLoanApiTest:
             "internalBranchId": int(self.internal_branch_id) if self.internal_branch_id else None, # Convert to int
         }
 
-        response = await self._make_authenticated_request(
-            'POST',
-            api_path,
-            json_data=request_body
-        )
+        try:
+            response = await self._make_authenticated_request(
+                'POST',
+                api_path,
+                json_data=request_body
+            )
+        except httpx.HTTPStatusError as e:
+            body = e.response.text or ""
+            if not (e.response.status_code == 400 and "not verified" in body.lower()):
+                raise
+            # The penny-drop did not verify the account -- on UAT validate-account itself 400s
+            # "Something went wrong" -- and the server ignores the isManuallyVerified flags we
+            # send here (it applies its own validate-account verdict). Only the OPS team's manual
+            # verification clears that state, so run it NOW rather than at the Ops stage: the flow
+            # cannot reach the Ops stage without bank-details succeeding first.
+            print(self._c(f"bank-details rejected ({body.strip()[:120]}). Running the OPS manual "
+                          "bank verification now, then retrying.", "yellow"))
+            await self.ops_manual_bank_verification(force=True, strict=False)
+            request_body["isManuallyVerified"] = True
+            request_body["manualVerifiedStatus"] = "verified"
+            response = await self._make_authenticated_request(
+                'POST',
+                api_path,
+                json_data=request_body
+            )
+            print('Store bank details successful (after the ops manual bank verification).')
+            return response
         print('Store bank details successful.')
 
 
@@ -4136,7 +4402,7 @@ class GoldLoanApiTest:
         finally:
             self.auth_token = saved_token
 
-    async def ops_manual_bank_verification(self, force: bool = False):
+    async def ops_manual_bank_verification(self, force: bool = False, strict: bool = True):
         """MANUAL bank verification by the OPS team -- clears the pending bank-verification state.
 
         Why this exists: validate-account's penny-drop succeeds (bankTxnStatus true) but the server
@@ -4153,7 +4419,9 @@ class GoldLoanApiTest:
         it swaps to the OPS role token for the duration and restores the appraiser session after.
 
         Set `force=True` (or leave the state unknown) to send the approval regardless of the flags
-        captured by validate_account.
+        captured by validate_account. `strict=False` downgrades the post-conditions to warnings --
+        used when this runs BEFORE bank-details (store_bank_details' fallback), where the bank
+        detail record does not exist yet and the retried bank-details call is the real check.
         """
         if not force and self.bank_manually_verified and not self.bank_for_ops_approval:
             print("Manual bank verification skipped: account is already manually verified.")
@@ -4190,12 +4458,17 @@ class GoldLoanApiTest:
             print(f"Manual bank verification submitted by ops (isManuallyVerified="
                   f"{self.bank_manually_verified}, isVerified={self.bank_system_verified}, "
                   f"forOpsApproval={self.bank_for_ops_approval}).")
-            assert self.bank_manually_verified or self.bank_system_verified, (
-                "Ops manual bank verification did not verify the account: "
-                f"{json.dumps(payload)[:500]}")
-            assert not self.bank_for_ops_approval, (
-                "Bank detail is still pending ops approval after bank-verification-manual: "
-                f"{json.dumps(payload)[:500]}")
+            problems = []
+            if not (self.bank_manually_verified or self.bank_system_verified):
+                problems.append("the account is still not verified")
+            if self.bank_for_ops_approval:
+                problems.append("the bank detail is still pending ops approval")
+            if problems:
+                detail = (f"Ops manual bank verification: {' and '.join(problems)} "
+                          f"-- {json.dumps(payload)[:500]}")
+                if strict:
+                    raise AssertionError(detail)
+                print(self._c(f"WARNING: {detail}", "yellow"))
         except httpx.HTTPStatusError as e:
             body = e.response.text or ""
             # Approving a bank detail that ops already approved comes back as a 400; that is the
@@ -4654,64 +4927,187 @@ class GoldLoanApiTest:
             else:
                 raise
 
+    def _load_bank_accounts(self) -> list:
+        """The candidate customer payout accounts for the penny-drop, in the order to try them.
+
+        Source: `reference/bank_accounts.json` (copied from the augmont-test-suite fixture
+        `fixtures/new-admin/bankAccounts.json` -- the LIC collection accounts from
+        LIST-OF-ALL-BANK-DETAILS-UPDATED26112019.pdf). Override the path with
+        GOLD_LOAN_BANK_ACCOUNTS. Falls back to the single hard-coded SBI account, which is what
+        the harness used before the list existed.
+        """
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        path = os.getenv("GOLD_LOAN_BANK_ACCOUNTS") or os.path.join(project_root, self.BANK_ACCOUNTS_PATH)
+        if not os.path.isabs(path):
+            path = os.path.join(project_root, path)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except (OSError, ValueError) as e:
+            print(f"Could not read the bank-account list at {path} ({e}); "
+                  "falling back to the built-in account.")
+            return [dict(self.DEFAULT_BANK_ACCOUNT)]
+        accounts = payload.get("accounts") if isinstance(payload, dict) else payload
+        usable = [a for a in accounts or []
+                  if isinstance(a, dict) and a.get("accountNumber") and a.get("ifscCode")]
+        if not usable:
+            print(f"The bank-account list at {path} has no usable entries; "
+                  "falling back to the built-in account.")
+            return [dict(self.DEFAULT_BANK_ACCOUNT)]
+        return usable
+
+    def _bank_account_candidates(self) -> list:
+        """The accounts to penny-drop, with the one already chosen this run tried FIRST.
+
+        The disbursement stage re-runs validate-account; putting the chosen account first means
+        that re-run settles on the same account immediately instead of walking the list again.
+        """
+        accounts = self._load_bank_accounts()
+        chosen = self.bank_account_number
+        if chosen:
+            accounts = ([a for a in accounts if str(a.get("accountNumber")) == str(chosen)]
+                        + [a for a in accounts if str(a.get("accountNumber")) != str(chosen)])
+        limit = self.bank_account_attempts
+        if limit and len(accounts) > limit:
+            print(f"Penny-dropping {limit} of {len(accounts)} candidate accounts "
+                  f"(the remaining {len(accounts) - limit} are not attempted; raise "
+                  "GOLD_LOAN_BANK_ACCOUNT_ATTEMPTS to try more).")
+            accounts = accounts[:limit]
+        return accounts
+
+    def _apply_bank_account(self, account: dict) -> None:
+        """Point the run's bank fields at `account` (bank name/branch come from the IFSC lookup)."""
+        self.bank_account_number = str(account.get("accountNumber"))
+        self.bank_ifsc_code = str(account.get("ifscCode"))
+        self.bank_account_label = account.get("label") or self.bank_ifsc_code
+        self.account_holder_name = self.account_holder_name or "LIC MUTUAL FUND"
+
     async def validate_account(self):
+        """Penny-drop the candidate payout accounts and keep the first usable one.
+
+        The penny-drop reaches the REAL bank and rejects accounts unpredictably -- on UAT the
+        single hard-coded SBI account answers 400 "Something went wrong", which then blocks
+        bank-details with "bank details is not verified" -- so walk the list from
+        reference/bank_accounts.json instead of relying on one account.
+
+        Ranking, best first:
+          1. verified outright (isVerified / isManuallyVerified) -- no ops approval needed;
+          2. bankTxnStatus true -- the transaction reached the bank; the account is USABLE and
+             ops_manual_bank_verification clears the pending state (this is the normal outcome:
+             the bank's account name never matches our random customer name);
+          3. the call merely succeeded (HTTP 200 with no bankTxnStatus) -- kept only as a
+             last resort if nothing better turns up.
+        The walk stops as soon as it reaches rank 1 or 2. If every account fails, the fields are
+        left on the first candidate and the flags stay false, so store_bank_details' ops manual
+        verification fallback still gets its chance.
+        """
         api_path = "/api/loan-process/validate-account"
-        await self.fetch_account_details_karza()
         # Passbook proof is a cheque IMAGE (PNG), matching the real call; penny-drop verifies by
-        # account/IFSC, not the image. When run before store_bank_details, passbook_proofs is empty.
+        # account/IFSC, not the image. Upload it ONCE, not per candidate.
         passbook = self.passbook_proofs or [
             (await self._upload_file(
                 "loan", file_type="image", file_path_override=self.CHEQUE_IMAGE_PATH))['uploadFile']['path']
         ]
-        request_body = {
-            "ifscCode": self.bank_ifsc_code or "SBIN0011777",
-            "accountNumber": self.bank_account_number or "00000036150491589",
-            "accountHolderName": self.account_holder_name or f"{self.first_name} {self.last_name}",
-            "bankName": self.bank_name or "STATE BANK OF INDIA",
-            "bankBranchName": self.bank_branch_name or "SBI CAPITAL MARKET BRANCH, MUMBAI",
-            "passbookProof": passbook,
-            "passbookProofImage": [f"{self.BASE_URL}/{p}" for p in passbook],
-            "passbookProofImageName": [],
-            "detailsFor": "customer",
-            "detailsForId": int(self.customer_id) if self.customer_id else None,
-        }
-        try:
-            response = await self._make_authenticated_request('POST', api_path, json_data=request_body)
+
+        candidates = self._bank_account_candidates()
+        attempts = []          # human-readable per-account outcome, for the summary
+        fallback = None        # (account, payload) for a rank-3 result
+
+        for position, account in enumerate(candidates, 1):
+            self._apply_bank_account(account)
+            await self.fetch_account_details_karza()  # bank name + branch for this IFSC
+            request_body = {
+                "ifscCode": self.bank_ifsc_code,
+                "accountNumber": self.bank_account_number,
+                "accountHolderName": self.account_holder_name or f"{self.first_name} {self.last_name}",
+                "bankName": self.bank_name or "STATE BANK OF INDIA",
+                "bankBranchName": self.bank_branch_name or "SBI CAPITAL MARKET BRANCH, MUMBAI",
+                "passbookProof": passbook,
+                "passbookProofImage": [f"{self.BASE_URL}/{p}" for p in passbook],
+                "passbookProofImageName": [],
+                "detailsFor": "customer",
+                "detailsForId": int(self.customer_id) if self.customer_id else None,
+            }
+            label = f"{self.bank_account_label} ({self.bank_ifsc_code}/{self.bank_account_number})"
+            print(f"Penny-drop {position}/{len(candidates)}: {label}")
+            try:
+                response = await self._make_authenticated_request('POST', api_path, json_data=request_body)
+            except httpx.HTTPStatusError as e:
+                detail = (e.response.text or "").strip()[:100]
+                attempts.append(f"{self.bank_account_label} -> {e.response.status_code} {detail}")
+                print(f"  rejected: {e.response.status_code} - {detail}")
+                continue
+
             data = response.json()
-            # Penny-drop result: data.bankTxnStatus True means the transaction reached the bank
-            # (CONFIRMED for the SBI test account 00000036150491589).
-            # NOTE: the response's top-level "message" can read "Something went wrong" even on success
-            # -- rely on bankTxnStatus, not the message.
-            #
-            # bankTxnStatus True does NOT mean the account is VERIFIED. The server also compares the
-            # bank's account name against the customer name; our test account is "LIC MUTUAL FUND"
-            # while the customer is a random name, so it answers
-            #   bankTxnStatus: true, isVerified: false, isManuallyVerified: false, forOpsApproval: true
-            # i.e. the bank detail is parked as "bankVerificationStatus: pending" awaiting an OPS
-            # manual approval (see ops_manual_bank_verification). Reading only bankTxnStatus here used
-            # to make the run believe the account was verified and fail later in the flow.
-            self.bank_account_verified = bool(data.get('data', {}).get('bankTxnStatus')
-                                              if isinstance(data.get('data'), dict)
-                                              else self._find_key_recursive(data, 'bankTxnStatus'))
-            self.bank_system_verified = bool(data.get('isVerified'))
-            self.bank_manually_verified = bool(data.get('isManuallyVerified'))
-            self.bank_for_ops_approval = bool(data.get('forOpsApproval'))
-            print(f"Validate account successful (bankTxnStatus={self.bank_account_verified}, "
-                  f"isVerified={self.bank_system_verified}, "
-                  f"isManuallyVerified={self.bank_manually_verified}, "
-                  f"forOpsApproval={self.bank_for_ops_approval}).")
-            if self.bank_for_ops_approval or not (self.bank_system_verified or self.bank_manually_verified):
-                name_as_per_system = data.get('nameAsPerSystem')
-                print(self._c("  Bank account is NOT verified yet (nameAsPerSystem="
-                              f"{name_as_per_system!r} vs accountHolderName="
-                              f"{request_body['accountHolderName']!r}); it needs the OPS manual "
-                              "verification step.", "yellow"))
-        except httpx.HTTPStatusError as e:
-            self.bank_account_verified = False
-            self.bank_system_verified = False
-            self.bank_manually_verified = False
-            self.bank_for_ops_approval = True
-            print(f"Validate account failed (non-fatal): {e.response.status_code} - {e.response.text}")
+            self._capture_validate_account_flags(data)
+            if self.bank_system_verified or self.bank_manually_verified:
+                print(self._c(f"  VERIFIED outright; using {label}.", "green"))
+                self._report_validate_account(data, request_body)
+                return
+            if self.bank_account_verified:
+                print(f"  usable (bankTxnStatus true); using {label}.")
+                self._report_validate_account(data, request_body)
+                return
+            attempts.append(f"{self.bank_account_label} -> 200 but no bankTxnStatus")
+            print("  reached the server but the bank transaction did not go through.")
+            if fallback is None:
+                fallback = (account, data)
+
+        if fallback is not None:
+            account, data = fallback
+            self._apply_bank_account(account)
+            await self.fetch_account_details_karza()
+            self._capture_validate_account_flags(data)
+            print(self._c(f"No account verified; falling back to {self.bank_account_label} "
+                          "(the server accepted the call). The ops manual verification will have "
+                          "to clear it.", "yellow"))
+            self._report_validate_account(data, {"accountHolderName": self.account_holder_name})
+            return
+
+        # Nothing worked at all: leave the fields on the first candidate so the rest of the flow
+        # has a consistent account, and let store_bank_details' ops fallback take over.
+        self._apply_bank_account(candidates[0])
+        self.bank_account_verified = False
+        self.bank_system_verified = False
+        self.bank_manually_verified = False
+        self.bank_for_ops_approval = True
+        print(self._c("Validate account FAILED for every candidate account (" +
+                      "; ".join(attempts) + "). Continuing with "
+                      f"{self.bank_account_label}; the ops manual verification will have to "
+                      "clear it.", "red"))
+
+    def _capture_validate_account_flags(self, data) -> None:
+        """Record the penny-drop verdict.
+
+        bankTxnStatus True does NOT mean the account is VERIFIED. The server also compares the
+        bank's account name against the customer name; the LIC collection accounts are never a
+        random test customer, so a good run answers
+          bankTxnStatus: true, isVerified: false, isManuallyVerified: false, forOpsApproval: true
+        i.e. the bank detail is parked as "bankVerificationStatus: pending" awaiting an OPS
+        manual approval (see ops_manual_bank_verification). Reading only bankTxnStatus here used
+        to make the run believe the account was verified and fail later in the flow.
+
+        NOTE: the response's top-level "message" can read "Something went wrong" even on success
+        -- rely on these flags, not the message.
+        """
+        self.bank_account_verified = bool(data.get('data', {}).get('bankTxnStatus')
+                                          if isinstance(data.get('data'), dict)
+                                          else self._find_key_recursive(data, 'bankTxnStatus'))
+        self.bank_system_verified = bool(data.get('isVerified'))
+        self.bank_manually_verified = bool(data.get('isManuallyVerified'))
+        self.bank_for_ops_approval = bool(data.get('forOpsApproval'))
+
+    def _report_validate_account(self, data, request_body) -> None:
+        print(f"Validate account successful (bankTxnStatus={self.bank_account_verified}, "
+              f"isVerified={self.bank_system_verified}, "
+              f"isManuallyVerified={self.bank_manually_verified}, "
+              f"forOpsApproval={self.bank_for_ops_approval}).")
+        if self.bank_for_ops_approval or not (self.bank_system_verified or self.bank_manually_verified):
+            name_as_per_system = data.get('nameAsPerSystem')
+            print(self._c("  Bank account is NOT verified yet (nameAsPerSystem="
+                          f"{name_as_per_system!r} vs accountHolderName="
+                          f"{request_body.get('accountHolderName')!r}); it needs the OPS manual "
+                          "verification step.", "yellow"))
 
     async def upload_income_document(self) -> str:
         api_path = f"/api/upload-file?reason=customerIncomeGeneratingDocument&customerId={self.customer_id}"
@@ -5374,6 +5770,10 @@ def main():
     parser.add_argument("--amount", type=float,
                         help="Requested loan amount (default 400000; capped at eligibility). "
                              "Over 500000 adds a BM-approval step.")
+    parser.add_argument("--fresh-request", action="store_true",
+                        help="If an appraiser request already exists for the customer, cancel its "
+                             "loan and create a new request. Default is to RESUME the existing "
+                             "request when it is still in progress.")
     args = parser.parse_args()
 
     # Environment must be set before the suite is constructed -- it picks the base URL and the
@@ -5391,6 +5791,8 @@ def main():
         os.environ["GOLD_LOAN_AMOUNT"] = str(args.amount)
     if args.scheme:
         os.environ["GOLD_LOAN_SCHEME_ID"] = args.scheme
+    if args.fresh_request:
+        os.environ["GOLD_LOAN_FRESH_APPRAISER_REQUEST"] = "true"
 
     suite = GoldLoanApiTest()
     suite.existing_customer_id = ""

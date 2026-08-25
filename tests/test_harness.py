@@ -645,6 +645,571 @@ def _():
 
 
 # --------------------------------------------------------------------------------------------
+# GROUP: appraiser -- resolving / reusing / recreating an existing appraiser request
+# --------------------------------------------------------------------------------------------
+
+ADMIN_TOKEN = "admin-tok"
+
+def _request_item(uid="MSYIITOI", customer_id=20308, request_id=13500,
+                  master_loan=None, process_complete=False, appraiser_id=1473):
+    return {
+        "id": request_id,
+        "customerId": customer_id,
+        "appraiserId": appraiser_id,
+        "internalBranchId": 1,
+        "status": "processing",
+        "isProcessComplete": process_complete,
+        "customer": {"id": customer_id, "customerUniqueId": uid},
+        "masterLoan": master_loan,
+    }
+
+def _appraiser_suite(uid="MSYIITOI", customer_id="20308", **env):
+    # suite() only scrubs the KYC vars, so clear this one explicitly -- otherwise the
+    # --fresh-request test leaks GOLD_LOAN_FRESH_APPRAISER_REQUEST into every later test.
+    if "GOLD_LOAN_FRESH_APPRAISER_REQUEST" not in env:
+        os.environ.pop("GOLD_LOAN_FRESH_APPRAISER_REQUEST", None)
+    s = suite(**env)
+    s.customer_unique_id = uid
+    s.customer_id = customer_id
+    s.mobile_number = "9876543210"
+    s.first_name, s.last_name = "A", "B"
+    s.module_id, s.internal_branch_id, s.appraiser_id = "1", "1", "1473"
+    s.logged_in_user_id = 1473
+    s._fetch_appraisers = lambda: asyncio.sleep(0)
+    return s
+
+def _json_response(payload):
+    class R:
+        content = b"{}"
+        def json(self_inner): return payload
+    return R()
+
+def _stub_api(s, visible, search_works=False, pages=None, create_ok=False,
+              branches=None, accept_branch=None, cancel_status=None):
+    """Fake the auth chokepoint with a miniature appraiser-request server.
+
+    `visible` maps scope ("appraiser"/"admin") to the items that scope can see -- the real
+    view-all is scoped to the logged-in user. `search_works=False` reproduces the live
+    behaviour where the `search` filter does not index customerUniqueId. `pages` overrides
+    the unfiltered listing so pagination can be exercised. `create_ok` lets the create
+    succeed once its loan has been cancelled. `branches` is what get-my-branches returns and
+    `accept_branch` is the one branch id whose create the server accepts. `cancel_status`
+    makes /loan-process/cancel fail with that status (the live UAT 403).
+    Returns a state dict recording what was called.
+    """
+    state = {"calls": [], "posts": 0, "cancels": 0, "created_in_branch": None, "created_body": None}
+
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        scope = "admin" if s.auth_token == ADMIN_TOKEN else "appraiser"
+        state["calls"].append((scope, method, path))
+
+        if path == "/api/user-otp/user-send-otp":
+            return _json_response({"referenceCode": "rc"})
+        if path == "/api/auth/verify-login":
+            return _json_response({"Token": ADMIN_TOKEN})
+        if path == "/api/user/get-my-branches":
+            return _json_response({"data": branches or []})
+        if method == "POST" and path == "/api/appraiser-request":
+            state["posts"] += 1
+            branch = (json_data or {}).get("internalBranchId")
+            accepted = (accept_branch is not None and branch == accept_branch) or \
+                       (create_ok and state["cancels"])
+            if accepted:
+                state["created_in_branch"] = branch
+                state["created_body"] = json_data
+                return _json_response({"data": {"id": 99999}})
+            request = httpx.Request("POST", "https://x" + path)
+            response = httpx.Response(400, text="This product Request already Exists", request=request)
+            raise httpx.HTTPStatusError("400", request=request, response=response)
+        if path == "/api/loan-cancel-reason":
+            return _json_response({"data": [{"reason": "Test"}]})
+        if path == "/api/loan-process/cancel":
+            state["cancels"] += 1
+            if cancel_status:
+                request = httpx.Request("POST", "https://x" + path)
+                response = httpx.Response(cancel_status, text="You are not allowed to cencel this loan.",
+                                          request=request)
+                raise httpx.HTTPStatusError(str(cancel_status), request=request, response=response)
+            return _json_response({"message": "cancelled"})
+        if path.startswith("/api/appraiser-request/view-all"):
+            searched = "&search=" in path
+            frm = int(path.split("from=", 1)[1].split("&", 1)[0])
+            page_index = (frm - 1) // 25
+            if searched and not search_works:
+                chunks = []
+            elif pages is not None and not searched:
+                chunks = pages
+            else:
+                chunks = [visible.get(scope, [])]
+            items = chunks[page_index] if page_index < len(chunks) else []
+            return _json_response({
+                "message": "ok" if items else "Data not found!",
+                "data": items,
+                "pagination": {"hasMore": page_index + 1 < len(chunks),
+                               "per_page": 25, "current_page": page_index + 1},
+            })
+        return _json_response({})
+
+    s._make_authenticated_request = fake
+    return state
+
+BRANCHES = [{"id": 1, "name": "Augmont"}, {"id": 3, "name": "Augmont Amritsar"},
+            {"id": 40, "name": "aaa"}, {"id": 76, "name": "Akhil"}, {"id": 125, "name": "Augmontr"}]
+
+@test("appraiser: an unfiltered scan finds the request when the search filter misses it")
+def _():
+    # Reproduces the live failure: POST said "already Exists" but search=<uniqueId> returned
+    # an empty data list, so the old search-only lookup asserted "No existing appraiser request".
+    s = _appraiser_suite()
+    state = _stub_api(s, {"appraiser": [_request_item()]})
+    found, _out = quiet(lambda: asyncio.run(s._fetch_existing_appraiser_request()))
+    eq(found, True, "the fallback scan should find the request")
+    eq(s.appraiser_request_id, "13500", "resolved the item-level request id, not the customer id")
+    paths = [p for _scope, _m, p in state["calls"]]
+    ok(any("search=MSYIITOI" in p for p in paths), "tried the unique-id search first")
+    ok(any("view-all" in p and "search=" not in p for p in paths), "fell back to an unfiltered listing")
+    close(s)
+
+@test("appraiser: the unfiltered scan follows pagination past page 1")
+def _():
+    s = _appraiser_suite()
+    state = _stub_api(s, {}, pages=[[_request_item(uid="OTHER1", customer_id=1)],
+                                    [_request_item(uid="OTHER2", customer_id=2)],
+                                    [_request_item()]])
+    found, _out = quiet(lambda: asyncio.run(s._fetch_existing_appraiser_request()))
+    eq(found, True, "found on page 3")
+    ok(any("from=51&to=75" in p for _s, _m, p in state["calls"]), "requested the third page")
+    close(s)
+
+@test("appraiser: a request owned by another branch is found under the admin scope")
+def _():
+    # view-all is scoped to the logged-in user, so the appraiser sees nothing even though the
+    # server refuses to create a second request.
+    s = _appraiser_suite()
+    state = _stub_api(s, {"appraiser": [], "admin": [_request_item()]})
+    found, _out = quiet(lambda: asyncio.run(s._fetch_existing_appraiser_request()))
+    eq(found, True, "admin sees every branch")
+    eq(s.appraiser_request_id, "13500", "captured the request id from the admin listing")
+    ok(any(scope == "admin" for scope, _m, _p in state["calls"]), "retried under the admin token")
+    eq(s.auth_token, "tok", "the appraiser token is restored afterwards")
+    close(s)
+
+@test("appraiser: a genuine miss returns False with required=False and names both scopes")
+def _():
+    s = _appraiser_suite()
+    _stub_api(s, {})  # nothing visible to anyone
+    found, _out = quiet(lambda: asyncio.run(s._fetch_existing_appraiser_request(required=False)))
+    eq(found, False, "required=False reports the miss instead of raising")
+    try:
+        quiet(lambda: asyncio.run(s._fetch_existing_appraiser_request()))
+        raise Fail("required=True should raise")
+    except AssertionError as e:
+        if isinstance(e, Fail):
+            raise
+        ok(s.env_name in str(e), "the error names the environment")
+        ok("admin" in str(e), "the error says the admin scope was tried too")
+    close(s)
+
+@test("appraiser: our own in-progress request is REUSED, not recreated")
+def _():
+    s = _appraiser_suite()
+    state = _stub_api(s, {"appraiser": [_request_item(master_loan={"id": 10930, "isLoanCompleted": False})]})
+    _r, out = quiet(lambda: asyncio.run(s.create_appraiser_request()))
+    eq(s.appraiser_request_id, "13500", "kept the existing request id")
+    eq(state["cancels"], 0, "the in-progress loan must NOT be cancelled")
+    eq(state["posts"], 1, "no second create attempt")
+    eq(s.master_loan_id, "10930", "carried the existing master loan forward for the resume")
+    ok("Reusing appraiser request" in out, "said it was reusing")
+    close(s)
+
+@test("appraiser: our own COMPLETED request is cancelled and recreated")
+def _():
+    s = _appraiser_suite()
+    item = _request_item(master_loan={"id": 10930, "isLoanCompleted": True}, process_complete=True)
+    state = _stub_api(s, {"appraiser": [item]}, create_ok=True)
+    _r, _out = quiet(lambda: asyncio.run(s.create_appraiser_request()))
+    eq(state["cancels"], 1, "our finished loan is cancelled")
+    eq(state["posts"], 2, "a fresh request is created after the cancel")
+    close(s)
+
+@test("appraiser: --fresh-request forces cancel-and-recreate of our own request")
+def _():
+    s = _appraiser_suite(GOLD_LOAN_FRESH_APPRAISER_REQUEST="true")
+    eq(s.reuse_existing_request, False, "the env var disables reuse")
+    state = _stub_api(s, {"appraiser": [_request_item(master_loan={"id": 10930, "isLoanCompleted": False})]},
+                      create_ok=True)
+    _r, out = quiet(lambda: asyncio.run(s.create_appraiser_request()))
+    eq(state["cancels"], 1, "cancelled despite the loan being in progress")
+    eq(state["posts"], 2, "created a fresh request")
+    ok("--fresh-request" in out, "explained why it did not reuse")
+    close(s)
+
+@test("appraiser: a request owned by ANOTHER appraiser is recreated in another branch")
+def _():
+    # The live UAT sequence: reusing it 400s "This customer is not assign to you" on every
+    # loan-process call, and cancelling it 403s "You are not allowed to cencel this loan" --
+    # so create our own request elsewhere instead.
+    s = _appraiser_suite()
+    item = _request_item(master_loan={"id": 10930, "isLoanCompleted": False}, appraiser_id=9999)
+    state = _stub_api(s, {"appraiser": [item]}, branches=BRANCHES, accept_branch=3)
+    _r, out = quiet(lambda: asyncio.run(s.create_appraiser_request()))
+    eq(state["created_in_branch"], 3, "created in the first alternate branch that accepted it")
+    eq(state["created_body"]["appraiserId"], 1473, "kept OUR appraiser id, not the previous owner's")
+    eq(s.internal_branch_id, "3", "the rest of the run uses the branch we actually created in")
+    ok("Created the appraiser request in branch 3" in out, "reported the branch it landed in")
+    close(s)
+
+@test("appraiser: a foreign request is NEVER cancelled")
+def _():
+    s = _appraiser_suite()
+    item = _request_item(master_loan={"id": 10930, "isLoanCompleted": False}, appraiser_id=9999)
+    state = _stub_api(s, {"appraiser": [item]}, branches=BRANCHES, accept_branch=3,
+                      cancel_status=403)
+    quiet(lambda: asyncio.run(s.create_appraiser_request()))
+    eq(state["cancels"], 0, "another appraiser's loan is left untouched")
+    close(s)
+
+@test("appraiser: an UNASSIGNED request is not treated as ours")
+def _():
+    s = _appraiser_suite()
+    item = _request_item(master_loan={"id": 10930, "isLoanCompleted": False}, appraiser_id=None)
+    state = _stub_api(s, {"appraiser": [item]}, branches=BRANCHES, accept_branch=3)
+    quiet(lambda: asyncio.run(s.create_appraiser_request()))
+    eq(s._existing_request_is_mine(), False, "an unassigned request binds to nobody")
+    eq(state["created_in_branch"], 3, "recreated so the request is bound to this appraiser")
+    eq(state["cancels"], 0, "still nothing to cancel")
+    close(s)
+
+@test("appraiser: the branch ladder is capped and reports what it skipped")
+def _():
+    s = _appraiser_suite()
+    item = _request_item(master_loan={"id": 10930, "isLoanCompleted": False}, appraiser_id=9999)
+    # accept_branch=125 is the LAST candidate, past the cap, so it is never reached.
+    state = _stub_api(s, {"appraiser": [item]}, branches=BRANCHES, accept_branch=125)
+    try:
+        quiet(lambda: asyncio.run(s.create_appraiser_request()))
+        raise Fail("no reachable branch accepted the create, so it must fail")
+    except RuntimeError as e:
+        ok("branch 3 ->" in str(e) and "branch 40 ->" in str(e),
+           "the error lists what each attempted branch answered")
+    eq(state["posts"], 4, "the original create plus exactly 3 branch attempts")
+    eq(s.internal_branch_id, "1", "a failed ladder must not move the run to another branch")
+    close(s)
+
+@test("appraiser: a foreign request with no branch left fails with the owner named")
+def _():
+    s = _appraiser_suite()
+    item = _request_item(master_loan={"id": 10930, "isLoanCompleted": False}, appraiser_id=9999)
+    state = _stub_api(s, {"appraiser": [item]}, branches=[{"id": 1, "name": "Augmont"}])
+    try:
+        quiet(lambda: asyncio.run(s.create_appraiser_request()))
+        raise Fail("should not silently reuse a request owned by another appraiser")
+    except RuntimeError as e:
+        ok("9999" in str(e), "the error names the owning appraiser")
+        ok("not assign to you" in str(e), "the error explains what would fail downstream")
+        ok("no alternate branch" in str(e), "the error says the branch retry found nothing to try")
+    eq(state["cancels"], 0, "and it still did not cancel anything")
+    close(s)
+
+@test("appraiser: an invisible existing request fails with a diagnosis, not a raw AssertionError")
+def _():
+    s = _appraiser_suite()
+    _stub_api(s, {})  # the server refuses the create but shows the request to nobody
+    try:
+        quiet(lambda: asyncio.run(s.create_appraiser_request()))
+        raise Fail("create_appraiser_request should fail when the request is invisible")
+    except RuntimeError as e:
+        ok("already Exists" in str(e), "the error quotes the server's rejection")
+        ok("admin" in str(e), "the error says the admin scope was tried")
+    close(s)
+
+# --------------------------------------------------------------------------------------------
+# GROUP: bank -- the ops manual-verification fallback for bank-details
+# --------------------------------------------------------------------------------------------
+
+def _bank_suite(**env):
+    # suite() only scrubs the KYC vars; clear the bank ones so they cannot leak between tests.
+    for var in ("GOLD_LOAN_BANK_ACCOUNTS", "GOLD_LOAN_BANK_ACCOUNT_ATTEMPTS"):
+        if var not in env:
+            os.environ.pop(var, None)
+    s = suite(**env)
+    s.customer_id = "20308"
+    s.loan_id, s.master_loan_id = "12345", "10930"
+    s.first_name, s.last_name = "A", "B"
+    s.final_loan_amount = 400000
+    s.secured_processing_charge = 4000
+    s.upfront_interest_amount = 0
+    s.logged_in_user_id = 1473
+    # store_bank_details uploads two cheque images; keep the test offline.
+    async def fake_upload(*a, **kw):
+        return {"uploadFile": {"path": "uploads/cheque.png"}}
+    s._upload_file = fake_upload
+    return s
+
+def _bank_stub(s, verified_after_ops=True, ops_status=None):
+    """Serve bank-details + bank-verification-manual.
+
+    bank-details 400s "bank details is not verified" until the ops manual verification has
+    run -- the live UAT behaviour once validate-account fails. `ops_status` makes the ops
+    call fail with that status instead.
+    """
+    state = {"bank_details_posts": 0, "ops_calls": 0, "ops_scope": None, "bodies": []}
+
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        if path == "/api/user-otp/user-send-otp":
+            return _json_response({"referenceCode": "rc"})
+        if path == "/api/auth/verify-login":
+            return _json_response({"Token": "ops-tok"})
+        if path == "/api/loan-process/bank-verification-manual":
+            state["ops_calls"] += 1
+            state["ops_scope"] = s.auth_token
+            if ops_status:
+                request = httpx.Request("POST", "https://x" + path)
+                response = httpx.Response(ops_status, text="ops rejected it", request=request)
+                raise httpx.HTTPStatusError(str(ops_status), request=request, response=response)
+            return _json_response({"message": "success", "data": {
+                "isVerified": False,
+                "isManuallyVerified": verified_after_ops,
+                "forOpsApproval": not verified_after_ops,
+            }})
+        if path == "/api/loan-process/bank-details":
+            state["bank_details_posts"] += 1
+            state["bodies"].append(dict(json_data))  # copy: the retry mutates the same dict
+            if state["ops_calls"]:
+                return _json_response({"message": "success"})
+            request = httpx.Request("POST", "https://x" + path)
+            response = httpx.Response(400, text="bank details is not verified", request=request)
+            raise httpx.HTTPStatusError("400", request=request, response=response)
+        return _json_response({})
+
+    s._make_authenticated_request = fake
+    return state
+
+@test("bank: an unverified account triggers the ops manual verification and a retry")
+def _():
+    # Live UAT: validate-account 400s "Something went wrong", so bank-details 400s
+    # "bank details is not verified" and the run never reaches the Ops stage that would fix it.
+    s = _bank_suite()
+    # bankTxnStatus was true (the penny-drop reached the bank) but the account is still not
+    # verified -- the documented name-mismatch case -- so the first body says system-verified.
+    s.bank_account_verified = True
+    state = _bank_stub(s)
+    _r, out = quiet(lambda: asyncio.run(s.store_bank_details()))
+    eq(state["ops_calls"], 1, "the ops manual verification ran")
+    eq(state["bank_details_posts"], 2, "bank-details was retried after it")
+    eq(state["bodies"][0]["isManuallyVerified"], False, "the first try went in as system-verified")
+    eq(state["bodies"][1]["isManuallyVerified"], True, "the retry declares the manual verification")
+    eq(state["bodies"][1]["manualVerifiedStatus"], "verified", "and its status")
+    ok("ops manual bank verification" in out.lower(), "said what it did")
+    close(s)
+
+@test("bank: the ops manual verification runs under the OPS token and restores ours")
+def _():
+    s = _bank_suite()
+    state = _bank_stub(s)
+    quiet(lambda: asyncio.run(s.store_bank_details()))
+    eq(state["ops_scope"], "ops-tok", "bank-verification-manual needs the ops role token")
+    eq(s.auth_token, "tok", "the appraiser token is restored afterwards")
+    close(s)
+
+@test("bank: a verified account does not call the ops manual verification at all")
+def _():
+    s = _bank_suite()
+    state = _bank_stub(s)
+    state["ops_calls"] = 1  # pretend it is already verified: bank-details succeeds first time
+    quiet(lambda: asyncio.run(s.store_bank_details()))
+    eq(state["bank_details_posts"], 1, "no retry when the server accepts it")
+    eq(state["ops_calls"], 1, "the ops call was not made again")
+    close(s)
+
+@test("bank: a bank-details error that is NOT about verification is re-raised untouched")
+def _():
+    s = _bank_suite()
+    state = {"ops_calls": 0}
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        if path == "/api/loan-process/bank-verification-manual":
+            state["ops_calls"] += 1
+            return _json_response({"message": "success", "data": {}})
+        if path == "/api/loan-process/bank-details":
+            request = httpx.Request("POST", "https://x" + path)
+            response = httpx.Response(400, text="To Be Paid amount is incorrect", request=request)
+            raise httpx.HTTPStatusError("400", request=request, response=response)
+        return _json_response({})
+    s._make_authenticated_request = fake
+    try:
+        quiet(lambda: asyncio.run(s.store_bank_details()))
+        raise Fail("a toBePaid error must not be swallowed")
+    except httpx.HTTPStatusError as e:
+        ok("To Be Paid" in e.response.text, "the original error survives")
+    eq(state["ops_calls"], 0, "and ops is not dragged into an unrelated failure")
+    close(s)
+
+@test("bank: strict=False downgrades an unverified ops verdict to a warning, strict=True raises")
+def _():
+    # Before bank-details the record does not exist yet, so the retried bank-details call is the
+    # real check -- a lukewarm ops verdict must not abort the run there.
+    s = _bank_suite()
+    state = _bank_stub(s, verified_after_ops=False)
+    _r, out = quiet(lambda: asyncio.run(s.store_bank_details()))
+    eq(state["bank_details_posts"], 2, "it still retried bank-details")
+    ok("WARNING" in out, "but it warned about the verdict")
+    close(s)
+
+    s2 = _bank_suite()
+    _bank_stub(s2, verified_after_ops=False)
+    try:
+        quiet(lambda: asyncio.run(s2.ops_manual_bank_verification(force=True)))
+        raise Fail("strict=True must reject an unverified verdict")
+    except AssertionError as e:
+        if isinstance(e, Fail):
+            raise
+        ok("still" in str(e), "the error says what was still wrong")
+    close(s2)
+
+def _accounts_stub(s, verdicts):
+    """Serve validate-account from `verdicts`: {accountNumber: payload-or-status-int}.
+
+    An int means the server answers with that HTTP status (the live UAT 400). A dict is the
+    JSON body. An account not listed answers 400, like an account the bank rejects.
+    Returns a state dict recording the accounts tried, in order.
+    """
+    state = {"tried": [], "karza": []}
+
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        if path.startswith("/api/loan-process/account-details-karza"):
+            state["karza"].append(path.split("ifscCode=")[1])
+            return _json_response({"data": {"bankName": "TEST BANK", "branch": "TEST BRANCH"}})
+        if path == "/api/loan-process/validate-account":
+            number = json_data["accountNumber"]
+            state["tried"].append(number)
+            verdict = verdicts.get(number, 400)
+            if isinstance(verdict, int):
+                request = httpx.Request("POST", "https://x" + path)
+                response = httpx.Response(verdict, text="Something went wrong", request=request)
+                raise httpx.HTTPStatusError(str(verdict), request=request, response=response)
+            return _json_response(verdict)
+        return _json_response({})
+
+    s._make_authenticated_request = fake
+    return state
+
+REAL_ACCOUNTS = None  # loaded lazily from the shipped fixture
+
+def _fixture_accounts():
+    global REAL_ACCOUNTS
+    if REAL_ACCOUNTS is None:
+        with open(os.path.join(ROOT, "reference", "bank_accounts.json"), encoding="utf-8") as fh:
+            REAL_ACCOUNTS = json.load(fh)["accounts"]
+    return REAL_ACCOUNTS
+
+@test("bank: the shipped account list is readable and every entry is usable")
+def _():
+    s = _bank_suite()
+    accounts = s._load_bank_accounts()
+    ok(len(accounts) > 1, "the fixture carries a real list, not just the fallback")
+    eq(len(accounts), len(_fixture_accounts()), "every fixture entry survived validation")
+    for a in accounts:
+        # One real HSBC entry is printed with separators (006-089866-001); keep the fixture's
+        # value verbatim rather than "fixing" the source data.
+        ok(re.fullmatch(r"[0-9-]+", a["accountNumber"]), f"{a['label']}: account number is plausible")
+        ok(re.fullmatch(r"[A-Z]{4}0[A-Z0-9]{6}", a["ifscCode"]), f"{a['label']}: IFSC is well formed")
+    close(s)
+
+@test("bank: an unreadable account list falls back to the built-in account")
+def _():
+    s = _bank_suite(GOLD_LOAN_BANK_ACCOUNTS=os.path.join(ROOT, "__no_such_bank_file__.json"))
+    accounts, _out = quiet(s._load_bank_accounts)
+    eq(len(accounts), 1, "one fallback account")
+    eq(accounts[0]["accountNumber"], s.DEFAULT_BANK_ACCOUNT["accountNumber"], "the built-in SBI account")
+    close(s)
+
+@test("bank: the penny-drop walks the list and keeps the first usable account")
+def _():
+    # Live UAT: the first account (SBI, previously hard-coded) 400s "Something went wrong".
+    s = _bank_suite()
+    accounts = s._load_bank_accounts()
+    third = accounts[2]["accountNumber"]
+    state = _accounts_stub(s, {third: {"data": {"bankTxnStatus": True}, "forOpsApproval": True}})
+    _r, out = quiet(lambda: asyncio.run(s.validate_account()))
+    eq(state["tried"], [a["accountNumber"] for a in accounts[:3]], "tried in order, stopped at the third")
+    eq(s.bank_account_number, third, "settled on the account that worked")
+    eq(s.bank_account_verified, True, "recorded bankTxnStatus")
+    ok("usable" in out, "said the account is usable")
+    close(s)
+
+@test("bank: an outright-verified account stops the walk immediately")
+def _():
+    s = _bank_suite()
+    first = s._load_bank_accounts()[0]["accountNumber"]
+    state = _accounts_stub(s, {first: {"data": {"bankTxnStatus": True}, "isVerified": True}})
+    _r, out = quiet(lambda: asyncio.run(s.validate_account()))
+    eq(state["tried"], [first], "no further penny-drops once one verifies")
+    eq(s.bank_system_verified, True, "recorded the verified flag")
+    ok("VERIFIED outright" in out, "reported it")
+    close(s)
+
+@test("bank: the bank name and branch come from each account's IFSC lookup")
+def _():
+    s = _bank_suite()
+    accounts = s._load_bank_accounts()
+    second = accounts[1]
+    _accounts_stub(s, {second["accountNumber"]: {"data": {"bankTxnStatus": True}}})
+    quiet(lambda: asyncio.run(s.validate_account()))
+    eq(s.bank_ifsc_code, second["ifscCode"], "IFSC follows the chosen account")
+    eq(s.bank_name, "TEST BANK", "bank name came from the karza lookup, not a hard-coded string")
+    eq(s.bank_branch_name, "TEST BRANCH", "and so did the branch")
+    close(s)
+
+@test("bank: when every account fails the flags stay false for the ops fallback")
+def _():
+    s = _bank_suite()
+    state = _accounts_stub(s, {})  # every account 400s
+    _r, out = quiet(lambda: asyncio.run(s.validate_account()))
+    eq(len(state["tried"]), s.bank_account_attempts, "walked up to the attempt cap")
+    eq(s.bank_account_verified, False, "nothing verified")
+    eq(s.bank_for_ops_approval, True, "so the ops manual verification must run")
+    ok(s.bank_account_number, "the run still has a concrete account to send")
+    ok("FAILED for every candidate" in out, "said so plainly")
+    close(s)
+
+@test("bank: the attempt cap is honoured and reports what it skipped")
+def _():
+    s = _bank_suite(GOLD_LOAN_BANK_ACCOUNT_ATTEMPTS="3")
+    state = _accounts_stub(s, {})
+    _r, out = quiet(lambda: asyncio.run(s.validate_account()))
+    eq(len(state["tried"]), 3, "stopped at the cap")
+    ok("of 54 candidate accounts" in out, "said how many it skipped")
+    close(s)
+
+@test("bank: the disbursement re-run validates the SAME account first")
+def _():
+    s = _bank_suite()
+    accounts = s._load_bank_accounts()
+    chosen = accounts[4]["accountNumber"]
+    s.bank_account_number = chosen  # as left by the Bank Details stage
+    state = _accounts_stub(s, {chosen: {"data": {"bankTxnStatus": True}}})
+    quiet(lambda: asyncio.run(s.validate_account()))
+    eq(state["tried"], [chosen], "no re-walk: the chosen account is tried first and settles")
+    close(s)
+
+@test("bank: store_bank_details sends the account the penny-drop settled on")
+def _():
+    s = _bank_suite()
+    accounts = s._load_bank_accounts()
+    third = accounts[2]
+    _accounts_stub(s, {third["accountNumber"]: {"data": {"bankTxnStatus": True}}})
+    quiet(lambda: asyncio.run(s.validate_account()))
+    state = _bank_stub(s)
+    state["ops_calls"] = 1  # already verified: no fallback needed, first POST is accepted
+    quiet(lambda: asyncio.run(s.store_bank_details()))
+    body = state["bodies"][0]
+    eq(body["accountNumber"], third["accountNumber"], "bank-details uses the chosen account")
+    eq(body["ifscCode"], third["ifscCode"], "and its IFSC")
+    eq(body["bankName"], "TEST BANK", "and the bank from the IFSC lookup, not hard-coded SBI")
+    eq(body["bankBranchName"], "TEST BRANCH", "and its branch")
+    close(s)
+
+# --------------------------------------------------------------------------------------------
 # GROUP: kyc-runner -- the standalone KYC script
 # --------------------------------------------------------------------------------------------
 
