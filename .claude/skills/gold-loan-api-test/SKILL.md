@@ -11,7 +11,7 @@ Single-file async Python harness that drives the **Augmont Gold Loan (GL) backen
 
 ## Standalone runners & tests (siblings of maintest.py)
 
-Three files wrap `GoldLoanApiTest` rather than subclassing it, so every request body, signature and
+Four files wrap `GoldLoanApiTest` rather than subclassing it, so every request body, signature and
 domain rule stays defined once in `maintest.py` and cannot drift:
 
 - **`src/test_kyc.py`** — the complete KYC journey and nothing else, in any identity mode.
@@ -28,10 +28,48 @@ domain rule stays defined once in `maintest.py` and cannot drift:
   guards stop a stale re-assign: `create_one` clears `available_packet` before each create (the real
   `create_packet` leaves the PREVIOUS packet in place when its listing lookup fails), and it
   cross-checks the listed `packetUniqueId` against the one just generated.
+- **`src/test_resume_loan.py`** — picks up a loan that is parked at ANY stage and drives it to
+  completion (`--loan AUGM-… | --customer UID | --loan-id N [--master-loan-id N]`, plus
+  `--from KEY`, `--dry-run`, `--list-steps`, `--env/--login/--partner`). `STEPS` mirrors the
+  post-creation half of `run_e2e_test` as 11 keyed units (ornaments → scheme → bank →
+  appraiser-rating → packet → bm-rating → documents → ops-bank → ops-rating → disburse →
+  submit-packet); a test asserts every method name in it exists on `GoldLoanApiTest` and that the
+  tail of `run_e2e_test` is fully covered, so a rename cannot silently break it mid-loan.
+  **The resume point comes from two signals, EARLIER wins**: `masterLoan.loanStageId` via
+  `STAGE_RESUME`, and the record's own contents (no ornaments / no `finalLoanAmount` / no
+  `loanBankDetail` / no packet / no documents / not disbursed). That asymmetry is deliberate —
+  a half-failed run leaves the stage saying "upload documents" while `loanBankDetail` is still
+  null, and trusting the stage alone would skip a missing prerequisite. **Any resume at or before
+  `scheme` backs up to `ornaments`**, because the scheme step recomputes eligibility from the
+  ornaments held in memory and a fresh process has none. State is rehydrated from
+  `single-loan.data` + `masterLoan` (ids, amounts, tenure, charges, bank detail, appraiser request,
+  branch) and the KYC artifacts come from `get_customer_by_id` + `_prepare_loan_fields_from_existing`.
+  Stages `12/13/14/20` (or `isLoanCompleted`) mean nothing is left to run.
+- **Finding an in-flight loan by its AUGM id: use `applied-loan-details`, NOT `loan-details`.**
+  `GET /api/loan-process/loan-details?…&loanUniqueId=AUGM-79787` answers `{"data": []}` for a loan
+  the portal happily shows — confirmed on TEST for a loan sitting at ops rating. `loan-details`
+  only lists loans that finished the flow (the e2e's last step reads it *after* submit-packet);
+  the portal's `/admin/loan-management/applied-loan?loanUniqueId=…` screen is backed by
+  **`/api/loan-process/applied-loan-details`**, whose rows come back under **`appliedLoanDetails`**,
+  not `data` (reading `data` there silently finds nothing). `_resolve_by_unique_id` walks
+  applied-loan-details (`isRejectedLoan` false then true) before loan-details, each filtered by
+  `loanUniqueId` and then scanned unfiltered page by page and matched client-side, and repeats the
+  whole ladder under an **admin token** — these listings are user-scoped like every other one here.
+- **NEVER send a guessed query parameter to these listings — an unknown one is a 500, not an ignored
+  filter.** They map the parameter straight onto a database column:
+  `applied-loan-details?…&search=AUGM-79787` → **500 `column customerLoanMaster.search does not
+  exist`** (an HTML error page, not JSON). `loanUniqueId` is the only filter name confirmed to work,
+  and it is the only one the ladder sends; a test asserts no other filter key can creep into
+  `LOAN_SEARCH_ENDPOINTS`. A 5xx on one listing is recorded and the ladder continues to the next.
+- The `--loan AUGM-…` value is stored on the suite at resolve time: `single-loan` reports
+  `loanUniqueId` as **null** until the assign-packet stage, and the closing `fetch_loan_details`
+  searches by it, so the id from the command line must not be lost.
+  `_row_ids` prefers the `customerLoan[]` entry whose `loanUniqueId` matches, because a master loan
+  can hold several.
 - **`tests/test_harness.py`** — offline regression suite, **no network and no extra deps** (there is
   no pytest here). `python tests/test_harness.py [group-prefix]`. Request bodies are byte-compared
-  against `reference/*.har`; control flow is mock-driven. 33 tests, groups: `kyc-body`, `kyc-verify`,
-  `duplicate`, `profile`, `packets`, `kyc-runner`. Node is required (CryptoJS tests).
+  against `reference/*.har`; control flow is mock-driven. 81 tests, groups: `kyc-body`, `kyc-verify`,
+  `duplicate`, `profile`, `packets`, `appraiser`, `bank`, `resume`, `kyc-runner`. Node is required (CryptoJS tests).
   **This suite was mutation-tested** — the code was deliberately broken to confirm each test fails.
   When adding a KYC behaviour, add a test AND check a mutation trips it; the first version of the
   `switchToManual` test passed even with the signal handling disabled, because it fired the flag on

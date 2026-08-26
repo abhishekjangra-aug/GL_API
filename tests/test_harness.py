@@ -33,6 +33,8 @@ import maintest  # noqa: E402
 from maintest import GoldLoanApiTest as G, KycDocumentAlreadyExistsError  # noqa: E402
 from test_create_packets import PacketBatchTest  # noqa: E402
 from test_kyc import KycOnlyTest  # noqa: E402
+from test_resume_loan import (  # noqa: E402
+    ResumeLoanTest, STAGE_NAMES, STEPS as RESUME_STEPS, STEP_KEYS as RESUME_KEYS)
 
 # --------------------------------------------------------------------------------------------
 # tiny test framework
@@ -1208,6 +1210,396 @@ def _():
     eq(body["bankName"], "TEST BANK", "and the bank from the IFSC lookup, not hard-coded SBI")
     eq(body["bankBranchName"], "TEST BRANCH", "and its branch")
     close(s)
+
+# --------------------------------------------------------------------------------------------
+# GROUP: resume -- the resume-any-loan runner
+# --------------------------------------------------------------------------------------------
+
+def _resume_args(**over):
+    class A:
+        loan = customer = loan_id = master_loan_id = start_from = None
+        env, login, partner = "test", "appraiser", "roshan"
+        dry_run = list_steps = False
+    a = A()
+    for k, v in over.items():
+        setattr(a, k, v)
+    return a
+
+def _resume_runner(**over):
+    clean_env()  # the constructor loads the KYC profile and prints about it
+    with redirect_stdout(io.StringIO()):
+        r = ResumeLoanTest(_resume_args(**over))
+    r.suite.auth_token = "tok"
+    return r
+
+def _loan_record(stage_id=6, ornaments=True, final_amount=400000, bank=True, packet=True,
+                 documents=True, disbursed=True, completed=False):
+    """A single-loan payload's `data`, trimmed to the fields the runner reads."""
+    return {
+        "id": 12952,
+        "masterLoanId": 10947,
+        "customerId": 8463,
+        "loanUniqueId": "AUGM-67273",
+        "partnerId": 152,
+        "schemeId": 853,
+        "rpg": 4533,
+        "ltv": 85,
+        "interestRate": 1,
+        "posExposureAgainstScheme": 0.18,
+        "loanOrnamentsDetail": [{"id": 1}] if ornaments else [],
+        "loanBankDetail": {"accountNumber": "00000036150491589", "ifscCode": "SBIN0011777",
+                           "bankName": "SBI", "isVerified": False,
+                           "forOpsApproval": True} if bank else None,
+        "loanPacketDetails": [{"id": 7}] if packet else [],
+        "customerLoanDocument": [{"id": 3}] if documents else [],
+        "isDisbursed": disbursed,
+        "masterLoan": {
+            "id": 10947,
+            "loanStageId": stage_id,
+            "loanStage": {"id": stage_id, "name": STAGE_NAMES.get(stage_id, "unknown")},
+            "finalLoanAmount": final_amount,
+            "tenure": 6,
+            "processingCharge": 4000,
+            "upfrontInterestAmount": 0,
+            "loanStartDate": "2026-07-27",
+            "loanEndDate": "2027-01-22",
+            "appraiserRequestId": 13501,
+            "internalBranchId": 1,
+            "isLoanDisbursed": disbursed,
+            "isLoanCompleted": completed,
+        },
+    }
+
+def _planned(record, **over):
+    """Run the runner's planning logic against a record, with no network at all."""
+    r = _resume_runner(**over)
+    r.loan_record = record
+    master = record["masterLoan"]
+    r.stage_id = master["loanStageId"]
+    r.stage_name = master["loanStage"]["name"]
+    steps = r.plan()
+    return r, [s.key for s in steps]
+
+@test("resume: every step maps to methods that exist on the harness")
+def _():
+    # The steps are named as strings, so a rename in maintest.py would otherwise only surface
+    # mid-run, after the loan has already been mutated.
+    for step in RESUME_STEPS:
+        for name in step.methods:
+            ok(callable(getattr(G, name, None)), f"{step.key}: GoldLoanApiTest.{name} exists")
+
+@test("resume: the step list covers the post-creation half of run_e2e_test")
+def _():
+    import inspect
+    called = set(re.findall(r"await self\.(\w+)\(", inspect.getsource(G.run_e2e_test)))
+    covered = {m for step in RESUME_STEPS for m in step.methods}
+    # Everything from ornaments onwards must be reachable by a resume; the earlier steps
+    # (customer, KYC, appraiser request, basic details, nominee) are what make it resumable.
+    tail = {"store_ornament_details", "check_loan_type", "generate_interest_table",
+            "get_final_loan_details", "validate_account", "store_bank_details",
+            "add_appraiser_rating", "add_packet_images", "submit_bm_rating_if_required",
+            "store_loan_documents", "ops_manual_bank_verification", "submit_ops_rating",
+            "disburse_amount", "submit_packet"}
+    eq(sorted(tail - covered), [], "steps in run_e2e_test's tail that no resume step runs")
+    eq(sorted(tail - called), [], "the expected tail no longer matches run_e2e_test")
+
+@test("resume: each stage id resumes at the right step")
+def _():
+    cases = [
+        (1, "appraiser-rating"), (3, "packet"), (2, "bm-rating"), (8, "documents"),
+        (7, "ops-bank"), (4, "disburse"), (18, "disburse"), (16, "disburse"),
+        (5, "submit-packet"), (11, "submit-packet"),
+    ]
+    for stage, expected in cases:
+        # everything present, so only the stage decides
+        _r, keys = _planned(_loan_record(stage_id=stage, disbursed=(stage in (5, 11))))
+        eq(keys[0], expected, f"stage {stage} ({STAGE_NAMES[stage]})")
+        eq(keys, RESUME_KEYS[RESUME_KEYS.index(expected):], "and runs every later step")
+
+@test("resume: a completed loan runs nothing")
+def _():
+    r, keys = _planned(_loan_record(stage_id=13))
+    eq(keys, [], "nothing left to do")
+    eq(r.resume_key, None, "no resume point")
+    ok("already" in r.reason, "and it says why")
+
+    r2, keys2 = _planned(_loan_record(stage_id=5, completed=True))
+    eq(keys2, [], "isLoanCompleted also ends it, whatever the stage says")
+
+@test("resume: a missing prerequisite wins over a later stage id")
+def _():
+    # The live shape of a half-failed run: the stage says "upload documents" but bank-details
+    # never stored. Starting at documents would fail on the missing prerequisite.
+    r, keys = _planned(_loan_record(stage_id=8, bank=False))
+    eq(keys[0], "bank", "backed up to the missing step")
+    ok("starting earlier" in r.reason, "and explained itself")
+
+    r2, keys2 = _planned(_loan_record(stage_id=4, packet=False))
+    eq(keys2[0], "packet", "same for a loan waiting to disburse with no packet")
+
+@test("resume: an early resume point backs up to ornaments")
+def _():
+    # The scheme step recomputes eligibility from ornaments held in memory, which a fresh
+    # process does not have -- so any resume at or before 'scheme' re-sends them first.
+    # Stage 1 says "appraiser rating" but the loan has no final amount, so the record pulls
+    # the start back to 'scheme', and that in turn pulls it back to 'ornaments'.
+    r, keys = _planned(_loan_record(stage_id=1, final_amount=None))
+    eq(keys[0], "ornaments", "re-sends the ornaments before recomputing the scheme")
+    ok("backed up" in r.reason, "and says so")
+
+    # Stage 6 "applying" already points at ornaments, so there is nothing to back up.
+    r2, keys2 = _planned(_loan_record(stage_id=6, final_amount=None))
+    eq(keys2[0], "ornaments", "same start, reached straight from the stage")
+    ok("backed up" not in r2.reason, "without a redundant back-up note")
+
+@test("resume: --from overrides both signals")
+def _():
+    r, keys = _planned(_loan_record(stage_id=8, bank=False), start_from="disburse")
+    eq(keys, ["disburse", "submit-packet"], "starts exactly where told")
+    eq(r.reason, "--from disburse", "and records why")
+
+@test("resume: an unmapped stage falls back to what the record holds")
+def _():
+    r, keys = _planned(_loan_record(stage_id=9, bank=False))  # 9 = loan transfer
+    eq(keys[0], "bank", "the record decides")
+    ok("not part of the new-loan flow" in r.reason, "and it says the stage was unmapped")
+
+@test("resume: rehydration fills the fields the later steps send back")
+def _():
+    record = _loan_record(stage_id=8)
+    r = _resume_runner()
+    r.suite.loan_id = "12952"
+    calls = []
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        calls.append(path)
+        if "single-loan" in path:
+            return _json_response({"data": record})
+        return _json_response({})
+    r.suite._make_authenticated_request = fake
+    async def noop(*a, **kw): return {}
+    r.suite.get_customer_by_id = noop
+    r.suite._prepare_loan_fields_from_existing = noop
+
+    quiet(lambda: asyncio.run(r.rehydrate()))
+    s = r.suite
+    eq(s.master_loan_id, "10947", "master loan id")
+    eq(s.customer_id, "8463", "customer id")
+    eq(s.loan_unique_id, "AUGM-67273", "loan unique id for the final search")
+    eq(s.final_loan_amount, 400000.0, "final amount (float, for toBePaid)")
+    eq(s.secured_processing_charge, 4000.0, "processing charge")
+    eq(s.upfront_interest_amount, 0.0, "upfront interest")
+    eq(s.tenure_months, 6, "tenure")
+    eq(s.appraiser_request_id, "13501", "appraiser request id, as a string")
+    eq(s.internal_branch_id, "1", "branch id, as a string")
+    eq(s.bank_account_number, "00000036150491589", "bank account from the stored detail")
+    eq(s.bank_for_ops_approval, True, "and its pending-verification flag")
+    eq(r.stage_id, 8, "captured the stage")
+    close(s)
+
+@test("resume: a loan with no single-loan data fails loudly")
+def _():
+    r = _resume_runner()
+    r.suite.loan_id = "12952"
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        return _json_response({"data": None})
+    r.suite._make_authenticated_request = fake
+    try:
+        quiet(lambda: asyncio.run(r.rehydrate()))
+        raise Fail("an empty single-loan must not be treated as a resumable loan")
+    except RuntimeError as e:
+        ok("single-loan" in str(e), "the error names what came back empty")
+    close(r.suite)
+
+RESUME_ADMIN_TOKEN = "resume-admin-tok"
+
+def _applied_row(uid="AUGM-79787", master_id=10947, loan_id=12952):
+    """An applied-loan-details row, shaped like the loan-details rows in the HAR."""
+    return {
+        "id": master_id,
+        "loanStage": {"id": 7, "name": "OPS team rating"},
+        "customerLoan": [{"id": loan_id, "loanUniqueId": uid, "masterLoanId": master_id}],
+    }
+
+def _loan_search_stub(r, where=None, row=None, scope="appraiser"):
+    """Serve the loan listings.
+
+    `where` is (endpoint_fragment, filter_key) naming the ONE combination that returns the row
+    -- everything else answers an empty list, like the live portal loan that loan-details does
+    not carry. `scope` is which token has to be in use for it to be found.
+    """
+    s = r.suite
+    state = {"paths": [], "scopes": []}
+
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        current = "admin" if s.auth_token == RESUME_ADMIN_TOKEN else "appraiser"
+        state["paths"].append(path)
+        state["scopes"].append(current)
+        if path == "/api/user-otp/user-send-otp":
+            return _json_response({"referenceCode": "rc"})
+        if path == "/api/auth/verify-login":
+            return _json_response({"Token": RESUME_ADMIN_TOKEN})
+
+        hit = False
+        if where and current == scope:
+            endpoint, key = where
+            # Match the endpoint EXACTLY: "loan-details" is a substring of
+            # "applied-loan-details", and a loose match let the wrong listing answer.
+            if path.split("?", 1)[0] == f"/api/loan-process/{endpoint}":
+                hit = (f"&{key}=" in path) if key else ("loanUniqueId=" not in path
+                                                        and "search=" not in path)
+        rows = [row or _applied_row()] if hit else []
+        # applied-loan-details answers under `appliedLoanDetails`; loan-details under `data`.
+        key = "appliedLoanDetails" if "applied-loan-details" in path else "data"
+        return _json_response({key: rows,
+                               "pagination": {"hasMore": False, "per_page": 25, "current_page": 1}})
+
+    s._make_authenticated_request = fake
+    return state
+
+@test("resume: an in-flight loan is found via applied-loan-details, not loan-details")
+def _():
+    # The live case: the portal shows AUGM-79787 at ops rating, but
+    # loan-details?loanUniqueId=… returns {"data": []} because it only lists finished loans.
+    r = _resume_runner(loan="AUGM-79787")
+    state = _loan_search_stub(r, where=("applied-loan-details", "loanUniqueId"))
+    (master, loan), _out = quiet(lambda: asyncio.run(r._resolve_by_unique_id("AUGM-79787")))
+    eq((master, loan), ("10947", "12952"), "ids out of the customerLoan entry")
+    ok(state["paths"][0].startswith("/api/loan-process/applied-loan-details"),
+       "applied-loan-details is tried FIRST")
+    close(r.suite)
+
+@test("resume: applied-loan-details rows are read from appliedLoanDetails, not data")
+def _():
+    # The endpoint does not use the `data` key the rest of the API uses; reading `data` here
+    # silently finds nothing.
+    payload = {"appliedLoanDetails": [_applied_row()], "pagination": {}}
+    rows = ResumeLoanTest._loan_rows(payload)
+    eq(len(rows), 1, "the rows were found under appliedLoanDetails")
+    eq(ResumeLoanTest._loan_rows({"data": [_applied_row()]}), [_applied_row()], "data still works")
+    eq(ResumeLoanTest._loan_rows({"pagination": {}}), [], "and an empty payload is empty")
+
+@test("resume: the search falls back to an unfiltered scan when the filter finds nothing")
+def _():
+    r = _resume_runner(loan="AUGM-79787")
+    state = _loan_search_stub(r, where=("applied-loan-details", None))  # only the bare listing
+    (master, loan), _out = quiet(lambda: asyncio.run(r._resolve_by_unique_id("AUGM-79787")))
+    eq(loan, "12952", "found by matching the rows client-side")
+    ok(any("loanUniqueId=" in p for p in state["paths"]), "the filtered query was tried first")
+    close(r.suite)
+
+@test("resume: a loan owned by another login is found under the admin scope")
+def _():
+    r = _resume_runner(loan="AUGM-79787")
+    state = _loan_search_stub(r, where=("applied-loan-details", "loanUniqueId"), scope="admin")
+    (_master, loan), _out = quiet(lambda: asyncio.run(r._resolve_by_unique_id("AUGM-79787")))
+    eq(loan, "12952", "admin sees it")
+    ok("admin" in state["scopes"], "retried under the admin token")
+    eq(r.suite.auth_token, "tok", "and restored our own token")
+    close(r.suite)
+
+@test("resume: a loan nowhere to be found reports every listing it tried")
+def _():
+    r = _resume_runner(loan="AUGM-00000")
+    _loan_search_stub(r, where=None)
+    try:
+        quiet(lambda: asyncio.run(r._resolve_by_unique_id("AUGM-00000")))
+        raise Fail("an unfindable loan must fail, not resume something else")
+    except RuntimeError as e:
+        ok("applied-loan-details" in str(e), "names the in-flight listing")
+        ok("loan-details" in str(e), "and the completed one")
+        ok("admin scope" in str(e), "and says the admin scope was tried")
+    close(r.suite)
+
+@test("resume: the right customer loan is picked when a master loan holds several")
+def _():
+    row = {"id": 10947, "customerLoan": [
+        {"id": 11111, "loanUniqueId": "AUGM-OTHER", "masterLoanId": 10947},
+        {"id": 12952, "loanUniqueId": "AUGM-79787", "masterLoanId": 10947},
+    ]}
+    master, loan = ResumeLoanTest._row_ids(row, "AUGM-79787")
+    eq((master, loan), ("10947", "12952"), "matched on the unique id, not just the first entry")
+
+@test("resume: a row with no customer loan id fails with the row's keys")
+def _():
+    r = _resume_runner(loan="AUGM-79787")
+    _loan_search_stub(r, where=("applied-loan-details", "loanUniqueId"),
+                      row={"loanUniqueId": "AUGM-79787", "someOtherShape": True})
+    try:
+        quiet(lambda: asyncio.run(r._resolve_by_unique_id("AUGM-79787")))
+        raise Fail("a row we cannot read ids from must not resume a mystery loan")
+    except RuntimeError as e:
+        ok("--loan-id" in str(e), "tells the user how to get past it")
+    close(r.suite)
+
+@test("resume: only loanUniqueId is ever sent as a filter")
+def _():
+    # These endpoints map an unrecognised query parameter onto a database column, so a guessed
+    # filter is a 500, not an ignored one:
+    #   applied-loan-details?...&search=AUGM-79787
+    #   -> 500 "column customerLoanMaster.search does not exist"
+    for _endpoint, _extras, filters in ResumeLoanTest.LOAN_SEARCH_ENDPOINTS:
+        eq(sorted(set(filters) - {""}), ["loanUniqueId"],
+           "no speculative filter names in the search ladder")
+
+@test("resume: the live search sends no filter other than loanUniqueId")
+def _():
+    r = _resume_runner(loan="AUGM-79787")
+    state = _loan_search_stub(r, where=("loan-details", "loanUniqueId"))
+    quiet(lambda: asyncio.run(r._resolve_by_unique_id("AUGM-79787")))
+    for path in state["paths"]:
+        if "loan-process" not in path:
+            continue
+        params = {p.split("=")[0] for p in path.split("?", 1)[-1].split("&")}
+        eq(sorted(params - {"from", "to", "isRejectedLoan", "loanUniqueId"}), [],
+           f"unexpected query parameter in {path}")
+    close(r.suite)
+
+@test("resume: a 500 from one listing does not stop the search")
+def _():
+    # Belt and braces: even if some future parameter blows up server-side, the ladder has to
+    # carry on to the listing that does work.
+    r = _resume_runner(loan="AUGM-79787")
+    s = r.suite
+    state = {"paths": []}
+
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        state["paths"].append(path)
+        if path.startswith("/api/user-otp") or path.startswith("/api/auth"):
+            return _json_response({"referenceCode": "rc", "Token": RESUME_ADMIN_TOKEN})
+        if "applied-loan-details" in path:
+            request = httpx.Request("GET", "https://x" + path)
+            response = httpx.Response(
+                500, text="<h1>column customerLoanMaster.search does not exist</h1>",
+                request=request)
+            raise httpx.HTTPStatusError("500", request=request, response=response)
+        rows = [_applied_row()] if "loanUniqueId=" in path else []
+        return _json_response({"data": rows, "pagination": {"hasMore": False}})
+
+    s._make_authenticated_request = fake
+    (_master, loan), _out = quiet(lambda: asyncio.run(r._resolve_by_unique_id("AUGM-79787")))
+    eq(loan, "12952", "fell through to loan-details and found it there")
+    close(s)
+
+@test("resume: the supplied loan unique id survives a loan that has none yet")
+def _():
+    # single-loan reports loanUniqueId as null until the assign-packet stage, but the closing
+    # fetch_loan_details searches by it -- so the id the user passed must not be lost.
+    r = _resume_runner(loan="AUGM-79787")
+    _loan_search_stub(r, where=("applied-loan-details", "loanUniqueId"))
+    quiet(lambda: asyncio.run(r.resolve_loan()))
+    eq(r.suite.loan_unique_id, "AUGM-79787", "kept from the command line")
+
+    record = _loan_record(stage_id=7)
+    record["loanUniqueId"] = None  # not assigned yet
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        return _json_response({"data": record} if "single-loan" in path else {})
+    r.suite._make_authenticated_request = fake
+    async def noop(*a, **kw): return {}
+    r.suite.get_customer_by_id = noop
+    r.suite._prepare_loan_fields_from_existing = noop
+    quiet(lambda: asyncio.run(r.rehydrate()))
+    eq(r.suite.loan_unique_id, "AUGM-79787", "and not clobbered by a null from single-loan")
+    close(r.suite)
 
 # --------------------------------------------------------------------------------------------
 # GROUP: kyc-runner -- the standalone KYC script
