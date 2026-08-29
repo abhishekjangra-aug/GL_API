@@ -1602,6 +1602,158 @@ def _():
     close(r.suite)
 
 # --------------------------------------------------------------------------------------------
+# GROUP: stage -- "Loan Stage has been changed to: …" recovery
+# --------------------------------------------------------------------------------------------
+
+STAGE_CHANGED_BODY = ('{"message":"Loan Stage has been changed to: bm rating, '
+                      'please re-visit the applied loan page."}')
+
+def _stage_suite(amount=500000):
+    s = suite()
+    s.loan_id, s.master_loan_id = "11312", "9939"
+    s.customer_id = "20308"
+    s.final_loan_amount = amount
+    s.logged_in_user_id = 1473
+    return s
+
+def _stage_error(body=STAGE_CHANGED_BODY, status=400):
+    request = httpx.Request("POST", "https://x/api/loan-process/ops-rating")
+    response = httpx.Response(status, text=body, request=request)
+    return httpx.HTTPStatusError(str(status), request=request, response=response)
+
+def _bm_recorder(s):
+    """Count BM ratings without touching the network."""
+    state = {"bm": 0, "tokens": []}
+    async def role_token(login_type):
+        state["tokens"].append(login_type)
+        return f"{login_type}-tok"
+    async def add_bm_rating():
+        state["bm"] += 1
+    s._role_token = role_token
+    s.add_bm_rating = add_bm_rating
+    return state
+
+@test("stage: the pending stage is parsed out of the server's message")
+def _():
+    s = _stage_suite()
+    eq(s._stage_changed_to(STAGE_CHANGED_BODY), "bm rating", "the stage name, lower-cased")
+    eq(s._stage_changed_to('{"message":"Loan Stage has been changed to: disbursement pending, '
+                           'please re-visit the applied loan page."}'),
+       "disbursement pending", "a multi-word stage")
+    eq(s._stage_changed_to('{"message":"To Be Paid amount is incorrect"}'), "",
+       "an unrelated error is not a stage change")
+    eq(s._stage_changed_to(""), "", "and neither is an empty body")
+    close(s)
+
+@test("stage: a loan of exactly 5L DOES need the BM rating")
+def _():
+    # The live failure: loanAmountDigi "500000.00" was skipped by a strict > threshold, and the
+    # server then refused loan-documents and ops-rating with "changed to: bm rating".
+    s = _stage_suite(amount=500000)
+    state = _bm_recorder(s)
+    _r, out = quiet(lambda: asyncio.run(s.submit_bm_rating_if_required()))
+    eq(state["bm"], 1, "the BM rating was submitted at the threshold")
+    eq(state["tokens"], ["bm"], "under the BM login")
+    eq(s.bm_rating_submitted, True, "and recorded")
+    ok("required" in out, "and said so")
+    close(s)
+
+@test("stage: a loan under 5L still skips the BM rating")
+def _():
+    s = _stage_suite(amount=499999.99)
+    state = _bm_recorder(s)
+    _r, out = quiet(lambda: asyncio.run(s.submit_bm_rating_if_required()))
+    eq(state["bm"], 0, "no BM rating below the threshold")
+    ok("skipped" in out, "and said why")
+    close(s)
+
+@test("stage: a stage-change 400 submits the BM rating and retries the call")
+def _():
+    s = _stage_suite()
+    state = _bm_recorder(s)
+    calls = {"n": 0}
+    async def send():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _stage_error()
+        return "ok"
+    result, out = quiet(lambda: asyncio.run(s._with_stage_recovery("ops rating", send)))
+    eq(result, "ok", "the retry succeeded")
+    eq(calls["n"], 2, "called exactly twice")
+    eq(state["bm"], 1, "the pending BM rating was settled first")
+    ok("Retrying ops rating" in out, "and it said what it retried")
+    close(s)
+
+@test("stage: recovery is attempted ONCE, not looped")
+def _():
+    # Force the settle step to keep claiming it fixed something: without a single-retry
+    # contract this recurses forever. (The duplicate-BM guard also stops the real path, but
+    # that is a different safeguard -- this pins the retry contract on its own.)
+    s = _stage_suite()
+    _bm_recorder(s)
+    async def always_settled(_text):
+        return True
+    s._settle_pending_stage = always_settled
+    calls = {"n": 0}
+    async def send():
+        calls["n"] += 1
+        raise _stage_error()
+    try:
+        quiet(lambda: asyncio.run(s._with_stage_recovery("ops rating", send)))
+        raise Fail("a stage that keeps moving must surface, not loop")
+    except httpx.HTTPStatusError:
+        pass
+    except RecursionError:
+        raise Fail("the recovery recursed instead of retrying once")
+    eq(calls["n"], 2, "one retry only")
+    close(s)
+
+@test("stage: an already-submitted BM rating is not submitted again")
+def _():
+    s = _stage_suite()
+    state = _bm_recorder(s)
+    s.bm_rating_submitted = True
+    calls = {"n": 0}
+    async def send():
+        calls["n"] += 1
+        raise _stage_error()
+    try:
+        quiet(lambda: asyncio.run(s._with_stage_recovery("ops rating", send)))
+        raise Fail("nothing left to settle, so the error must surface")
+    except httpx.HTTPStatusError:
+        pass
+    eq(state["bm"], 0, "no duplicate BM rating")
+    eq(calls["n"], 1, "and no pointless retry")
+    close(s)
+
+@test("stage: an unrelated 400 and any non-400 are re-raised untouched")
+def _():
+    s = _stage_suite()
+    state = _bm_recorder(s)
+    for err in (_stage_error(body='{"message":"To Be Paid amount is incorrect"}'),
+                _stage_error(body=STAGE_CHANGED_BODY, status=500)):
+        calls = {"n": 0}
+        async def send(err=err):
+            calls["n"] += 1
+            raise err
+        try:
+            quiet(lambda: asyncio.run(s._with_stage_recovery("bank details", send)))
+            raise Fail("the original error must survive")
+        except httpx.HTTPStatusError as raised:
+            eq(raised.response.status_code, err.response.status_code, "same error")
+        eq(calls["n"], 1, "no retry")
+    eq(state["bm"], 0, "and ops/bm were not dragged into an unrelated failure")
+    close(s)
+
+@test("stage: ops rating and loan documents both go through the recovery")
+def _():
+    import inspect
+    for method in (G.submit_ops_rating, G.store_loan_documents):
+        src = inspect.getsource(method)
+        ok("_with_stage_recovery" in src,
+           f"{method.__name__} must route through the stage recovery")
+
+# --------------------------------------------------------------------------------------------
 # GROUP: kyc-runner -- the standalone KYC script
 # --------------------------------------------------------------------------------------------
 

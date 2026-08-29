@@ -237,6 +237,7 @@ class GoldLoanApiTest:
         self._existing_request_appraiser_id = None
         self._branch_attempts = []  # per-attempt results of the alternate-branch create ladder
         self.bank_account_label = ''
+        self.bm_rating_submitted = False  # set by _submit_bm_rating; stops a duplicate on recovery
         # How many candidate payout accounts the penny-drop may walk (each one hits a real bank).
         self.bank_account_attempts = int(os.getenv("GOLD_LOAN_BANK_ACCOUNT_ATTEMPTS", "12") or 0)
         self.master_loan_id = ''
@@ -4376,31 +4377,100 @@ class GoldLoanApiTest:
     # 5-lakh threshold above which a Branch Manager approval (BM rating) is required.
     BM_RATING_THRESHOLD = 500000
 
+    # The server refuses any loan-process call whose stage has moved on, with a 400 whose body
+    # names the stage it is now waiting on:
+    #   {"message":"Loan Stage has been changed to: bm rating, please re-visit the applied loan page."}
+    # That is not really a failure -- it is the server telling us which step to do first.
+    STAGE_CHANGED_MARKER = "Loan Stage has been changed to"
+
+    @classmethod
+    def _stage_changed_to(cls, response_text: str) -> str:
+        """The stage name out of that message, lower-cased, or '' for any other error."""
+        if not response_text or cls.STAGE_CHANGED_MARKER not in response_text:
+            return ""
+        tail = response_text.split(cls.STAGE_CHANGED_MARKER, 1)[1]
+        return tail.lstrip(': "').split(",")[0].strip().strip('".').lower()
+
+    async def _settle_pending_stage(self, response_text: str) -> bool:
+        """Do whatever the loan is now waiting on. True when the caller should retry.
+
+        Only stages this harness can actually settle are handled; anything else is reported and
+        left alone, so an unexpected stage surfaces as the original error rather than a silent
+        no-op retry loop.
+        """
+        stage = self._stage_changed_to(response_text)
+        if not stage:
+            return False
+        if stage == "bm rating":
+            if self.bm_rating_submitted:
+                print(f"Loan is waiting on '{stage}' but the BM rating was already submitted; "
+                      "not retrying.")
+                return False
+            print(self._c(f"Loan stage moved to '{stage}' -- submitting the BM rating "
+                          "(the amount is at or over the 5L threshold), then retrying.", "yellow"))
+            await self._submit_bm_rating()
+            return True
+        if stage == "disbursement pending":
+            # The ops rating already advanced the loan to where disbursement wants it; the
+            # caller's own call is what is out of date, not the loan.
+            print(f"Loan stage moved to '{stage}'; nothing to settle before disbursement.")
+            return False
+        print(self._c(f"Loan stage moved to '{stage}' and this harness has no recovery for it.",
+                      "yellow"))
+        return False
+
+    async def _with_stage_recovery(self, description: str, send):
+        """Run `send()`; if the server says the stage moved, settle that stage and retry ONCE.
+
+        One retry only: if the stage moves again the loan is being changed underneath us and
+        looping would just hide it.
+        """
+        try:
+            return await send()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code != 400:
+                raise
+            if not await self._settle_pending_stage(e.response.text or ""):
+                raise
+            print(f"Retrying {description} now that the pending stage is settled.")
+            return await send()
+
     async def submit_bm_rating_if_required(self):
         """BM approval is only needed when the loan amount exceeds 5L. BM rating must be posted
         under the BM's own login (per-environment mobile, OTP 1234), so swap to a BM role token for
         just this call and restore the appraiser session afterwards."""
         amount = float(self.final_loan_amount) if self.final_loan_amount else 0.0
-        if amount <= self.BM_RATING_THRESHOLD:
-            print(f"BM rating skipped: loan amount {amount:.2f} <= {self.BM_RATING_THRESHOLD} threshold.")
+        # The threshold is INCLUSIVE: a loan of exactly 500000 is moved to the "bm rating"
+        # stage by the server (confirmed on UAT -- loanAmountDigi "500000.00" then answered
+        # "Loan Stage has been changed to: bm rating" on loan-documents and ops-rating). A
+        # strict > here skipped the rating and deadlocked the rest of the flow.
+        if amount < self.BM_RATING_THRESHOLD:
+            print(f"BM rating skipped: loan amount {amount:.2f} < {self.BM_RATING_THRESHOLD} threshold.")
             return
-        print(f"BM rating required: loan amount {amount:.2f} > {self.BM_RATING_THRESHOLD} threshold.")
+        print(f"BM rating required: loan amount {amount:.2f} >= {self.BM_RATING_THRESHOLD} threshold.")
+        await self._submit_bm_rating()
+
+    async def _submit_bm_rating(self) -> None:
+        """Post the BM rating under the BM's own login, then restore the appraiser session."""
         saved_token = self.auth_token
         try:
             self.auth_token = await self._role_token("bm")
             await self.add_bm_rating()
+            self.bm_rating_submitted = True
         finally:
             self.auth_token = saved_token
 
     async def submit_ops_rating(self):
         """Ops rating (final approval) must be posted under the Ops login (per env, OTP 1234).
         Swap to an ops role token for just this call, then restore the appraiser session."""
-        saved_token = self.auth_token
-        try:
-            self.auth_token = await self._role_token("ops")
-            await self.add_ops_rating()
-        finally:
-            self.auth_token = saved_token
+        async def send():
+            saved_token = self.auth_token
+            try:
+                self.auth_token = await self._role_token("ops")
+                return await self.add_ops_rating()
+            finally:
+                self.auth_token = saved_token
+        await self._with_stage_recovery("ops rating", send)
 
     async def ops_manual_bank_verification(self, force: bool = False, strict: bool = True):
         """MANUAL bank verification by the OPS team -- clears the pending bank-verification state.
@@ -5218,8 +5288,10 @@ class GoldLoanApiTest:
             "loanAmountDigi": f"{float(self.final_loan_amount):.2f}" if self.final_loan_amount else "0.00",
             "loanType": "Fresh Loan",
         }
+        async def send():
+            return await self._make_authenticated_request('POST', api_path, json_data=request_body)
         try:
-            await self._make_authenticated_request('POST', api_path, json_data=request_body)
+            await self._with_stage_recovery("loan documents", send)
             print('Store loan documents successful.')
         except httpx.HTTPStatusError as e:
             print(f"Store loan documents failed (non-fatal): {e.response.status_code} - {e.response.text}")
