@@ -138,54 +138,9 @@ class ResumeLoanTest:
 
     # ---------------------------------------------------------------- resolving the loan
 
-    # Where an in-flight loan can be found. The portal's "applied loan" screen
-    # (/admin/loan-management/applied-loan?loanUniqueId=…) is backed by applied-loan-details,
-    # and its rows come back under `appliedLoanDetails`, NOT `data` -- loan-details only lists
-    # loans that have reached the end of the flow, so a loan sitting at e.g. ops rating is
-    # simply absent from it.
-    #
-    # Each entry is (path, extra query params to try, filter keys to try). A filter key of ""
-    # means an unfiltered paged scan matched client-side.
-    #
-    # ONLY `loanUniqueId` is sent as a filter. These endpoints map an unrecognised query
-    # parameter straight onto a database column, so a guessed one does not come back as an
-    # ignored filter or a 400 -- it is a 500 with the raw error in an HTML page:
-    #     GET applied-loan-details?...&search=AUGM-79787
-    #     -> 500 "column customerLoanMaster.search does not exist"
-    # Do not add speculative filter names here without a capture showing the server accepts them.
-    LOAN_SEARCH_ENDPOINTS = (
-        ("/api/loan-process/applied-loan-details",
-         ("isRejectedLoan=false", "isRejectedLoan=true"), ("loanUniqueId", "")),
-        ("/api/loan-process/loan-details", ("",), ("loanUniqueId", "")),
-    )
-    LOAN_SEARCH_MAX_PAGES = 8
-
-    @staticmethod
-    def _loan_rows(payload):
-        """Rows out of a loan listing, whichever key this endpoint happens to use."""
-        if isinstance(payload, list):
-            return payload
-        if not isinstance(payload, dict):
-            return []
-        for key in ("appliedLoanDetails", "data", "loanDetails"):
-            rows = payload.get(key)
-            if isinstance(rows, list):
-                return rows
-        return []
-
-    @staticmethod
-    def _row_matches(row, loan_unique_id):
-        if not isinstance(row, dict):
-            return False
-        if str(row.get("loanUniqueId") or "") == loan_unique_id:
-            return True
-        customer_loans = row.get("customerLoan")
-        if isinstance(customer_loans, dict):
-            customer_loans = [customer_loans]
-        for loan in customer_loans or []:
-            if isinstance(loan, dict) and str(loan.get("loanUniqueId") or "") == loan_unique_id:
-                return True
-        return False
+    # The listing search itself lives on GoldLoanApiTest (find_loan_row): the main
+    # harness needs the same ladder for its closing loan-details read, and one copy
+    # means one place to fix when a listing changes.
 
     @staticmethod
     def _row_ids(row, loan_unique_id):
@@ -212,68 +167,17 @@ class ResumeLoanTest:
             loan_id = row.get("id") or ""
         return str(master_loan_id or ""), str(loan_id or "")
 
-    async def _scan_for_loan(self, loan_unique_id, attempts):
-        """Walk every endpoint/filter combination under the CURRENT token. Returns a row or None."""
-        quoted = urllib.parse.quote(loan_unique_id)
-        for endpoint, extras, filters in self.LOAN_SEARCH_ENDPOINTS:
-            for extra in extras:
-                for key in filters:
-                    pages = self.LOAN_SEARCH_MAX_PAGES if not key else 1
-                    for page in range(pages):
-                        frm = page * 25 + 1
-                        api_path = f"{endpoint}?from={frm}&to={frm + 24}"
-                        if extra:
-                            api_path += f"&{extra}"
-                        if key:
-                            api_path += f"&{key}={quoted}"
-                        try:
-                            response = await self.suite._make_authenticated_request('GET', api_path)
-                        except httpx.HTTPStatusError as e:
-                            attempts.append(f"{endpoint} {extra or ''} {key or 'scan'} -> "
-                                            f"{e.response.status_code}")
-                            break
-                        payload = response.json() if response.content else {}
-                        rows = self._loan_rows(payload)
-                        for row in rows:
-                            if self._row_matches(row, loan_unique_id):
-                                print(f"Found {loan_unique_id} via {endpoint} "
-                                      f"({key or 'unfiltered scan'}).")
-                                return row
-                        pagination = payload.get("pagination") if isinstance(payload, dict) else {}
-                        if not rows or not (pagination or {}).get("hasMore"):
-                            break
-                    else:
-                        continue
-        attempts.append("no listing contained it")
-        return None
-
     async def _resolve_by_unique_id(self, loan_unique_id):
-        """AUGM-… -> (masterLoanId, customerLoanId).
-
-        Walks applied-loan-details (where an in-flight loan lives) before loan-details (which
-        only lists loans that finished the flow), filtered then unfiltered, and repeats the whole
-        thing under an admin token because these listings are scoped to the logged-in user.
-        """
+        """AUGM-… -> (masterLoanId, customerLoanId), via the harness's shared listing search."""
         attempts = []
-        row = await self._scan_for_loan(loan_unique_id, attempts)
-        if row is None:
-            print("Loan not visible to this login - retrying the lookup as admin.")
-            saved_token = self.suite.auth_token
-            try:
-                self.suite.auth_token = await self.suite._role_token("admin")
-                row = await self._scan_for_loan(loan_unique_id, attempts)
-            except Exception as e:  # a failed admin login must not mask the real diagnosis
-                print(f"Admin-scoped loan lookup failed: {e}")
-                row = None
-            finally:
-                self.suite.auth_token = saved_token
-
+        row = await self.suite.find_loan_row(loan_unique_id, attempts)
         if row is None:
             raise RuntimeError(
                 f"No loan found for loanUniqueId={loan_unique_id} on env "
-                f"'{self.suite.env_name}' - searched applied-loan-details and loan-details, "
+                f"'{self.suite.env_name}' - searched loan-details and applied-loan-details, "
                 "filtered and unfiltered, under both the appraiser and the admin scope "
-                f"({'; '.join(attempts)}). Check the id, or try --env with the other environment.")
+                f"({'; '.join(attempts) or 'every listing came back empty'}). Check the id, or "
+                "try --env with the other environment.")
 
         master_loan_id, loan_id = self._row_ids(row, loan_unique_id)
         if not loan_id:

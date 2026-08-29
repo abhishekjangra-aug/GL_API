@@ -45,16 +45,18 @@ domain rule stays defined once in `maintest.py` and cannot drift:
   `single-loan.data` + `masterLoan` (ids, amounts, tenure, charges, bank detail, appraiser request,
   branch) and the KYC artifacts come from `get_customer_by_id` + `_prepare_loan_fields_from_existing`.
   Stages `12/13/14/20` (or `isLoanCompleted`) mean nothing is left to run.
-- **Finding an in-flight loan by its AUGM id: use `applied-loan-details`, NOT `loan-details`.**
-  `GET /api/loan-process/loan-details?…&loanUniqueId=AUGM-79787` answers `{"data": []}` for a loan
-  the portal happily shows — confirmed on TEST for a loan sitting at ops rating. `loan-details`
-  only lists loans that finished the flow (the e2e's last step reads it *after* submit-packet);
-  the portal's `/admin/loan-management/applied-loan?loanUniqueId=…` screen is backed by
+- **Finding a loan by its AUGM id needs BOTH listings and the admin scope — `GoldLoanApiTest.find_loan_row(loan_unique_id, attempts)` is the one implementation** (`_scan_for_loan`, `_loan_rows`, `_loan_row_matches`, `LOAN_SEARCH_ENDPOINTS`); `test_resume_loan.py` delegates to it, and a test asserts it keeps no copy of its own.
+  `GET /api/loan-process/loan-details?…&loanUniqueId=…` answers `{"data": []}` for loans the portal
+  happily shows — confirmed twice on live runs: a loan sitting at **ops rating**, AND a run's OWN
+  loan **immediately after it completed at stage 13**. So "loan-details only lists finished loans"
+  is WRONG; both listings are user-scoped, and a loan handed between roles (appraiser creates,
+  partner disburses) is frequently invisible to the session that made it. The portal's
+  `/admin/loan-management/applied-loan?loanUniqueId=…` screen is backed by
   **`/api/loan-process/applied-loan-details`**, whose rows come back under **`appliedLoanDetails`**,
-  not `data` (reading `data` there silently finds nothing). `_resolve_by_unique_id` walks
-  applied-loan-details (`isRejectedLoan` false then true) before loan-details, each filtered by
-  `loanUniqueId` and then scanned unfiltered page by page and matched client-side, and repeats the
-  whole ladder under an **admin token** — these listings are user-scoped like every other one here.
+  not `data` (reading `data` there silently finds nothing). The ladder tries loan-details then
+  applied-loan-details (`isRejectedLoan` false then true), each filtered by `loanUniqueId` and then
+  scanned unfiltered page by page and matched client-side, and repeats the whole thing under an
+  **admin token**.
 - **NEVER send a guessed query parameter to these listings — an unknown one is a 500, not an ignored
   filter.** They map the parameter straight onto a database column:
   `applied-loan-details?…&search=AUGM-79787` → **500 `column customerLoanMaster.search does not
@@ -68,7 +70,7 @@ domain rule stays defined once in `maintest.py` and cannot drift:
   can hold several.
 - **`tests/test_harness.py`** — offline regression suite, **no network and no extra deps** (there is
   no pytest here). `python tests/test_harness.py [group-prefix]`. Request bodies are byte-compared
-  against `reference/*.har`; control flow is mock-driven. 89 tests, groups: `kyc-body`, `kyc-verify`,
+  against `reference/*.har`; control flow is mock-driven. 93 tests, groups: `kyc-body`, `kyc-verify`,
   `duplicate`, `profile`, `packets`, `appraiser`, `bank`, `resume`, `stage`, `kyc-runner`. Node is required (CryptoJS tests).
   **This suite was mutation-tested** — the code was deliberately broken to confirm each test fails.
   When adding a KYC behaviour, add a test AND check a mutation trips it; the first version of the
@@ -334,7 +336,7 @@ After ops rating the loan is disbursed, then the packet is handed to the partner
 - **Submit packet runs as the APPRAISER** (`submit_packet`): `update-loan-lock` → GET `packet-tracking/view-packets?masterLoanId` (→ barcode + packetUniqueId) → GET `packet-location` list → GET `packet-tracking/get-particular-location?packetLocationId=4&masterLoanId` (→ partnerId/name) → GET `packet-tracking/user-name?mobileNumber=…&receiverType=PartnerUser&partnerBranchId=…` (→ partnerReceiverId + name) → POST `partner-user-otp/send-otp` `{mobileNumber, id:<appraiserId>, type:"updateLocationCollect", masterLoanId}` → POST `partner-user-otp/verify-otp` `{otp:"1234", referenceCode, type:"updateLocationCollect"}` → POST `packet-tracking/submit-packet-location`. Response: `{"message":"packet location submitted"}`.
 - **Submit-packet collection point is RESOLVED LIVE, not hardcoded** (it differs per env/partner): the packet location id comes from matching `location == "partner branch in"` in the `/api/packet-location` list (`PACKET_LOCATION_NAME`; fallback `PACKET_LOCATION_ID="4"`), and `partnerBranchId` from `get-particular-location`'s `data.partnerBranch[0].id` (fallback `PARTNER_BRANCH_ID="146"` = Roshan/Nerul on test). Both accept env overrides (`GOLD_LOAN_PACKET_LOCATION_ID`, `GOLD_LOAN_PARTNER_BRANCH_ID`). The partner-branch USER mobile comes from `_partner_user_mobile()` (per env + partner; test-Arvog is unknown → raises unless `GOLD_LOAN_PARTNER_USER_MOBILE` is set). `submit-packet-location.barcodeNumber` is `[{Barcode:<UPPER>, packetId:<lower packetUniqueId>}]`.
 - **`loanUniqueId` (AUGM-…) is assigned at the ASSIGN-PACKET stage**, not at disbursement. It's carried in `single-loan.data.loanUniqueId`; since `add_packet_images` calls `fetch_single_loan`, capture `self.loan_unique_id` there. Disbursement's `securedLoanUniqueId` is only a fallback. This id feeds the disbursement body and the final loan-details search.
-- **Load loan details (final step, `fetch_loan_details`)** — GET `/api/loan-process/loan-details?from=1&to=25` (list) then the targeted search `&loanUniqueId=<AUGM-…>`; `data[0]` is the full loan record. Display fields: `loanStage.name` (**"packet submitted" / id 13 = process complete**), `finalLoanAmount`, `tenure`, `loanStartDate`/`loanEndDate`, `customer` (name/uniqueId/mobile/PAN via `customer` + `customerLoan[0].loanUniqueId`), `appraiser`. A completed run ends at loanStage 13.
+- **Load loan details (final step, `fetch_loan_details`)** — goes through `find_loan_row` (see the ladder above), NOT a bare `loan-details` query. **It RAISES when the loan cannot be read back, and when `loan_unique_id` is empty.** Returning `{}` there let a completed run print *"RESULT - PASSED"* while its closing verification silently found nothing (live: `Loan details: no loan found for loanUniqueId=AUGM-59084` followed by PASSED); and the old empty-id fallback took `data[0]` of the unfiltered list, i.e. printed a DIFFERENT loan as if it were this run's. Display fields: `loanStage.name` (**"packet submitted" / id 13 = process complete**), `finalLoanAmount`, `tenure`, `loanStartDate`/`loanEndDate`, `customer` (name/uniqueId/mobile/PAN via `customer` + `customerLoan[0].loanUniqueId`), `appraiser`. A completed run ends at loanStage 13.
 
 ## Full E2E order (`run_e2e_test`)
 

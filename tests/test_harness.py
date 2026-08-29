@@ -1464,8 +1464,10 @@ def _():
     state = _loan_search_stub(r, where=("applied-loan-details", "loanUniqueId"))
     (master, loan), _out = quiet(lambda: asyncio.run(r._resolve_by_unique_id("AUGM-79787")))
     eq((master, loan), ("10947", "12952"), "ids out of the customerLoan entry")
-    ok(state["paths"][0].startswith("/api/loan-process/applied-loan-details"),
-       "applied-loan-details is tried FIRST")
+    queried = {p.split("?", 1)[0] for p in state["paths"] if "loan-process" in p}
+    ok("/api/loan-process/loan-details" in queried, "loan-details was tried")
+    ok("/api/loan-process/applied-loan-details" in queried,
+       "and applied-loan-details too, which is where an in-flight loan actually is")
     close(r.suite)
 
 @test("resume: applied-loan-details rows are read from appliedLoanDetails, not data")
@@ -1473,10 +1475,10 @@ def _():
     # The endpoint does not use the `data` key the rest of the API uses; reading `data` here
     # silently finds nothing.
     payload = {"appliedLoanDetails": [_applied_row()], "pagination": {}}
-    rows = ResumeLoanTest._loan_rows(payload)
+    rows = G._loan_rows(payload)
     eq(len(rows), 1, "the rows were found under appliedLoanDetails")
-    eq(ResumeLoanTest._loan_rows({"data": [_applied_row()]}), [_applied_row()], "data still works")
-    eq(ResumeLoanTest._loan_rows({"pagination": {}}), [], "and an empty payload is empty")
+    eq(G._loan_rows({"data": [_applied_row()]}), [_applied_row()], "data still works")
+    eq(G._loan_rows({"pagination": {}}), [], "and an empty payload is empty")
 
 @test("resume: the search falls back to an unfiltered scan when the filter finds nothing")
 def _():
@@ -1537,7 +1539,7 @@ def _():
     # filter is a 500, not an ignored one:
     #   applied-loan-details?...&search=AUGM-79787
     #   -> 500 "column customerLoanMaster.search does not exist"
-    for _endpoint, _extras, filters in ResumeLoanTest.LOAN_SEARCH_ENDPOINTS:
+    for _endpoint, _extras, filters in G.LOAN_SEARCH_ENDPOINTS:
         eq(sorted(set(filters) - {""}), ["loanUniqueId"],
            "no speculative filter names in the search ladder")
 
@@ -1752,6 +1754,89 @@ def _():
         src = inspect.getsource(method)
         ok("_with_stage_recovery" in src,
            f"{method.__name__} must route through the stage recovery")
+
+@test("stage: the closing loan read finds the loan via the shared ladder")
+def _():
+    # The live symptom: loan-details?loanUniqueId=AUGM-59084 came back empty for the run's OWN
+    # just-completed loan, so the final step printed nothing -- and the run still said PASSED.
+    s = _stage_suite()
+    s.loan_unique_id = "AUGM-59084"
+    s.logged_in_mobile_number = "8880008881"
+    row = {"id": 10947, "loanStage": {"id": 13, "name": "packet submitted"},
+           "finalLoanAmount": 500000.00, "loanType": "Fresh Loan", "tenure": 6,
+           "customer": {"firstName": "A", "lastName": "B", "customerUniqueId": "MS1",
+                        "mobileNumber": "9", "panCardNumber": "P"},
+           "appraiser": {"firstName": "Ap", "lastName": "Pr"},
+           "customerLoan": [{"id": 12952, "loanUniqueId": "AUGM-59084"}]}
+    state = {"paths": []}
+
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        state["paths"].append(path)
+        if path.startswith("/api/user-otp") or path.startswith("/api/auth"):
+            return _json_response({"referenceCode": "rc", "Token": "admin-tok"})
+        # loan-details never carries it; applied-loan-details does.
+        hit = "applied-loan-details" in path and "loanUniqueId=" in path
+        key = "appliedLoanDetails" if "applied-loan-details" in path else "data"
+        return _json_response({key: [row] if hit else [],
+                               "pagination": {"hasMore": False}})
+
+    s._make_authenticated_request = fake
+    loan, out = quiet(lambda: asyncio.run(s.fetch_loan_details()))
+    eq(loan.get("id"), 10947, "the finished loan was found and returned")
+    ok("AUGM-59084" in out, "and its details printed")
+    ok("packet submitted" in out, "including the stage it ended at")
+    close(s)
+
+@test("stage: a loan that cannot be read back FAILS instead of passing quietly")
+def _():
+    s = _stage_suite()
+    s.loan_unique_id = "AUGM-59084"
+    s.logged_in_mobile_number = "8880008881"
+
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        if path.startswith("/api/user-otp") or path.startswith("/api/auth"):
+            return _json_response({"referenceCode": "rc", "Token": "admin-tok"})
+        return _json_response({"data": [], "pagination": {"hasMore": False}})
+
+    s._make_authenticated_request = fake
+    try:
+        quiet(lambda: asyncio.run(s.fetch_loan_details()))
+        raise Fail("a closing check that found nothing must not report success")
+    except AssertionError as e:
+        if isinstance(e, Fail):
+            raise
+        ok("AUGM-59084" in str(e), "the error names the loan")
+        ok("admin scope" in str(e), "and says the admin scope was tried too")
+    close(s)
+
+@test("stage: no loanUniqueId fails rather than printing some other loan")
+def _():
+    # Without an id the old code fell back to the unfiltered list and took row[0] -- a
+    # DIFFERENT loan, printed as if it were this run's.
+    s = _stage_suite()
+    s.loan_unique_id = ""
+    called = {"n": 0}
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        called["n"] += 1
+        return _json_response({"data": [{"id": 1, "customerLoan": [{"loanUniqueId": "AUGM-OTHER"}]}]})
+    s._make_authenticated_request = fake
+    try:
+        quiet(lambda: asyncio.run(s.fetch_loan_details()))
+        raise Fail("with no id there is nothing to verify against")
+    except AssertionError as e:
+        if isinstance(e, Fail):
+            raise
+        ok("assign-packet" in str(e), "the error says where the id comes from")
+    eq(called["n"], 0, "and it did not go fishing in the list")
+    close(s)
+
+@test("stage: the loan search is shared, not duplicated in the resume runner")
+def _():
+    import inspect
+    ok(not hasattr(ResumeLoanTest, "LOAN_SEARCH_ENDPOINTS"),
+       "the resume runner must not keep its own copy of the endpoint table")
+    ok("find_loan_row" in inspect.getsource(ResumeLoanTest._resolve_by_unique_id),
+       "it delegates to the harness's search")
 
 # --------------------------------------------------------------------------------------------
 # GROUP: kyc-runner -- the standalone KYC script

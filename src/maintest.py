@@ -5554,20 +5554,134 @@ class GoldLoanApiTest:
         msg = response.json().get("message") if isinstance(response.json(), dict) else ""
         print(f"Submit packet successful: {msg}")
 
+    # Where a loan can be looked up by its AUGM id. Each entry is
+    # (path, extra query params to try, filter keys to try); a filter key of "" means an
+    # unfiltered paged scan matched client-side.
+    #
+    # BOTH listings are needed and BOTH are scoped to the logged-in user:
+    #   * applied-loan-details backs the portal's "applied loan" screen and returns its rows
+    #     under `appliedLoanDetails`, NOT `data`;
+    #   * loan-details is what the UI loads after submit-packet -- but a just-completed loan is
+    #     NOT reliably in it (a run that finished at stage 13 still got `{"data": []}` for its
+    #     own AUGM id), so it cannot be the only place we look.
+    #
+    # ONLY `loanUniqueId` is sent as a filter. These endpoints map an unrecognised query
+    # parameter straight onto a database column, so a guessed one is not an ignored filter or a
+    # 400 -- it is a 500 with the raw error in an HTML page:
+    #     GET applied-loan-details?...&search=AUGM-79787
+    #     -> 500 "column customerLoanMaster.search does not exist"
+    # Do not add speculative filter names without a capture showing the server accepts them.
+    LOAN_SEARCH_ENDPOINTS = (
+        ("/api/loan-process/loan-details", ("",), ("loanUniqueId", "")),
+        ("/api/loan-process/applied-loan-details",
+         ("isRejectedLoan=false", "isRejectedLoan=true"), ("loanUniqueId", "")),
+    )
+    LOAN_SEARCH_MAX_PAGES = 8
+
+    @staticmethod
+    def _loan_rows(payload):
+        """Rows out of a loan listing, whichever key that endpoint happens to use."""
+        if isinstance(payload, list):
+            return payload
+        if not isinstance(payload, dict):
+            return []
+        for key in ("data", "appliedLoanDetails", "loanDetails"):
+            rows = payload.get(key)
+            if isinstance(rows, list):
+                return rows
+        return []
+
+    @staticmethod
+    def _loan_row_matches(row, loan_unique_id):
+        if not isinstance(row, dict):
+            return False
+        if str(row.get("loanUniqueId") or "") == loan_unique_id:
+            return True
+        customer_loans = row.get("customerLoan")
+        if isinstance(customer_loans, dict):
+            customer_loans = [customer_loans]
+        for loan in customer_loans or []:
+            if isinstance(loan, dict) and str(loan.get("loanUniqueId") or "") == loan_unique_id:
+                return True
+        return False
+
+    async def _scan_for_loan(self, loan_unique_id, attempts):
+        """Walk every listing/filter combination under the CURRENT token. Returns a row or None."""
+        quoted = urllib.parse.quote(str(loan_unique_id))
+        for endpoint, extras, filters in self.LOAN_SEARCH_ENDPOINTS:
+            for extra in extras:
+                for key in filters:
+                    pages = self.LOAN_SEARCH_MAX_PAGES if not key else 1
+                    for page in range(pages):
+                        frm = page * 25 + 1
+                        api_path = f"{endpoint}?from={frm}&to={frm + 24}"
+                        if extra:
+                            api_path += f"&{extra}"
+                        if key:
+                            api_path += f"&{key}={quoted}"
+                        try:
+                            response = await self._make_authenticated_request('GET', api_path)
+                        except httpx.HTTPStatusError as e:
+                            attempts.append(f"{endpoint} {extra or ''} {key or 'scan'} -> "
+                                            f"{e.response.status_code}")
+                            break
+                        payload = response.json() if response.content else {}
+                        for row in self._loan_rows(payload):
+                            if self._loan_row_matches(row, loan_unique_id):
+                                print(f"Found {loan_unique_id} via {endpoint} "
+                                      f"({key or 'unfiltered scan'}).")
+                                return row
+                        pagination = payload.get("pagination") if isinstance(payload, dict) else {}
+                        if not self._loan_rows(payload) or not (pagination or {}).get("hasMore"):
+                            break
+        return None
+
+    async def find_loan_row(self, loan_unique_id, attempts=None):
+        """Find a loan's listing row by its AUGM id, or None.
+
+        Tries loan-details then applied-loan-details, each filtered by loanUniqueId and then
+        scanned unfiltered, and repeats the whole ladder under an ADMIN token -- these listings
+        are scoped to the logged-in user, so a loan handed between roles (the appraiser creates
+        it, the partner disburses it) is frequently invisible to the session that made it.
+        `attempts` collects a per-listing note for the caller's error message.
+        """
+        attempts = attempts if attempts is not None else []
+        row = await self._scan_for_loan(loan_unique_id, attempts)
+        if row is not None:
+            return row
+        print(f"{loan_unique_id} is not visible to this login - retrying the lookup as admin.")
+        saved_token = self.auth_token
+        try:
+            self.auth_token = await self._role_token("admin")
+            row = await self._scan_for_loan(loan_unique_id, attempts)
+        except Exception as e:  # a failed admin login must not mask the real diagnosis
+            print(f"Admin-scoped loan lookup failed: {e}")
+            row = None
+        finally:
+            self.auth_token = saved_token
+        return row
+
     async def fetch_loan_details(self) -> dict:
         """Final step: search the loan-details list by the loan's unique id (AUGM-…) and display the
         completed loan's key attributes. Mirrors the UI loading the loan after submit-packet. Returns
         the matched loan record (or {})."""
-        base = "/api/loan-process/loan-details?from=1&to=25"
-        # First the plain list (as the UI does), then the targeted search by loanUniqueId.
-        await self._make_authenticated_request('GET', base)
-        api_path = f"{base}&loanUniqueId={self.loan_unique_id}" if self.loan_unique_id else base
-        response = await self._make_authenticated_request('GET', api_path)
-        rows = response.json().get("data", []) if isinstance(response.json(), dict) else []
-        loan = rows[0] if rows else {}
+        if not self.loan_unique_id:
+            raise AssertionError(
+                "Cannot load the finished loan: no loanUniqueId was captured. It is assigned at "
+                "the assign-packet stage and read from single-loan; without it there is nothing "
+                "to search for, and taking the first row of the list would show a DIFFERENT loan.")
+        attempts = []
+        loan = await self.find_loan_row(self.loan_unique_id, attempts)
         if not loan:
-            print(f"Loan details: no loan found for loanUniqueId={self.loan_unique_id}.")
-            return {}
+            # The whole point of this step is to read the finished loan back. Not finding it is a
+            # FAILED verification, not a cosmetic gap -- returning {} here let a run print
+            # "RESULT - PASSED" while its closing check silently found nothing.
+            raise AssertionError(
+                f"Loan {self.loan_unique_id} could not be loaded back after the flow completed - "
+                "searched loan-details and applied-loan-details, filtered and unfiltered, under "
+                f"both the {self.logged_in_mobile_number} session and the admin scope "
+                f"({'; '.join(attempts) or 'every listing came back empty'}). The loan may exist "
+                "but be invisible to these logins; check it on the portal.")
 
         # Pull display fields (some live under customerLoan[0]).
         cl = (loan.get("customerLoan") or [{}])[0] if isinstance(loan.get("customerLoan"), list) else {}
