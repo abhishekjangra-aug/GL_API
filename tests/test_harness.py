@@ -31,6 +31,7 @@ import httpx  # noqa: E402
 
 import maintest  # noqa: E402
 from maintest import GoldLoanApiTest as G, KycDocumentAlreadyExistsError  # noqa: E402
+from maintest import validate_cli  # noqa: E402
 from test_create_packets import PacketBatchTest  # noqa: E402
 from test_kyc import KycOnlyTest  # noqa: E402
 from test_resume_loan import (  # noqa: E402
@@ -824,14 +825,19 @@ def _():
     ok("Reusing appraiser request" in out, "said it was reusing")
     close(s)
 
-@test("appraiser: our own COMPLETED request is cancelled and recreated")
+@test("appraiser: our own FINISHED request is kept and a fresh loan started on it")
 def _():
+    # Cancelling a finished loan is futile (the server answers "You are not allowed to cencel
+    # this loan"), and this is the path --customer with --count takes for loans 2..N.
     s = _appraiser_suite()
     item = _request_item(master_loan={"id": 10930, "isLoanCompleted": True}, process_complete=True)
     state = _stub_api(s, {"appraiser": [item]}, create_ok=True)
-    _r, _out = quiet(lambda: asyncio.run(s.create_appraiser_request()))
-    eq(state["cancels"], 1, "our finished loan is cancelled")
-    eq(state["posts"], 2, "a fresh request is created after the cancel")
+    _r, out = quiet(lambda: asyncio.run(s.create_appraiser_request()))
+    eq(state["cancels"], 0, "no futile cancel of a finished loan")
+    eq(state["posts"], 1, "and no second create attempt")
+    eq(s.appraiser_request_id, "13500", "the request is kept")
+    eq((s.loan_id, s.master_loan_id), ("", ""), "but the loan ids are cleared for a fresh loan")
+    ok("fresh loan" in out, "and it said so")
     close(s)
 
 @test("appraiser: --fresh-request forces cancel-and-recreate of our own request")
@@ -931,9 +937,18 @@ def _():
 
 def _bank_suite(**env):
     # suite() only scrubs the KYC vars; clear the bank ones so they cannot leak between tests.
-    for var in ("GOLD_LOAN_BANK_ACCOUNTS", "GOLD_LOAN_BANK_ACCOUNT_ATTEMPTS"):
+    for var in ("GOLD_LOAN_BANK_ACCOUNTS", "GOLD_LOAN_BANK_ACCOUNT_ATTEMPTS",
+                "GOLD_LOAN_BANK_STATUS_FILE", "GOLD_LOAN_BANK_RETRY_ALL", "GOLD_LOAN_ENV"):
         if var not in env:
             os.environ.pop(var, None)
+    if "GOLD_LOAN_BANK_STATUS_FILE" not in env:
+        # Every suite that does not ask for a specific status file gets a CLEAN one: the file
+        # is written on each rejection, so a shared path would leak one test's flags into the
+        # next and quietly shrink its candidate list.
+        default_status = os.path.join(ROOT, "tests", "_bank_status_default.json")
+        if os.path.exists(default_status):
+            os.remove(default_status)
+        env["GOLD_LOAN_BANK_STATUS_FILE"] = default_status
     s = suite(**env)
     s.customer_id = "20308"
     s.loan_id, s.master_loan_id = "12345", "10930"
@@ -1068,7 +1083,7 @@ def _():
         ok("still" in str(e), "the error says what was still wrong")
     close(s2)
 
-def _accounts_stub(s, verdicts):
+def _accounts_stub(s, verdicts, bad_ifsc=()):
     """Serve validate-account from `verdicts`: {accountNumber: payload-or-status-int}.
 
     An int means the server answers with that HTTP status (the live UAT 400). A dict is the
@@ -1079,7 +1094,12 @@ def _accounts_stub(s, verdicts):
 
     async def fake(method, path, json_data=None, params=None, files=None, headers=None):
         if path.startswith("/api/loan-process/account-details-karza"):
-            state["karza"].append(path.split("ifscCode=")[1])
+            ifsc = path.split("ifscCode=")[1]
+            state["karza"].append(ifsc)
+            if ifsc in bad_ifsc:
+                request = httpx.Request("GET", "https://x" + path)
+                response = httpx.Response(400, text="Invalid IFSC Code", request=request)
+                raise httpx.HTTPStatusError("400", request=request, response=response)
             return _json_response({"data": {"bankName": "TEST BANK", "branch": "TEST BRANCH"}})
         if path == "/api/loan-process/validate-account":
             number = json_data["accountNumber"]
@@ -1141,14 +1161,18 @@ def _():
 
 @test("bank: an outright-verified account stops the walk immediately")
 def _():
-    s = _bank_suite()
+    path = _status_file()
+    s = _bank_suite(GOLD_LOAN_BANK_STATUS_FILE=path)
     first = s._load_bank_accounts()[0]["accountNumber"]
     state = _accounts_stub(s, {first: {"data": {"bankTxnStatus": True}, "isVerified": True}})
     _r, out = quiet(lambda: asyncio.run(s.validate_account()))
     eq(state["tried"], [first], "no further penny-drops once one verifies")
     eq(s.bank_system_verified, True, "recorded the verified flag")
     ok("VERIFIED outright" in out, "reported it")
+    eq(_read_status(path)["environments"][s.env_name]["preferred"], first,
+       "and it is remembered for the next run, like the bankTxnStatus path")
     close(s)
+    os.remove(path)
 
 @test("bank: the bank name and branch come from each account's IFSC lookup")
 def _():
@@ -1210,6 +1234,233 @@ def _():
     eq(body["bankName"], "TEST BANK", "and the bank from the IFSC lookup, not hard-coded SBI")
     eq(body["bankBranchName"], "TEST BRANCH", "and its branch")
     close(s)
+
+@test("bank: a rejected account is flagged and never penny-dropped again")
+def _():
+    # The live waste: validate-account 400'd for account after account, and the SAME accounts
+    # were walked again on the next loan -- two calls each (IFSC lookup + penny-drop).
+    s = _bank_suite()
+    accounts = s._load_bank_accounts()
+    good = accounts[3]["accountNumber"]
+    first = _accounts_stub(s, {good: {"data": {"bankTxnStatus": True}}})
+    quiet(lambda: asyncio.run(s.validate_account()))
+    eq(len(first["tried"]), 4, "walked until one worked")
+    eq(sorted(s._bank_accounts_rejected), sorted(a["accountNumber"] for a in accounts[:3]),
+       "the three that failed are flagged")
+
+    # Next loan: the good account is tried first and nothing else is touched.
+    second = _accounts_stub(s, {good: {"data": {"bankTxnStatus": True}}})
+    quiet(lambda: asyncio.run(s.validate_account()))
+    eq(second["tried"], [good], "one call, straight to the account that works")
+    close(s)
+
+@test("bank: flagged accounts are dropped from the candidate list")
+def _():
+    # Asserted on the candidate list directly: in a live walk the settled account is tried
+    # first and succeeds, which would hide whether the skip filter does anything at all.
+    s = _bank_suite()
+    accounts = s._load_bank_accounts()
+    s._bank_accounts_rejected = {a["accountNumber"] for a in accounts[:5]}
+    candidates, out = quiet(s._bank_account_candidates)
+    numbers = {a["accountNumber"] for a in candidates}
+    eq(numbers & s._bank_accounts_rejected, set(), "no flagged account survives")
+    eq(len(candidates), min(s.bank_account_attempts, len(accounts) - 5), "five fewer to try")
+    ok("Skipping 5 account" in out, "and it says how many it skipped")
+    close(s)
+
+@test("bank: the rejection flags survive the per-loan reset")
+def _():
+    s = _bank_suite()
+    s._bank_accounts_rejected = {"111", "222"}
+    s._bank_penny_drop_unavailable = True
+    quiet(s._reset_for_next_loan)
+    eq(sorted(s._bank_accounts_rejected), ["111", "222"],
+       "a batch must not re-learn the same rejections per loan")
+    eq(s._bank_penny_drop_unavailable, True, "and must not re-walk a dead penny-drop")
+    close(s)
+
+@test("bank: once a full walk finds nothing, later loans skip the penny-drop entirely")
+def _():
+    s = _bank_suite()
+    first = _accounts_stub(s, {})  # every account 400s
+    quiet(lambda: asyncio.run(s.validate_account()))
+    eq(len(first["tried"]), s.bank_account_attempts, "the first walk went to the cap")
+    eq(s._bank_penny_drop_unavailable, True, "and recorded that it found nothing")
+
+    second = _accounts_stub(s, {})
+    _r, out = quiet(lambda: asyncio.run(s.validate_account()))
+    eq(second["tried"], [], "no penny-drop at all the second time")
+    eq(second["karza"], [], "and no IFSC lookups either")
+    eq(s.bank_for_ops_approval, True, "the ops manual verification still has to run")
+    ok("skipping it" in out, "and it said what it was doing")
+    close(s)
+
+@test("bank: GOLD_LOAN_BANK_RETRY_ALL re-tries the flagged accounts")
+def _():
+    s = _bank_suite(GOLD_LOAN_BANK_RETRY_ALL="true")
+    eq(s.bank_retry_all_accounts, True, "the switch is read")
+    s._bank_penny_drop_unavailable = True
+    accounts = s._load_bank_accounts()
+    state = _accounts_stub(s, {accounts[0]["accountNumber"]: {"data": {"bankTxnStatus": True}}})
+    quiet(lambda: asyncio.run(s.validate_account()))
+    ok(state["tried"], "the walk happened despite the earlier verdict")
+    close(s)
+
+@test("bank: the account that worked is never skipped, even if once flagged")
+def _():
+    s = _bank_suite()
+    accounts = s._load_bank_accounts()
+    chosen = accounts[0]["accountNumber"]
+    s.bank_account_number = chosen
+    s._bank_accounts_rejected = {chosen}       # e.g. one flaky rejection earlier
+    candidates, _out = quiet(s._bank_account_candidates)
+    eq(candidates[0]["accountNumber"], chosen,
+       "the settled account stays first rather than being filtered out")
+    close(s)
+
+def _status_file():
+    """A scratch path for the persistent bank-account status, cleared before each use."""
+    path = os.path.join(ROOT, "tests", "_bank_status_scratch.json")
+    if os.path.exists(path):
+        os.remove(path)
+    return path
+
+def _read_status(path):
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+@test("bank: a rejection is written to the status file, marked definitive or not")
+def _():
+    path = _status_file()
+    s = _bank_suite(GOLD_LOAN_BANK_STATUS_FILE=path)
+    accounts = s._load_bank_accounts()
+    first, second, good = accounts[0], accounts[1], accounts[2]
+    # The stub answers "Something went wrong" -- the ambiguous reason the live run kept getting.
+    _accounts_stub(s, {good["accountNumber"]: {"data": {"bankTxnStatus": True}}})
+    quiet(lambda: asyncio.run(s.validate_account()))
+    recorded = _read_status(path)["environments"][s.env_name]["rejected"]
+    ok(first["accountNumber"] in recorded, "the first failure was written down")
+    ok(second["accountNumber"] in recorded, "and so was the second")
+    eq(recorded[first["accountNumber"]]["definitive"], False,
+       '"Something went wrong" is not definitive -- the provider may just be down')
+    eq(_read_status(path)["environments"][s.env_name]["preferred"], good["accountNumber"],
+       "and the account that worked is remembered")
+    close(s)
+    os.remove(path)
+
+@test("bank: a definitive reason is recorded as definitive")
+def _():
+    path = _status_file()
+    s = _bank_suite(GOLD_LOAN_BANK_STATUS_FILE=path)
+    s.bank_account_label = "RBL - LIC MF POOL A/C"
+    quiet(lambda: s._flag_bank_account("409000559756", "BENEFICIARY ACCOUNT IS CLOSED", 400,
+                                       definitive=s._is_definitive_bank_rejection(
+                                           "BENEFICIARY ACCOUNT IS CLOSED")))
+    entry = _read_status(path)["environments"][s.env_name]["rejected"]["409000559756"]
+    eq(entry["definitive"], True, "a closed account will never work")
+    ok("CLOSED" in entry["reason"], "the reason is kept for the next reader")
+    ok(entry["lastSeen"].endswith("Z"), "and when it was seen")
+    for text in ("The ifsc code is not found", "Invalid IFSC Code", "Invalid account number"):
+        ok(G._is_definitive_bank_rejection(text), f"{text!r} is definitive")
+    for text in ("Something went wrong", "", "timeout"):
+        ok(not G._is_definitive_bank_rejection(text), f"{text!r} is not definitive")
+    close(s)
+    os.remove(path)
+
+@test("bank: the NEXT run skips the accounts recorded as failing")
+def _():
+    path = _status_file()
+    first = _bank_suite(GOLD_LOAN_BANK_STATUS_FILE=path)
+    accounts = first._load_bank_accounts()
+    good = accounts[3]["accountNumber"]
+    state = _accounts_stub(first, {good: {"data": {"bankTxnStatus": True}}})
+    quiet(lambda: asyncio.run(first.validate_account()))
+    eq(len(state["tried"]), 4, "the first run walked four accounts")
+    close(first)
+
+    # A brand new process, same status file.
+    second = _bank_suite(GOLD_LOAN_BANK_STATUS_FILE=path)
+    state2 = _accounts_stub(second, {good: {"data": {"bankTxnStatus": True}}})
+    _r, out = quiet(lambda: asyncio.run(second.validate_account()))
+    eq(state2["tried"], [good], "the second run goes straight to the one that worked")
+    ok("last worked" in out, "and says it is starting from it")
+    close(second)
+    os.remove(path)
+
+@test("bank: a bad IFSC skips the penny-drop instead of spending a second call on it")
+def _():
+    # Live: account-details-karza answered "Invalid IFSC Code" and validate-account was still
+    # sent, answering "The ifsc code is not found" -- two calls to learn one thing.
+    path = _status_file()
+    s = _bank_suite(GOLD_LOAN_BANK_STATUS_FILE=path)
+    accounts = s._load_bank_accounts()
+    good = accounts[1]["accountNumber"]
+    bad_ifsc = accounts[0]["ifscCode"]
+    state = _accounts_stub(s, {good: {"data": {"bankTxnStatus": True}}}, bad_ifsc=(bad_ifsc,))
+    quiet(lambda: asyncio.run(s.validate_account()))
+    eq(state["tried"], [good], "no penny-drop for the account whose IFSC does not resolve")
+    entry = _read_status(path)["environments"][s.env_name]["rejected"][accounts[0]["accountNumber"]]
+    eq(entry["definitive"], True, "a bad IFSC is permanent")
+    close(s)
+    os.remove(path)
+
+@test("bank: the status file is per environment")
+def _():
+    path = _status_file()
+    s = _bank_suite(GOLD_LOAN_BANK_STATUS_FILE=path)
+    quiet(lambda: s._flag_bank_account("111", "Something went wrong", 400, definitive=False))
+    other = _bank_suite(GOLD_LOAN_BANK_STATUS_FILE=path, GOLD_LOAN_ENV="uat")
+    quiet(lambda: other._bank_account_candidates())
+    eq(other._bank_accounts_rejected, set(), "uat is unaffected by a rejection recorded on test")
+    envs = _read_status(path)["environments"]
+    ok(s.env_name in envs, "the environment that recorded it is there")
+    close(s)
+    close(other)
+    os.remove(path)
+
+@test("bank: a recorded outage can never permanently exhaust the list")
+def _():
+    # If every account were flagged with a non-definitive reason, honouring the file would leave
+    # nothing to try, forever. The soft ones are forgiven instead.
+    path = _status_file()
+    s = _bank_suite(GOLD_LOAN_BANK_STATUS_FILE=path)
+    accounts = s._load_bank_accounts()
+    for a in accounts:
+        quiet(lambda a=a: s._flag_bank_account(a["accountNumber"], "Something went wrong", 400,
+                                               definitive=False))
+    fresh = _bank_suite(GOLD_LOAN_BANK_STATUS_FILE=path)
+    candidates, out = quiet(fresh._bank_account_candidates)
+    ok(candidates, "there is still something to try")
+    ok("forgiving" in out, "and it says why")
+    close(s)
+    close(fresh)
+    os.remove(path)
+
+@test("bank: GOLD_LOAN_BANK_RETRY_ALL ignores the status file")
+def _():
+    path = _status_file()
+    s = _bank_suite(GOLD_LOAN_BANK_STATUS_FILE=path)
+    accounts = s._load_bank_accounts()
+    quiet(lambda: s._flag_bank_account(accounts[0]["accountNumber"], "closed", 400, definitive=True))
+    fresh = _bank_suite(GOLD_LOAN_BANK_STATUS_FILE=path, GOLD_LOAN_BANK_RETRY_ALL="true")
+    candidates, _out = quiet(fresh._bank_account_candidates)
+    eq(candidates[0]["accountNumber"], accounts[0]["accountNumber"],
+       "even a definitively-dead account is retried when asked")
+    close(s)
+    close(fresh)
+    os.remove(path)
+
+@test("bank: an unreadable or missing status file is not fatal")
+def _():
+    path = os.path.join(ROOT, "tests", "_bank_status_broken.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("{ this is not json")
+    s = _bank_suite(GOLD_LOAN_BANK_STATUS_FILE=path)
+    candidates, _out = quiet(s._bank_account_candidates)
+    ok(candidates, "a corrupt cache falls back to trying everything")
+    eq(s._bank_accounts_rejected, set(), "with nothing blocked")
+    close(s)
+    os.remove(path)
 
 # --------------------------------------------------------------------------------------------
 # GROUP: resume -- the resume-any-loan runner
@@ -1837,6 +2088,343 @@ def _():
        "the resume runner must not keep its own copy of the endpoint table")
     ok("find_loan_row" in inspect.getsource(ResumeLoanTest._resolve_by_unique_id),
        "it delegates to the harness's search")
+
+# --------------------------------------------------------------------------------------------
+# GROUP: batch -- maintest.py --count N, many loans in one session
+# --------------------------------------------------------------------------------------------
+
+def _batch_suite():
+    s = suite()
+    s.auth_token = "appraiser-tok"
+    s.logged_in_user_id = 1473
+    s.appraiser_id = "1473"
+    s._role_token_cache = {"8880008880": "admin-tok"}
+    return s
+
+def _batch_recorder(s, fail_on=()):
+    """Replace run_e2e_test with a recorder. `fail_on` is the 1-based loans that blow up."""
+    state = {"runs": [], "skips": [], "tokens": [], "caches": []}
+    async def fake_run(login_type, skip_login=False):
+        n = len(state["runs"]) + 1
+        state["runs"].append(n)
+        state["skips"].append(skip_login)
+        state["tokens"].append(s.auth_token)
+        state["caches"].append(dict(s._role_token_cache))
+        # Whatever the previous loan left behind must already be gone by now.
+        state.setdefault("seen_customer", []).append(s.customer_unique_id)
+        state.setdefault("seen_loan", []).append(s.loan_unique_id)
+        s.customer_unique_id = f"MSCUST{n}"
+        s.loan_unique_id = f"AUGM-{n}"
+        s.final_loan_amount = 400000.0
+        s.master_loan_id, s.loan_id = str(1000 + n), str(2000 + n)
+        s.bm_rating_submitted = True
+        s.bank_for_ops_approval = True
+        s._api_calls, s._api_failures = 40, 0
+        if n in fail_on:
+            raise httpx.HTTPStatusError(
+                "400", request=httpx.Request("POST", "https://x/api/loan-process/bank-details"),
+                response=httpx.Response(400, text="bank details is not verified"))
+        return True
+    s.run_e2e_test = fake_run
+    return state
+
+@test("batch: only the FIRST loan logs in; the rest reuse the session")
+def _():
+    # The whole point: the OTP send endpoint rate-limits repeat requests to a number
+    # ("Please try again after a minute"), which a login-per-loan batch would hit at once.
+    s = _batch_suite()
+    state = _batch_recorder(s)
+    passed, _out = quiet(lambda: asyncio.run(s.run_many("appraiser", 3)))
+    eq(passed, True, "all three loans passed")
+    eq(state["runs"], [1, 2, 3], "ran three times")
+    eq(state["skips"], [False, True, True], "loan 1 logs in, loans 2-3 do not")
+    eq(set(state["tokens"]), {"appraiser-tok"}, "the same session throughout")
+    close(s)
+
+@test("batch: the role-token cache survives, so each role logs in once for the batch")
+def _():
+    s = _batch_suite()
+    state = _batch_recorder(s)
+    quiet(lambda: asyncio.run(s.run_many("appraiser", 3)))
+    for cache in state["caches"]:
+        eq(cache.get("8880008880"), "admin-tok", "the admin token is reused, not re-fetched")
+    close(s)
+
+@test("batch: each loan starts with the previous loan's identity cleared")
+def _():
+    s = _batch_suite()
+    state = _batch_recorder(s)
+    quiet(lambda: asyncio.run(s.run_many("appraiser", 3)))
+    eq(state["seen_customer"], ["", "", ""], "no customer carried over")
+    eq(state["seen_loan"], ["", "", ""], "and no loan id either")
+    close(s)
+
+@test("batch: per-loan flags that would corrupt the next loan are reset")
+def _():
+    s = _batch_suite()
+    s.bm_rating_submitted = True
+    s.bank_manually_verified = True
+    s.bank_for_ops_approval = False
+    s.loan_ornaments_details = [{"id": 1}]
+    s.available_packet = {"id": 7}
+    s._api_calls, s._api_failures = 88, 5
+    quiet(s._reset_for_next_loan)
+    eq(s.bm_rating_submitted, False, "a stale BM flag would skip a needed BM rating")
+    eq(s.bank_manually_verified, False, "and a stale bank verdict would skip the ops approval")
+    eq(s.loan_ornaments_details, [], "ornaments are per loan")
+    eq(s.available_packet, {}, "so is the packet")
+    eq((s._api_calls, s._api_failures), (0, 0), "metrics are per loan, not cumulative")
+    close(s)
+
+@test("batch: the bank ACCOUNT is kept but its verification is not")
+def _():
+    # Re-walking the candidate accounts each loan would re-fire the same doomed penny-drops.
+    s = _batch_suite()
+    s.bank_account_number, s.bank_ifsc_code = "00600350006733", "HDFC0000060"
+    s.bank_name, s.bank_account_label = "HDFC", "HDFC - LIC MF LIQUID FUND"
+    s.bank_account_verified = True
+    quiet(s._reset_for_next_loan)
+    eq(s.bank_account_number, "00600350006733", "the account that worked is kept")
+    eq(s.bank_ifsc_code, "HDFC0000060", "with its IFSC")
+    eq(s.bank_account_verified, False, "but it must be re-validated for this loan")
+    close(s)
+
+@test("batch: pinned CLI choices survive the reset")
+def _():
+    s = _batch_suite()
+    s.forced_scheme_id = "853"
+    s._forced_co_lender_id = "4"
+    s.partner_id = "152"
+    s.scheme_id = "853"
+    quiet(s._reset_for_next_loan)
+    eq(s.forced_scheme_id, "853", "--scheme is a run-wide choice")
+    eq(s._forced_co_lender_id, "4", "so is --co-lender")
+    eq(s.co_lender_bank_id, "4", "which is re-applied to the next loan")
+    eq(s.partner_id, "152", "and the partner")
+    eq(s.scheme_id, "", "but the resolved scheme is re-picked per loan")
+    close(s)
+
+@test("batch: one failed loan does not stop the others")
+def _():
+    s = _batch_suite()
+    state = _batch_recorder(s, fail_on=(2,))
+    passed, out = quiet(lambda: asyncio.run(s.run_many("appraiser", 3)))
+    eq(state["runs"], [1, 2, 3], "loan 3 still ran after loan 2 failed")
+    eq(passed, False, "but the batch verdict is a failure")
+    ok("2/3 loans completed" in out, "the summary counts them")
+    ok("HTTPStatusError" in out, "and names what went wrong")
+    close(s)
+
+@test("batch: the reset covers everything the KYC runner resets")
+def _():
+    # test_kyc.py resets per-customer state for its own batches; a field it clears but the loan
+    # batch does not would leak one customer's identity into the next loan.
+    missing = sorted(set(KycOnlyTest.PER_CUSTOMER_STATE) - set(G.PER_LOAN_STATE))
+    eq(missing, [], "fields the KYC runner clears that PER_LOAN_STATE does not")
+
+@test("batch: every name in PER_LOAN_STATE is a real attribute")
+def _():
+    s = _batch_suite()
+    missing = [f for f in G.PER_LOAN_STATE if not hasattr(s, f)]
+    eq(missing, [], "PER_LOAN_STATE must not name attributes that no longer exist")
+    close(s)
+
+def _cli(**over):
+    class A:
+        count, kyc, customer = 1, "manual", None
+    a = A()
+    for k, v in over.items():
+        setattr(a, k, v)
+    errors = []
+    def fail(message):
+        errors.append(message)
+        raise SystemExit(2)
+    try:
+        validate_cli(a, fail)
+    except SystemExit:
+        pass
+    return errors
+
+@test("batch: --customer is allowed together with --count")
+def _():
+    eq(_cli(count=3, customer="MS35QNJP"), [], "many loans for one existing customer is valid")
+    eq(_cli(count=3, kyc="auto", customer="MS35QNJP"), [],
+       "and a real-identity mode is fine there -- no new customer is created")
+
+@test("batch: a NEW-customer batch still refuses a real-identity KYC mode")
+def _():
+    errors = _cli(count=3, kyc="auto")
+    eq(len(errors), 1, "rejected")
+    ok("one customer" in errors[0], "and says why")
+    ok("--customer" in errors[0], "and points at the way to make it work")
+    eq(_cli(count=3, kyc="manual"), [], "manual is fine for a new-customer batch")
+
+@test("batch: --count below 1 is rejected")
+def _():
+    ok(_cli(count=0), "zero is not a batch")
+    eq(_cli(count=1), [], "one is the normal single run")
+
+@test("batch: the existing-customer selection survives the per-loan reset")
+def _():
+    # --customer is a run-wide choice: run_e2e_test re-reads it each loan and re-resolves the
+    # customer. Clearing it would turn loans 2..N into new-customer runs.
+    s = _batch_suite()
+    s.existing_customer_unique_id = "MS35QNJP"
+    s.existing_customer_id = ""
+    s.customer_unique_id, s.customer_id = "MS35QNJP", "8500"
+    quiet(s._reset_for_next_loan)
+    eq(s.existing_customer_unique_id, "MS35QNJP", "the selection is kept")
+    eq(s.customer_unique_id, "", "but the resolved customer is re-fetched per loan")
+    close(s)
+
+@test("batch: a loan that reuses the PREVIOUS master loan is reported as failed")
+def _():
+    # With --customer, loans 2..N land on the same appraiser request. If the server answers
+    # "Your loan already initiated" instead of opening a new loan, every step would re-run
+    # against the finished loan and could still look like a pass.
+    s = _batch_suite()
+    state = {"n": 0}
+    async def fake_run(login_type, skip_login=False):
+        state["n"] += 1
+        s.customer_unique_id = "MS35QNJP"
+        s.master_loan_id = "9939"          # the SAME master loan every time
+        s.loan_unique_id = "AUGM-1"
+        return True
+    s.run_e2e_test = fake_run
+    passed, out = quiet(lambda: asyncio.run(s.run_many("appraiser", 3)))
+    eq(passed, False, "a repeated loan is not a pass")
+    ok("handed back the previous one" in out, "and the reason is spelled out")
+    ok("1/3 loans completed" in out, "only the first one counts")
+    close(s)
+
+@test("batch: distinct loans for the same customer all pass")
+def _():
+    s = _batch_suite()
+    state = {"n": 0}
+    async def fake_run(login_type, skip_login=False):
+        state["n"] += 1
+        s.customer_unique_id = "MS35QNJP"
+        s.master_loan_id = str(9939 + state["n"])   # a new master loan each time
+        s.loan_unique_id = f"AUGM-{state['n']}"
+        return True
+    s.run_e2e_test = fake_run
+    passed, out = quiet(lambda: asyncio.run(s.run_many("appraiser", 3)))
+    eq(passed, True, "three real loans for one customer")
+    ok("3/3 loans completed" in out, "all counted")
+    close(s)
+
+# --------------------------------------------------------------------------------------------
+# GROUP: gateway -- 502/503/504 and transport blips
+# --------------------------------------------------------------------------------------------
+
+NGINX_502 = ("<html>\n<head><title>502 Bad Gateway</title></head>\n<body>\n"
+             "<center><h1>502 Bad Gateway</h1></center>\n<hr><center>nginx/1.30.4</center>\n"
+             "</body>\n</html>")
+
+def _gateway_suite(**env):
+    for var in ("GOLD_LOAN_GATEWAY_RETRIES", "GOLD_LOAN_GATEWAY_RETRY_DELAY"):
+        if var not in env:
+            os.environ.pop(var, None)
+    env.setdefault("GOLD_LOAN_GATEWAY_RETRY_DELAY", "0")  # no real sleeping in tests
+    s = suite(**env)
+    s.auth_token = "tok"
+    return s
+
+def _responses(s, script):
+    """Drive _send_with_gateway_retry from `script`: ints are statuses, exceptions are raised."""
+    state = {"sent": 0}
+    async def send_once():
+        item = script[min(state["sent"], len(script) - 1)]
+        state["sent"] += 1
+        if isinstance(item, BaseException):
+            raise item
+        request = httpx.Request("GET", "https://x/api/customer")
+        return httpx.Response(item, text=NGINX_502 if item >= 500 else "{}", request=request)
+    return state, send_once
+
+@test("gateway: a 502 on a GET is retried and the good response is used")
+def _():
+    # The live failure: GET /api/customer answered 502 while the backend was restarting, and
+    # the whole batch went down with it.
+    s = _gateway_suite()
+    state, send = _responses(s, [502, 502, 200])
+    response, out = quiet(lambda: asyncio.run(s._send_with_gateway_retry("GET", "/api/customer", send)))
+    eq(response.status_code, 200, "the retry succeeded")
+    eq(state["sent"], 3, "two retries after the first 502")
+    ok("retrying in" in out, "and it said it was retrying")
+    close(s)
+
+@test("gateway: a GET that never recovers returns the last 502 rather than looping")
+def _():
+    s = _gateway_suite()
+    state, send = _responses(s, [502])
+    response, _out = quiet(lambda: asyncio.run(s._send_with_gateway_retry("GET", "/api/customer", send)))
+    eq(response.status_code, 502, "the caller still sees the failure")
+    eq(state["sent"], 3, "exactly the configured number of attempts")
+    close(s)
+
+@test("gateway: a WRITE is NOT retried on a 502")
+def _():
+    # nginx cannot say whether the backend applied the write before dying; re-sending a create
+    # would duplicate a customer, a loan or a rating.
+    s = _gateway_suite()
+    state, send = _responses(s, [502, 200])
+    response, out = quiet(lambda: asyncio.run(s._send_with_gateway_retry("POST", "/api/customer", send)))
+    eq(response.status_code, 502, "the 502 is handed straight back")
+    eq(state["sent"], 1, "sent exactly once")
+    ok("NOT retried" in out, "and it explained why")
+    close(s)
+
+@test("gateway: a write IS retried when the connection never got made")
+def _():
+    # Nothing can have been processed if no connection was established.
+    s = _gateway_suite()
+    state, send = _responses(s, [httpx.ConnectError("refused"), 200])
+    response, _out = quiet(lambda: asyncio.run(s._send_with_gateway_retry("POST", "/api/customer", send)))
+    eq(response.status_code, 200, "the retry went through")
+    eq(state["sent"], 2, "one retry")
+    close(s)
+
+@test("gateway: a write is NOT retried on a read timeout")
+def _():
+    # The request went out; the server may well have applied it.
+    s = _gateway_suite()
+    state, send = _responses(s, [httpx.ReadTimeout("slow"), 200])
+    try:
+        quiet(lambda: asyncio.run(s._send_with_gateway_retry("POST", "/api/customer", send)))
+        raise Fail("a half-completed write must surface, not be repeated")
+    except httpx.ReadTimeout:
+        pass
+    eq(state["sent"], 1, "sent exactly once")
+    close(s)
+
+@test("gateway: a 4xx is never retried")
+def _():
+    s = _gateway_suite()
+    state, send = _responses(s, [400, 200])
+    response, _out = quiet(lambda: asyncio.run(s._send_with_gateway_retry("GET", "/api/customer", send)))
+    eq(response.status_code, 400, "a client error is the caller's to handle")
+    eq(state["sent"], 1, "no retry")
+    close(s)
+
+@test("gateway: retries can be turned off")
+def _():
+    s = _gateway_suite(GOLD_LOAN_GATEWAY_RETRIES="1")
+    state, send = _responses(s, [502, 200])
+    response, _out = quiet(lambda: asyncio.run(s._send_with_gateway_retry("GET", "/api/customer", send)))
+    eq(response.status_code, 502, "one attempt only")
+    eq(state["sent"], 1, "and it really was one")
+    close(s)
+
+@test("gateway: an HTML error page is collapsed to one line in the report")
+def _():
+    eq(G._short_error_body(NGINX_502), "502 Bad Gateway (nginx/1.30.4)",
+       "eight lines of markup become one")
+    eq(G._short_error_body('{"message":"To Be Paid amount is incorrect"}'),
+       '{"message":"To Be Paid amount is incorrect"}', "a JSON body is left alone")
+    eq(G._short_error_body(""), "", "and an empty body stays empty")
+    ok(len(G._short_error_body("<!DOCTYPE html><html><h1>column x does not exist</h1></html>")) < 60,
+       "the 500 HTML page is collapsed too")
 
 # --------------------------------------------------------------------------------------------
 # GROUP: kyc-runner -- the standalone KYC script

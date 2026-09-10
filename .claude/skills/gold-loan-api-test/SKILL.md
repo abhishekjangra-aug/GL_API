@@ -70,8 +70,8 @@ domain rule stays defined once in `maintest.py` and cannot drift:
   can hold several.
 - **`tests/test_harness.py`** — offline regression suite, **no network and no extra deps** (there is
   no pytest here). `python tests/test_harness.py [group-prefix]`. Request bodies are byte-compared
-  against `reference/*.har`; control flow is mock-driven. 93 tests, groups: `kyc-body`, `kyc-verify`,
-  `duplicate`, `profile`, `packets`, `appraiser`, `bank`, `resume`, `stage`, `kyc-runner`. Node is required (CryptoJS tests).
+  against `reference/*.har`; control flow is mock-driven. 130 tests, groups: `kyc-body`, `kyc-verify`,
+  `duplicate`, `profile`, `packets`, `appraiser`, `bank`, `resume`, `stage`, `batch`, `gateway`, `kyc-runner`. Node is required (CryptoJS tests).
   **This suite was mutation-tested** — the code was deliberately broken to confirm each test fails.
   When adding a KYC behaviour, add a test AND check a mutation trips it; the first version of the
   `switchToManual` test passed even with the signal handling disabled, because it fired the flag on
@@ -86,7 +86,39 @@ domain rule stays defined once in `maintest.py` and cannot drift:
   python src/maintest.py --customer MS35QNJP  # EXISTING customer by unique id -> new loan (reuses approved KYC)
   python src/maintest.py --partner arvog --amount 550000 --login appraiser
   python src/maintest.py --env uat            # same flow against UAT (gfau); --env test (default) = gfat
+  python src/maintest.py --count 5           # 5 loans back to back in ONE logged-in session
   ```
+- **`--count N` (N > 1) runs a BATCH in one session.** `run_many(login_type, count)` calls
+  `run_e2e_test(..., skip_login=index > 1)`: only loan 1 logs in, and `_role_token_cache` persists,
+  so admin/bm/ops/partner each authenticate **once for the whole batch**. That is the point — the
+  OTP send endpoint rate-limits repeat requests to a number (*"Please try again after a minute"*),
+  which a login-per-loan batch would hit immediately. `N == 1` is byte-identical to the old
+  behaviour (no `run_many`, no reset, `run_e2e_test` still raises on failure); the batch path is
+  the only thing that catches per-loan failures so **one bad loan does not stop the rest**, with a
+  BATCH SUMMARY at the end naming the failures. `run_e2e_test` now returns `True` on success.
+- **`_reset_for_next_loan()` + `PER_LOAN_STATE`** clear one customer's and one loan's state between
+  iterations. **Kept on purpose:** `auth_token`, `_role_token_cache`, the appraiser identity, every
+  CLI/env choice (`forced_scheme_id`, `_forced_co_lender_id`, `partner_id`), and **the bank ACCOUNT
+  the penny-drop settled on** (re-walking the candidate list per loan re-fires the same doomed
+  penny-drops). **Cleared on purpose:** the bank VERIFICATION verdicts (each loan needs its own ops
+  approval — a stale `bank_manually_verified` makes `ops_manual_bank_verification` self-skip),
+  `bm_rating_submitted`, the resolved `scheme_id`, and the API-call metrics (cumulative counters
+  would report loan 1's calls again). Two tests guard it: every `PER_LOAN_STATE` name must be a real
+  attribute, and it must be a superset of `test_kyc.py`'s `PER_CUSTOMER_STATE`.
+- **`--count` works WITH `--customer`** — N loans for the same existing customer. Loans 2..N hit
+  "This product Request already Exists" and land on the SAME appraiser request: `create_appraiser_request`
+  now sees *ours + finished* and **keeps the request, clearing the loan ids so a fresh loan starts on
+  it** — it no longer attempts the cancel, which the server refuses for a finished loan anyway
+  (*"You are not allowed to cencel this loan"*). `--fresh-request` still forces cancel-and-recreate.
+  **Safety net:** `run_many` tracks `masterLoanId` per loan and FAILS a loan whose master loan
+  repeats — if the server answers *"Your loan already initiated"* instead of opening a new one, every
+  step would re-run against the finished loan and could still look like a pass.
+- Argument rules live in **`validate_cli(args, fail)`** (module level, so the offline tests exercise
+  them without running a flow): `--count >= 1`, and `--count > 1` with `--kyc auto|ovd` is refused
+  ONLY for a new-customer batch — with `--customer` no new customer is created, so it is allowed.
+- **`existing_customer_unique_id` / `existing_customer_id` are NOT in `PER_LOAN_STATE`** — they are
+  run-wide choices that `run_e2e_test` re-reads each loan; clearing them would turn loans 2..N of a
+  `--customer` batch into new-customer runs. A test pins this.
   No `--customer` → `main()` clears `existing_customer_unique_id` so `run_e2e_test` takes the create-customer + full-KYC path. With `--customer` → resolves that customer and skips KYC if already approved. `--amount` sets `GOLD_LOAN_AMOUNT`. Both modes run the identical end-to-end flow through disbursement → submit-packet → load-loan-details. (The constructor default for `GOLD_LOAN_EXISTING_CUSTOMER_UNIQUE_ID` is now `""` — the bare command creates a new customer, it no longer defaults to MS35QNJP.) **Every run logs in fresh — there is no session/token persistence.**
 - **Reference/ground-truth data (do NOT modify): `reference/gold-loan-e2e-flow.har` and `reference/ovd-kyc-flow.har`** (the latter captures KYC via an OVD instead of PAN: `verify-dl`/`verify-voter-id`, `panType:"ovd"`, Form 97; it ends at the consent OTP).
   `gold-loan-e2e-flow.har` is one consolidated HAR of the complete journey (customer/KYC → appraiser → ornaments → scheme → final-loan → bank details → assign packet → ratings → loan documents → partner approval → disbursement → submit packet → load details), 244 API calls. Each entry's `comment` tags its stage (A = customer/KYC/loan/bank/packet/docs, B0 = partner approval, B = disbursement, C = submit-packet/load-details). Merged from four captures, so ids differ across stages — it's a step reference, not one live session. The older per-stage HARs / Postman collection / loan-flow JSON were consolidated into this file and removed.
@@ -113,7 +145,11 @@ domain rule stays defined once in `maintest.py` and cannot drift:
 | `GOLD_LOAN_KYC_*` | Per-field overrides of the identity profile — see `KYC_PROFILE_ENV_KEYS` (`_PAN`, `_AADHAAR`, `_AADHAAR_XML`, `_OVD_TYPE`, `_OVD_NUMBER`, `_OVD_IMAGE`, `_FORM97`, `_DOB`, …) |
 | `GOLD_LOAN_KYC_OVD_TYPE_STRING` | Override the `ovdType` string sent on submit-basic-info |
 | `GOLD_LOAN_KYC_IDENTITY_TYPE_ID` | Override `identityTypeId` (default 5 = Aadhaar) |
+| `GOLD_LOAN_GATEWAY_RETRIES` | Attempts for a SAFE request when the gateway 502/503/504s (default 3; 1 disables) |
+| `GOLD_LOAN_GATEWAY_RETRY_DELAY` | Seconds between those attempts, multiplied by the attempt number (default 2) |
 | `GOLD_LOAN_BANK_ACCOUNTS` | Path to the candidate payout-account list (default `reference/bank_accounts.json`) |
+| `GOLD_LOAN_BANK_STATUS_FILE` | Where the cross-run bank-account status is kept (default `config/bank_account_status.json`) |
+| `GOLD_LOAN_BANK_RETRY_ALL` | `true` → re-try accounts the penny-drop already rejected this run (default: skip them) |
 | `GOLD_LOAN_BANK_ACCOUNT_ATTEMPTS` | How many accounts the penny-drop may walk (default 12) |
 | `GOLD_LOAN_FRESH_APPRAISER_REQUEST` | `true` → cancel an existing appraiser request's loan and create a new one instead of RESUMING it. CLI: `--fresh-request` |
 | `GOLD_LOAN_LOG_LEVEL` | `quiet` \| `normal` \| `verbose` |
@@ -153,7 +189,8 @@ The harness runs against **either environment**, chosen with `--env {test|uat}` 
 
 **`_make_authenticated_request(method, api_path, json_data, params, files, headers)`** is the one gateway every endpoint routes through. It:
 - Adds the HMAC signature + auth headers.
-- **No retry/relogin.** On 401 it raises with a clear message; the run logs in fresh at the start and there is no mid-flight re-login.
+- **No auth retry/relogin.** On 401 it raises with a clear message; the run logs in fresh at the start and there is no mid-flight re-login.
+- **Gateway retry (502/503/504 + transport blips), asymmetric on purpose.** nginx answers 502 while the backend restarts, and one blip used to lose a whole run — or a whole `--count` batch (live: `GET /api/customer` 502 killed loan 2, `update-loan-lock` 502 killed loan 1). `_send_with_gateway_retry` retries **GET** on 502/503/504 and on any transport error, with a linear backoff. A **write is NOT retried on a gateway status** — nginx cannot say whether the backend applied it first, and re-sending a create would duplicate a customer/loan/rating, i.e. manufacture the very "already exists" mess the appraiser-request code exists to clean up; it prints a line saying so. A write IS retried on `ConnectError`/`ConnectTimeout` (no connection ⇒ nothing processed) but NOT on a read timeout (the request went out). Tunable: `GOLD_LOAN_GATEWAY_RETRIES` (default 3, `1` disables), `GOLD_LOAN_GATEWAY_RETRY_DELAY` (default 2s).
 - Normalizes the body via `_js_number_normalize` before signing/sending.
 
 Don't add per-endpoint auth or retry logic — change it here.
@@ -293,6 +330,10 @@ This is the most fragile area. Rules verified empirically against captured reque
 ## Bank details & verification
 
 - **The payout account is CHOSEN from a list, not hard-coded.** `reference/bank_accounts.json` (54 LIC collection accounts, copied from `augmont-test-suite/fixtures/new-admin/bankAccounts.json`, itself from LIST-OF-ALL-BANK-DETAILS-UPDATED26112019.pdf) holds `{label, ifscCode, accountNumber}` per account. The penny-drop reaches the REAL bank and rejects accounts unpredictably — on UAT the previously hard-coded SBI account answers **400 "Something went wrong"**, which then blocks bank-details — so `validate_account` walks the list and keeps the first usable one. Ranking: **(1)** `isVerified`/`isManuallyVerified` → stop; **(2)** `bankTxnStatus` true → usable, stop (the normal outcome — ops still has to clear it); **(3)** HTTP 200 with no `bankTxnStatus` → remembered as a last resort. Every account failing leaves the fields on the first candidate with the flags false, so `store_bank_details`' ops fallback still runs. `GOLD_LOAN_BANK_ACCOUNTS` overrides the path, `GOLD_LOAN_BANK_ACCOUNT_ATTEMPTS` the cap (default **12** — each attempt hits a real bank; the skipped count is logged, never silent). Helpers: `_load_bank_accounts`, `_bank_account_candidates`, `_apply_bank_account`, `_capture_validate_account_flags`, `_report_validate_account`; constants `BANK_ACCOUNTS_PATH`, `DEFAULT_BANK_ACCOUNT`.
+- **Rejections PERSIST ACROSS RUNS** in `config/bank_account_status.json` (gitignored; `GOLD_LOAN_BANK_STATUS_FILE` overrides). Keyed by ENVIRONMENT — test and uat sit in front of different backends — it records each failed account with its reason, status, label, timestamp and a `definitive` flag, plus a `preferred` account that last worked. On the next run the recorded accounts are skipped and `preferred` is tried FIRST, so a walk that once cost 20+ calls costs one. `_flag_bank_account` / `_remember_working_bank_account` write it; `_load_bank_status` seeds the run (lazily, on the first `_bank_account_candidates`) and **UNIONs** with whatever is already flagged in memory — assigning would drop an earlier loan's findings in a `--count` batch. **This is NOT the session persistence that was removed**: no tokens, no customer, no PAN, nothing that can go stale into an "already exists" failure — just a list of dead bank accounts.
+- **A rejection is classified.** `DEFINITIVE_BANK_REJECTIONS` (account closed / invalid account / IFSC not found …) will answer the same way forever; anything else — notably **"Something went wrong"**, the reason the live run got eight times — may just be the provider having a bad day. Both are recorded, but if honouring the whole file would leave NOTHING to try, the non-definitive ones are forgiven for that run, so one bad day can never permanently disable the flow. `GOLD_LOAN_BANK_RETRY_ALL=true` ignores the file outright.
+- **A bad IFSC costs ONE call, not two.** `account-details-karza` answering *"Invalid IFSC Code"* condemns the account — the penny-drop that used to follow answered *"The ifsc code is not found"*. `fetch_account_details_karza` now returns `{"_error": {..., "badIfsc": True}}` and the walk flags the account definitively and skips its penny-drop.
+- **A rejected account is FLAGGED and never penny-dropped again in the same run.** Each candidate costs TWO calls (the `account-details-karza` IFSC lookup plus the penny-drop), and the same doomed accounts were being re-walked on the disbursement re-run and on every loan of a `--count` batch. `_bank_accounts_rejected` collects every account the penny-drop rejected; `_bank_account_candidates` drops them (never the settled `bank_account_number`, which stays first even if it was once flagged) and says how many it skipped. When a FULL walk ends with nothing usable, `_bank_penny_drop_unavailable` is set and later `validate_account` calls **skip the walk entirely** — zero calls — and go straight to the state `store_bank_details`' ops-manual-verification fallback expects. Both flags deliberately SURVIVE `_reset_for_next_loan` (that is the saving); `GOLD_LOAN_BANK_RETRY_ALL=true` clears the behaviour and re-tries everything.
 - **The chosen account is tried FIRST on any re-run** (`_bank_account_candidates` reorders by `self.bank_account_number`), so the disbursement stage's second `validate-account` settles immediately instead of re-walking. `store_bank_details` sends whatever was chosen, with `bankName`/`bankBranchName` from that account's `account-details-karza` IFSC lookup rather than the old hard-coded SBI strings. One fixture entry (HSBC `006-089866-001`) carries separators — keep the source values verbatim.
 - **`validate-account` (penny-drop) MUST run BEFORE `bank-details`** — otherwise bank-details 400s with "bank details is not verified". HAR order: GET bank-details → GET account-details-karza (IFSC lookup only, not verification) → POST validate-account → POST bank-details. `validate_account` runs in the Bank-Details step (not the later disbursement step).
 - **The SBI test account penny-drop REACHES THE BANK but does NOT verify the account.** CONFIRMED from a real validate-account call with `00000036150491589`/`SBIN0011777`/`LIC MUTUAL FUND` (`ops complete.har` entry 35): `data.bankTxnStatus: true` — **but** `isVerified: false`, `isManuallyVerified: false`, **`forOpsApproval: true`**, `nameAsPerSystem: "Michael Davis"`. The server compares the bank's account name against the CUSTOMER's name; our fixed test account never matches a randomly-named customer, so the bank detail is stored as **`bankVerificationStatus: "pending"`** (see `single-loan.data.loanBankDetail`) and the loan cannot disburse. **`bankTxnStatus: true` ≠ verified** — reading only that flag is what made the run believe the bank was fine and then fail downstream. `validate_account` now captures all four flags into `self.bank_account_verified` / `bank_system_verified` / `bank_manually_verified` / `bank_for_ops_approval`.

@@ -7,6 +7,7 @@ import json
 import random
 import datetime
 import os
+import sys
 import urllib.parse
 import asyncio
 import re  # Import regex module
@@ -237,6 +238,15 @@ class GoldLoanApiTest:
         self._existing_request_appraiser_id = None
         self._branch_attempts = []  # per-attempt results of the alternate-branch create ladder
         self.bank_account_label = ''
+        # Accounts the penny-drop rejected THIS RUN, so they are not retried per loan.
+        self._bank_accounts_rejected = set()
+        self._bank_penny_drop_unavailable = False  # a full walk found nothing usable
+        self._bank_rejection_reasons = {}          # accountNumber -> why it was flagged
+        self.bank_retry_all_accounts = os.getenv("GOLD_LOAN_BANK_RETRY_ALL", "").lower() in ("1", "true", "yes")
+        self._bank_status_loaded = False  # deferred: needs env_name + the account list
+        # nginx 502/503/504 and transport blips: how many times a SAFE request is repeated.
+        self.gateway_retries = int(os.getenv("GOLD_LOAN_GATEWAY_RETRIES", "3") or 1)
+        self.gateway_retry_delay = float(os.getenv("GOLD_LOAN_GATEWAY_RETRY_DELAY", "2") or 0)
         self.bm_rating_submitted = False  # set by _submit_bm_rating; stops a duplicate on recovery
         # How many candidate payout accounts the penny-drop may walk (each one hits a real bank).
         self.bank_account_attempts = int(os.getenv("GOLD_LOAN_BANK_ACCOUNT_ATTEMPTS", "12") or 0)
@@ -530,7 +540,9 @@ class GoldLoanApiTest:
                 err_body = response.json()
                 err_msg = err_body.get("message") if isinstance(err_body, dict) else str(err_body)
             except Exception:
-                err_msg = (response.text or "")[:200]
+                # An nginx/express failure is an HTML page; collapsed to one line so it does not
+                # bury the other failures in the end-of-run report.
+                err_msg = self._short_error_body(response.text, 200)
             self._failed_endpoints.append(
                 (self._api_calls, method, path.split("?")[0], status, response.reason_phrase, err_msg or "")
             )
@@ -827,6 +839,80 @@ class GoldLoanApiTest:
                              f"{sorted(mobiles) + ['partner']}.")
         return mobiles[login_type]
 
+    # nginx in front of the API answers 502/503/504 while the backend is restarting or wedged.
+    # That is infrastructure, not our request -- one blip should not lose a whole run, let alone
+    # a whole --count batch.
+    GATEWAY_STATUSES = (502, 503, 504)
+
+    @staticmethod
+    def _is_html_error_page(text: str) -> bool:
+        return bool(text) and text.lstrip()[:200].lower().startswith(("<html", "<!doctype"))
+
+    @classmethod
+    def _short_error_body(cls, text: str, limit: int = 300) -> str:
+        """Collapse an nginx/express HTML error page to one line; leave JSON bodies alone.
+
+        A 502 page is eight lines of markup that buries the actual failure in the run summary.
+        """
+        if not text:
+            return ""
+        if not cls._is_html_error_page(text):
+            return text[:limit]
+        title = re.search(r"<title>(.*?)</title>", text, re.I | re.S)
+        heading = re.search(r"<h1>(.*?)</h1>", text, re.I | re.S)
+        server = re.search(r"<center>([^<]*?/[^<]*?)</center>", text, re.I)
+        parts = [p.group(1).strip() for p in (title, heading) if p and p.group(1).strip()]
+        label = parts[0] if parts else "HTML error page"
+        if server:
+            label += f" ({server.group(1).strip()})"
+        return label
+
+    async def _send_with_gateway_retry(self, verb: str, api_path: str, send_once):
+        """Send, retrying only failures that are safe to repeat.
+
+        GET is idempotent, so a 502/503/504 or any transport error is retried. A write is NOT
+        retried on a gateway status: nginx cannot tell us whether the backend processed the
+        request before dying, and re-sending a create would duplicate a customer, a loan or a
+        rating -- the exact mess "already exists" handling exists to clean up. A write IS retried
+        when the connection never got established, because then nothing can have been processed.
+        """
+        attempts = max(1, self.gateway_retries)
+        for attempt in range(1, attempts + 1):
+            last = attempt == attempts
+            try:
+                response = await send_once()
+            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                # No connection was made, so nothing was processed -- safe to repeat for any verb.
+                if last:
+                    raise
+                await self._gateway_backoff(attempt, verb, api_path, f"{type(e).__name__}")
+                continue
+            except httpx.TransportError as e:
+                # The request went out; the reply did not come back. Only a GET may be repeated.
+                if last or verb != 'GET':
+                    raise
+                await self._gateway_backoff(attempt, verb, api_path, f"{type(e).__name__}")
+                continue
+
+            if response.status_code in self.GATEWAY_STATUSES and not last and verb == 'GET':
+                await self._gateway_backoff(
+                    attempt, verb, api_path,
+                    f"{response.status_code} {response.reason_phrase}")
+                continue
+            if response.status_code in self.GATEWAY_STATUSES and verb != 'GET':
+                print(self._c(
+                    f"  {response.status_code} {response.reason_phrase} on {verb} {api_path} - "
+                    "NOT retried: the gateway cannot say whether the backend applied it, and "
+                    "re-sending a write would risk a duplicate.", "yellow"))
+            return response
+        return response
+
+    async def _gateway_backoff(self, attempt: int, verb: str, api_path: str, reason: str) -> None:
+        delay = self.gateway_retry_delay * attempt
+        print(self._c(f"  {reason} on {verb} {api_path} - retrying in {delay:.0f}s "
+                      f"(attempt {attempt + 1}/{max(1, self.gateway_retries)}).", "yellow"))
+        await asyncio.sleep(delay)
+
     async def _make_authenticated_request(self, method: str, api_path: str, json_data: dict = None, params: dict = None, files: dict = None, headers: dict = None):
         if headers is None:
             headers = {}
@@ -862,14 +948,18 @@ class GoldLoanApiTest:
                 del headers['Content-Type'] # Let httpx handle it
 
         self._debug(f"Sending {method} {api_path} with headers: {list(headers)}")
-        if method.upper() == 'GET':
-            response = await self.client.get(api_path, headers=headers, params=params)
-        elif method.upper() == 'POST':
-            response = await self.client.post(api_path, json=json_data, headers=headers, files=files)
-        elif method.upper() == 'PUT':
-            response = await self.client.put(api_path, json=json_data, headers=headers)
-        else:
+        verb = method.upper()
+        if verb not in ('GET', 'POST', 'PUT'):
             raise ValueError(f"Unsupported HTTP method: {method}")
+
+        async def send_once():
+            if verb == 'GET':
+                return await self.client.get(api_path, headers=headers, params=params)
+            if verb == 'POST':
+                return await self.client.post(api_path, json=json_data, headers=headers, files=files)
+            return await self.client.put(api_path, json=json_data, headers=headers)
+
+        response = await self._send_with_gateway_retry(verb, api_path, send_once)
 
         if response.status_code == 401:
             raise httpx.HTTPStatusError(
@@ -2856,10 +2946,21 @@ class GoldLoanApiTest:
                               "(still in progress, assigned to this appraiser) instead of recreating it.")
                         return
 
+                    if attempt == 0 and mine and self.reuse_existing_request:
+                        # OUR OWN request whose loan is FINISHED (an in-progress one was reused
+                        # above). Cancelling a finished loan is futile -- the server refuses it
+                        # ("You are not allowed to cencel this loan") -- so keep the request and
+                        # start a FRESH loan on it. This is what makes --customer with --count
+                        # work: loan 2..N for the same customer land on the same request.
+                        print(f"Appraiser request {self.appraiser_request_id} is ours but its loan "
+                              "is finished; keeping the request and starting a fresh loan on it.")
+                        self.loan_id = ''
+                        self.master_loan_id = ''
+                        return
+
                     if attempt == 0 and mine:
-                        # OUR OWN request: cancelling its loan frees the customer and is ours to do.
-                        reason = ("--fresh-request was given" if not self.reuse_existing_request
-                                  else "the existing request is already complete")
+                        # --fresh-request: the caller explicitly wants the old loan gone.
+                        reason = "--fresh-request was given"
                         print(f"Cancelling our existing loan and creating a fresh request ({reason}).")
                         if self.loan_id and self.master_loan_id:
                             try:
@@ -4975,8 +5076,13 @@ class GoldLoanApiTest:
             print(f"Fetched Karza account details for IFSC {ifsc}.")
             return data
         except httpx.HTTPStatusError as e:
-            print(f"Fetch Karza account details failed (non-fatal): {e.response.status_code}")
-            return {}
+            body = self._short_error_body(e.response.text, 120)
+            print(f"Fetch Karza account details failed (non-fatal): {e.response.status_code} - {body}")
+            # "Invalid IFSC Code" condemns the ACCOUNT, not just this lookup -- the penny-drop
+            # that would follow answers "The ifsc code is not found". Say so, so the caller can
+            # skip it and save that second call.
+            return {"_error": {"status": e.response.status_code, "body": body,
+                               "badIfsc": "ifsc" in body.lower()}}
 
 
     # --- Disbursement / documents phase (from loan-flow collection) ---
@@ -4996,6 +5102,135 @@ class GoldLoanApiTest:
                 print(f"Update loan lock skipped (already locked/invalid stage): {e.response.text}")
             else:
                 raise
+
+    # --- persistent bank-account status ---------------------------------------------------
+    #
+    # The penny-drop hits a REAL bank, so a rejection is worth remembering ACROSS runs: the
+    # eight "Something went wrong" calls, the closed beneficiary account and the two bad IFSC
+    # codes cost two API calls each (the karza IFSC lookup plus validate-account) and answer the
+    # same way every time. The file records them per ENVIRONMENT (test and uat sit in front of
+    # different backends) together with the account that last worked.
+    #
+    # This is NOT the session persistence that was deliberately removed: no tokens, no customer,
+    # no PAN -- nothing that can go stale into a "already exists" failure. It is a list of dead
+    # bank accounts, which stay dead.
+    BANK_STATUS_FILENAME = os.path.join("config", "bank_account_status.json")
+
+    # A rejection naming the ACCOUNT or its IFSC will answer the same way forever. Anything else
+    # ("Something went wrong", a 5xx) may just be the provider having a bad day, so it is
+    # remembered but can be forgiven -- see _load_bank_status.
+    DEFINITIVE_BANK_REJECTIONS = (
+        "account is closed", "account closed", "invalid account",
+        "account does not exist", "no such account", "invalid beneficiary",
+        "ifsc code is not found", "invalid ifsc",
+    )
+
+    @classmethod
+    def _is_definitive_bank_rejection(cls, text: str) -> bool:
+        low = (text or "").lower()
+        return any(marker in low for marker in cls.DEFINITIVE_BANK_REJECTIONS)
+
+    def _bank_status_path(self) -> str:
+        override = os.getenv("GOLD_LOAN_BANK_STATUS_FILE", "").strip()
+        if override:
+            return override
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(project_root, self.BANK_STATUS_FILENAME)
+
+    def _read_bank_status(self) -> dict:
+        try:
+            with open(self._bank_status_path(), encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except (OSError, ValueError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _load_bank_status(self) -> None:
+        """Seed this run's rejections (and preferred account) from the status file.
+
+        `GOLD_LOAN_BANK_RETRY_ALL=true` ignores the file entirely. Otherwise every recorded
+        rejection is honoured -- UNLESS honouring them would leave nothing to try, in which case
+        the non-definitive ones are forgiven for this run, so a provider outage recorded once can
+        never permanently disable the flow.
+        """
+        if self.bank_retry_all_accounts:
+            print("GOLD_LOAN_BANK_RETRY_ALL is set: ignoring the recorded bank-account rejections.")
+            return
+        env_block = (self._read_bank_status().get("environments") or {}).get(self.env_name) or {}
+        rejected = env_block.get("rejected") or {}
+        if not isinstance(rejected, dict):
+            return
+
+        definitive = {n for n, info in rejected.items()
+                      if isinstance(info, dict) and info.get("definitive")}
+        soft = set(rejected) - definitive
+        total = len(self._load_bank_accounts())
+        if len(definitive) + len(soft) >= total and soft:
+            print(f"Every known account is flagged on '{self.env_name}'; forgiving "
+                  f"{len(soft)} non-definitive rejection(s) so there is something to try.")
+            self._bank_accounts_rejected |= set(definitive)
+        else:
+            self._bank_accounts_rejected |= set(rejected)
+        # UNION, never assignment: anything already flagged in memory (an earlier loan of a
+        # --count batch, or a caller that seeded it) must not be forgotten by the file load.
+        self._bank_rejection_reasons.update(
+            {n: (info or {}).get("reason", "") for n, info in rejected.items()
+             if isinstance(info, dict)})
+
+        preferred = env_block.get("preferred")
+        if preferred and preferred not in self._bank_accounts_rejected:
+            match = next((a for a in self._load_bank_accounts()
+                          if str(a.get("accountNumber")) == str(preferred)), None)
+            if match:
+                self._apply_bank_account(match)
+                print(f"Starting from the account that last worked on '{self.env_name}': "
+                      f"{self.bank_account_label}.")
+        if self._bank_accounts_rejected:
+            print(f"Skipping {len(self._bank_accounts_rejected)} bank account(s) recorded as "
+                  f"failing on '{self.env_name}' (GOLD_LOAN_BANK_RETRY_ALL=true to try them again).")
+
+    def _write_bank_status(self, mutate) -> None:
+        """Read-modify-write this environment's block. Never fatal -- it is a cache, not state."""
+        path = self._bank_status_path()
+        payload = self._read_bank_status()
+        payload.setdefault("version", 1)
+        environments = payload.setdefault("environments", {})
+        env_block = environments.setdefault(self.env_name, {})
+        env_block.setdefault("rejected", {})
+        mutate(env_block)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2, sort_keys=True)
+        except OSError as e:
+            print(f"Could not update the bank-account status file at {path}: {e}")
+
+    def _flag_bank_account(self, number: str, reason: str, status, definitive: bool) -> None:
+        """Remember that this account failed, for this run AND the next one."""
+        number = str(number)
+        self._bank_accounts_rejected.add(number)
+        self._bank_rejection_reasons[number] = reason
+        def mutate(env_block):
+            env_block["rejected"][number] = {
+                "reason": reason[:200],
+                "status": status,
+                "definitive": bool(definitive),
+                "label": self.bank_account_label,
+                "lastSeen": datetime.datetime.now(datetime.timezone.utc)
+                    .isoformat().replace("+00:00", "Z"),
+            }
+            if env_block.get("preferred") == number:
+                env_block.pop("preferred", None)
+        self._write_bank_status(mutate)
+
+    def _remember_working_bank_account(self, number: str) -> None:
+        """Record the account that worked so the next run starts with it (one call, not twelve)."""
+        number = str(number)
+        self._bank_accounts_rejected.discard(number)
+        def mutate(env_block):
+            env_block["preferred"] = number
+            env_block["rejected"].pop(number, None)
+        self._write_bank_status(mutate)
 
     def _load_bank_accounts(self) -> list:
         """The candidate customer payout accounts for the penny-drop, in the order to try them.
@@ -5027,16 +5262,37 @@ class GoldLoanApiTest:
         return usable
 
     def _bank_account_candidates(self) -> list:
-        """The accounts to penny-drop, with the one already chosen this run tried FIRST.
+        """The accounts still worth penny-dropping, best first.
 
-        The disbursement stage re-runs validate-account; putting the chosen account first means
-        that re-run settles on the same account immediately instead of walking the list again.
+        Two savings, both of which matter across a --count batch and across the disbursement
+        stage's second validate-account:
+          * the account that already WORKED is tried first, so a re-run settles in one call;
+          * accounts the penny-drop already rejected THIS RUN are skipped entirely -- they are
+            flagged in `_bank_accounts_rejected` and cost two calls each (the IFSC lookup plus
+            the penny-drop itself) every time they are retried.
         """
+        if not self._bank_status_loaded:
+            self._bank_status_loaded = True
+            self._load_bank_status()
         accounts = self._load_bank_accounts()
-        chosen = self.bank_account_number
+        chosen = str(self.bank_account_number or "")
+        rejected = self._bank_accounts_rejected
+
+        keep, skipped = [], 0
+        for account in accounts:
+            number = str(account.get("accountNumber"))
+            if number in rejected and number != chosen:
+                skipped += 1
+                continue
+            keep.append(account)
+        if skipped:
+            print(f"Skipping {skipped} account(s) the penny-drop already rejected in this run "
+                  "(set GOLD_LOAN_BANK_RETRY_ALL=true to try them again).")
+        accounts = keep
+
         if chosen:
-            accounts = ([a for a in accounts if str(a.get("accountNumber")) == str(chosen)]
-                        + [a for a in accounts if str(a.get("accountNumber")) != str(chosen)])
+            accounts = ([a for a in accounts if str(a.get("accountNumber")) == chosen]
+                        + [a for a in accounts if str(a.get("accountNumber")) != chosen])
         limit = self.bank_account_attempts
         if limit and len(accounts) > limit:
             print(f"Penny-dropping {limit} of {len(accounts)} candidate accounts "
@@ -5079,13 +5335,43 @@ class GoldLoanApiTest:
                 "loan", file_type="image", file_path_override=self.CHEQUE_IMAGE_PATH))['uploadFile']['path']
         ]
 
+        if self._bank_penny_drop_unavailable and not self.bank_retry_all_accounts:
+            # A full walk already rejected every account it tried. Re-walking costs two calls per
+            # account per loan and has never once changed the answer, so go straight to the state
+            # store_bank_details' ops-manual-verification fallback expects.
+            print(self._c("Penny-drop already rejected every account tried in this run; skipping "
+                          "it and relying on the ops manual verification "
+                          "(GOLD_LOAN_BANK_RETRY_ALL=true to try again).", "yellow"))
+            self.bank_account_verified = False
+            self.bank_system_verified = False
+            self.bank_manually_verified = False
+            self.bank_for_ops_approval = True
+            return
+
         candidates = self._bank_account_candidates()
+        if not candidates:
+            print(self._c("Every candidate account is flagged as rejected; skipping the penny-drop "
+                          "and relying on the ops manual verification.", "yellow"))
+            self._bank_penny_drop_unavailable = True
+            self.bank_account_verified = False
+            self.bank_for_ops_approval = True
+            return
+
         attempts = []          # human-readable per-account outcome, for the summary
         fallback = None        # (account, payload) for a rank-3 result
 
         for position, account in enumerate(candidates, 1):
             self._apply_bank_account(account)
-            await self.fetch_account_details_karza()  # bank name + branch for this IFSC
+            label = f"{self.bank_account_label} ({self.bank_ifsc_code}/{self.bank_account_number})"
+            karza = await self.fetch_account_details_karza()  # bank name + branch for this IFSC
+            karza_error = karza.get("_error") if isinstance(karza, dict) else None
+            if karza_error and karza_error.get("badIfsc"):
+                reason = karza_error.get("body") or "Invalid IFSC Code"
+                attempts.append(f"{self.bank_account_label} -> IFSC lookup: {reason}")
+                print(f"  {reason}; skipping the penny-drop for {label}.")
+                self._flag_bank_account(self.bank_account_number, reason,
+                                        karza_error.get("status"), definitive=True)
+                continue
             request_body = {
                 "ifscCode": self.bank_ifsc_code,
                 "accountNumber": self.bank_account_number,
@@ -5098,13 +5384,16 @@ class GoldLoanApiTest:
                 "detailsFor": "customer",
                 "detailsForId": int(self.customer_id) if self.customer_id else None,
             }
-            label = f"{self.bank_account_label} ({self.bank_ifsc_code}/{self.bank_account_number})"
             print(f"Penny-drop {position}/{len(candidates)}: {label}")
             try:
                 response = await self._make_authenticated_request('POST', api_path, json_data=request_body)
             except httpx.HTTPStatusError as e:
-                detail = (e.response.text or "").strip()[:100]
+                detail = self._short_error_body(e.response.text, 100).strip()
                 attempts.append(f"{self.bank_account_label} -> {e.response.status_code} {detail}")
+                # Flag it so neither the disbursement re-run, nor a later loan in a --count
+                # batch, nor the NEXT RUN spends two calls on it again.
+                self._flag_bank_account(self.bank_account_number, detail, e.response.status_code,
+                                        definitive=self._is_definitive_bank_rejection(detail))
                 print(f"  rejected: {e.response.status_code} - {detail}")
                 continue
 
@@ -5112,10 +5401,12 @@ class GoldLoanApiTest:
             self._capture_validate_account_flags(data)
             if self.bank_system_verified or self.bank_manually_verified:
                 print(self._c(f"  VERIFIED outright; using {label}.", "green"))
+                self._remember_working_bank_account(self.bank_account_number)
                 self._report_validate_account(data, request_body)
                 return
             if self.bank_account_verified:
                 print(f"  usable (bankTxnStatus true); using {label}.")
+                self._remember_working_bank_account(self.bank_account_number)
                 self._report_validate_account(data, request_body)
                 return
             attempts.append(f"{self.bank_account_label} -> 200 but no bankTxnStatus")
@@ -5137,6 +5428,7 @@ class GoldLoanApiTest:
         # Nothing worked at all: leave the fields on the first candidate so the rest of the flow
         # has a consistent account, and let store_bank_details' ops fallback take over.
         self._apply_bank_account(candidates[0])
+        self._bank_penny_drop_unavailable = True  # do not walk the list again this run
         self.bank_account_verified = False
         self.bank_system_verified = False
         self.bank_manually_verified = False
@@ -5709,7 +6001,144 @@ class GoldLoanApiTest:
         return loan
 
 
-    async def run_e2e_test(self, login_type: str):
+    # Cleared between loans in a --count run: everything that identifies ONE customer or ONE
+    # loan. Deliberately KEPT, because keeping it is the whole point of a batch:
+    #   * auth_token and _role_token_cache -- one login per role for the WHOLE batch, so the
+    #     OTP send endpoint's "Please try again after a minute" rate limit is never hit;
+    #   * the appraiser identity (appraiser_id, logged_in_*) and every CLI/env choice;
+    #   * the bank ACCOUNT the penny-drop settled on -- re-walking the candidate list per loan
+    #     would fire the same doomed penny-drops again. Its VERIFICATION verdicts are cleared
+    #     below, because every loan needs its own ops approval.
+    PER_LOAN_STATE = (
+        # customer identity
+        "customer_id", "customer_unique_id", "customer_kyc_id", "mobile_number",
+        "first_name", "last_name", "random_pan", "pan_image", "form60_image",
+        "identity_proof_number", "encrypted_identity_proof_number",
+        "masked_identity_proof", "unmasked_identity_proof", "address_proof",
+        "name_as_per_aadhaar", "profile_image", "signature_proof",
+        "mother_name", "spouse_name", "martial_status", "gender", "dob", "age",
+        "ovd_image", "form97_image", "ovd_name", "kyc_status", "kyc_reference_code",
+        # loan identity and financials
+        "appraiser_request_id", "master_loan_id", "loan_id", "loan_unique_id",
+        "loan_stage_id", "scheme_id", "final_loan_amount", "total_eligible_amount",
+        "total_final_interest_amt", "secured_rpg", "secured_ltv", "tenure_months",
+        "interest_rate", "secured_processing_charge", "upfront_interest_amount",
+        "secured_exposure", "secured_rebate_interest", "loan_start_date", "loan_end_date",
+        "max_loan_limit", "min_loan_amount", "max_loan_amount", "purpose_id",
+        "nominee_relation_id", "ornament_type_id", "karat_id", "reference_code",
+        "lead_converter_id",
+    )
+
+    def _reset_for_next_loan(self) -> None:
+        """Clear the previous loan's customer and loan state so the next one starts clean."""
+        for field in self.PER_LOAN_STATE:
+            if not hasattr(self, field):
+                continue
+            current = getattr(self, field)
+            if isinstance(current, bool):
+                setattr(self, field, False)
+            elif isinstance(current, (int, float)):
+                setattr(self, field, type(current)())
+            else:
+                setattr(self, field, "")
+        # Containers
+        self.customer_details = {}
+        self.selected_scheme = {}
+        self.loan_ornaments_details = []
+        self.interest_table_data = []
+        self.available_packet = {}
+        self.passbook_proofs = []
+        self.karza_account_details = {}
+        self._diagnostics = {}
+        self._branch_attempts = []
+        # Call metrics are cumulative, so reset them: each loan reports its OWN calls and
+        # failures rather than the batch running total.
+        self._api_calls = 0
+        self._api_failures = 0
+        self._failed_endpoints = []
+        # Per-loan decisions
+        self._existing_request_status = ''
+        self._existing_process_complete = False
+        self._existing_loan_completed = False
+        self._existing_request_appraiser_id = None
+        self.bm_rating_submitted = False
+        self.co_lender_bank_id = self._forced_co_lender_id or ''
+        # The account stays; its verdicts do not -- each loan gets its own ops approval.
+        self.bank_account_verified = False
+        self.bank_system_verified = False
+        self.bank_manually_verified = False
+        self.bank_for_ops_approval = False
+        # KYC verdicts are per-customer, and so is a degrade back to manual.
+        self.pan_verified = False
+        self.aadhaar_verified = False
+        self.ovd_verified = False
+        self.kyc_verification_log = []
+        self.kyc_mode_effective = self.kyc_mode_requested
+        self.kyc_mode = self.kyc_mode_requested
+
+    async def run_many(self, login_type: str, count: int) -> bool:
+        """Run the full journey `count` times inside ONE logged-in session.
+
+        Only the FIRST loan logs in; every later one reuses `auth_token` and the role-token
+        cache, so admin/bm/ops/partner each authenticate once for the batch instead of once per
+        loan. That is not just faster: the OTP send endpoint rate-limits repeat requests to the
+        same number ("Please try again after a minute"), which a loan-per-login batch would hit
+        immediately.
+
+        A failure stops that loan, not the batch -- the remaining loans still run, and the
+        summary at the end says which ones failed.
+        """
+        results = []
+        seen_master_loans = {}
+        for index in range(1, count + 1):
+            if index > 1:
+                self._reset_for_next_loan()
+            self._banner(f"LOAN {index} OF {count}",
+                         "reusing the logged-in session" if index > 1 else "logging in")
+            error = ""
+            try:
+                passed = bool(await self.run_e2e_test(login_type=login_type, skip_login=index > 1))
+            except Exception as e:
+                # run_e2e_test re-raises after printing its own diagnosis; in a batch that must
+                # end THIS loan, not the remaining ones.
+                passed, error = False, f"{type(e).__name__}: {e}"
+            # With --customer, loans 2..N land on the SAME appraiser request. If the server
+            # answers "Your loan already initiated" instead of opening a new one, the flow would
+            # re-run every step against the PREVIOUS loan and could still report success. Catch
+            # that here rather than reporting a loan that was never created.
+            master = str(self.master_loan_id or "")
+            if passed and master and master in seen_master_loans:
+                passed = False
+                error = (f"masterLoanId {master} is the loan from run "
+                         f"{seen_master_loans[master]} - the server did not open a new loan for "
+                         "this customer, it handed back the previous one")
+                print(self._c(f"  {error}.", "red"))
+            elif master:
+                seen_master_loans[master] = index
+            results.append({
+                "n": index,
+                "passed": passed,
+                "customer": self.customer_unique_id or "-",
+                "loan": self.loan_unique_id or "-",
+                "amount": self.final_loan_amount or 0,
+                "error": error,
+            })
+
+        self._banner("BATCH SUMMARY", f"{sum(r['passed'] for r in results)}/{count} loans completed")
+        for r in results:
+            mark = self._c(self._G["ok"], "green") if r["passed"] else self._c(self._G["fail"], "red")
+            print(f"  {mark} loan {r['n']}/{count}  customer={r['customer']:<12} "
+                  f"loan={r['loan']:<14} amount={r['amount']}")
+            if r["error"]:
+                print(self._c(f"      {r['error'][:160]}", "red"))
+        return all(r["passed"] for r in results)
+
+    async def run_e2e_test(self, login_type: str, skip_login: bool = False):
+        """Run the whole journey once. Returns True when it completed.
+
+        `skip_login=True` reuses the session already on this instance -- used by run_many for
+        loans 2..N so a batch logs in once instead of once per loan.
+        """
         self._banner(
             "GOLD LOAN - END-TO-END API TEST",
             f"env={self.env_name.upper()}   login={login_type} "
@@ -5718,7 +6147,9 @@ class GoldLoanApiTest:
         )
         try:
             self._log_step("Authentication")
-            if self.supplied_auth_token:
+            if skip_login and self.auth_token:
+                print("Reusing the session from the previous loan (no re-login, no new OTP).")
+            elif self.supplied_auth_token:
                 # Escape hatch: run against a caller-supplied JWT (GOLD_LOAN_AUTH_TOKEN) instead of
                 # logging in. Must carry internalBranchId + id.
                 self.auth_token = self.supplied_auth_token
@@ -5838,13 +6269,14 @@ class GoldLoanApiTest:
             # The closing "LOAN DETAILS" table (from fetch_loan_details) already shows the completed
             # loan's key attributes, so no separate identifiers dump is printed here.
             self._print_run_metrics(passed=True)
+            return True
 
 
         except httpx.HTTPStatusError as e:
             self._banner("RESULT - FAILED (HTTP ERROR)", f"login={login_type}")
             print(self._c(f"  {e.request.method} {e.request.url}", "red", "bold"))
             print(self._c(f"  status : {e.response.status_code} {e.response.reason_phrase}", "red"))
-            print(self._c(f"  body   : {e.response.text}", "red"))
+            print(self._c(f"  body   : {self._short_error_body(e.response.text, 600)}", "red"))
             self._print_run_metrics(passed=False)
             raise
         except Exception as e:
@@ -5886,6 +6318,22 @@ class GoldLoanApiTest:
                 if msg:
                     print(self._c(f"       -> {msg}", "gray"))
             print(self._c(rule, "gray"))
+
+
+def validate_cli(args, fail):
+    """Reject argument combinations that cannot work. `fail` is argparse's error() (it exits).
+
+    Kept out of main() so the offline tests can check these rules without running a flow.
+    """
+    if args.count < 1:
+        fail("--count must be at least 1")
+    if args.count > 1 and args.kyc in ("auto", "ovd") and not args.customer:
+        # One real person's documents can only be registered against ONE customer, so a batch of
+        # NEW customers cannot use a real-identity KYC mode (same rule as test_kyc.py --count).
+        # With --customer no new customer is created, so the combination is fine there.
+        fail(f"--count {args.count} cannot be combined with --kyc {args.kyc}: the real "
+             "PAN/Aadhaar/OVD in the identity profile can only be registered against one "
+             "customer. Use --kyc manual for a batch, or add --customer.")
 
 
 def main():
@@ -5960,7 +6408,14 @@ def main():
                         help="If an appraiser request already exists for the customer, cancel its "
                              "loan and create a new request. Default is to RESUME the existing "
                              "request when it is still in progress.")
+    parser.add_argument("--count", type=int, default=1, metavar="N",
+                        help="Create N loans back to back in ONE logged-in session (default 1). "
+                             "Every role logs in once for the whole batch, so the OTP endpoint's "
+                             "one-a-minute rate limit is never hit. A loan that fails does not "
+                             "stop the rest; the batch summary says which ones did.")
     args = parser.parse_args()
+
+    validate_cli(args, parser.error)
 
     # Environment must be set before the suite is constructed -- it picks the base URL and the
     # login mobiles for every role.
@@ -6008,6 +6463,12 @@ def main():
           + (f"  |  scheme: {args.scheme}" if args.scheme else "")
           + f"  |  co-lending: {co_lender_label}")
 
+    if args.count > 1:
+        who = (f"the SAME customer {args.customer}" if args.customer else "a NEW customer each")
+        print(f">> Batch: {args.count} loans for {who}, in ONE session "
+              "(one login per role for the batch).")
+        passed = asyncio.run(suite.run_many(login_type=args.login, count=args.count))
+        sys.exit(0 if passed else 1)
     asyncio.run(suite.run_e2e_test(login_type=args.login))
 
 
