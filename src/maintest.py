@@ -44,6 +44,9 @@ class GoldLoanApiTest:
     ENVIRONMENTS = {
         "test": {
             "base_url": "https://gold-loan-backend-api.gfat.augmont.com",
+            # The web app's origin, sent as the Origin header on every call: without it the
+            # server answers {"message": "This request is not permitted."}.
+            "origin": "https://ap.gfat.augmont.com",
             "role_mobiles": {"admin": "8880008880", "appraiser": "8880008881",
                              "ops": "8880008882", "bm": "8880008883"},
             "partner_mobiles": {"152": "8767002003", "10": "9375876473"},
@@ -52,6 +55,7 @@ class GoldLoanApiTest:
         },
         "uat": {
             "base_url": "https://gold-loan-backend-api.gfau.augmont.com",
+            "origin": "https://ap.gfau.augmont.com",
             "role_mobiles": {"admin": "9990009990", "appraiser": "9990009991",
                              "ops": "9990009995", "bm": "9990009993"},
             "partner_mobiles": {"152": "8767002002", "10": "8846651348"},  # ROSHAN PARTNER / ARVOG ARV10
@@ -139,6 +143,7 @@ class GoldLoanApiTest:
         self.BASE_URL = os.getenv(
             "GOLD_LOAN_BASE_URL", self.env["base_url"]
         ).rstrip("/")
+        self.ORIGIN = os.getenv("GOLD_LOAN_ORIGIN", self.env["origin"]).rstrip("/")
         self.HMAC_SECRET = os.getenv(
             "GOLD_LOAN_HMAC_SECRET",
             "3056301006072a8648ce3d020106052b8104000a0342000499c5f442c3264bcdfb093b0bc820e3f0f6546972856ebec2f8ccc03f49abdb47ffcfcaf4f37e0ec53050760e74014767e30a8a3e891f4db8c83fa27627898f15",
@@ -181,6 +186,7 @@ class GoldLoanApiTest:
         self._step_no = 0
         self.client = httpx.AsyncClient(
             base_url=self.BASE_URL,
+            headers={"Origin": self.ORIGIN},
             event_hooks={"response": [self._log_http_exchange]},
         )
         # --- Global Variables to store dynamic data ---
@@ -312,6 +318,10 @@ class GoldLoanApiTest:
         self.bank_branch_name = ''
         self.account_holder_name = ''
         self.passbook_proofs = []  # Uploaded passbook proof paths
+        # The customer's own saved bank accounts (GET loan-process/bank-details). When present,
+        # the penny-drop uses ONLY these, never the reference/bank_accounts.json list.
+        self.saved_bank_accounts = []
+        self._passbook_from_saved = False  # passbook_proofs came from a saved account
         # Bank verification state, captured from validate-account / bank-verification-manual.
         # bank_account_verified  -> penny-drop reached the bank (data.bankTxnStatus)
         # bank_system_verified   -> the server accepted it outright (isVerified)
@@ -1252,6 +1262,11 @@ class GoldLoanApiTest:
                 return payload
         return payload
 
+    @property
+    def full_name(self) -> str:
+        """First + last name; last name is optional (single-name Aadhaar / AUTO KYC customers)."""
+        return f"{self.first_name} {self.last_name}".strip()
+
     async def _fetch_customer_unique_id(self) -> None:
         if self.customer_unique_id:
             filters = {"customerUniqueId": self.customer_unique_id}
@@ -1398,12 +1413,10 @@ class GoldLoanApiTest:
         assert self.customer_id or self.customer_unique_id, (
             "Set GOLD_LOAN_EXISTING_CUSTOMER_ID or GOLD_LOAN_EXISTING_CUSTOMER_UNIQUE_ID."
         )
-        if self.customer_id and (
-            not self.mobile_number or not self.first_name or not self.last_name
-        ):
+        if self.customer_id and (not self.mobile_number or not self.first_name):
             await self.get_customer_by_id()
         if self.customer_unique_id and (
-            not self.customer_id or not self.mobile_number or not self.first_name or not self.last_name
+            not self.customer_id or not self.mobile_number or not self.first_name
         ):
             payload = await self._search_customers({"customerUniqueId": self.customer_unique_id})
 
@@ -1435,8 +1448,9 @@ class GoldLoanApiTest:
             self.mobile_number = self.mobile_number or str(customer.get("mobileNumber") or "")
             self.first_name = self.first_name or str(customer.get("firstName") or "")
             self.last_name = self.last_name or str(customer.get("lastName") or "")
-        assert self.mobile_number and self.first_name and self.last_name, (
-            "Customer lookup did not return the mobile number and full name required for loan processing."
+        # lastName is optional: AUTO KYC (Aadhaar) customers with a single name have none.
+        assert self.mobile_number and self.first_name, (
+            "Customer lookup did not return the mobile number and first name required for loan processing."
         )
         if not self.customer_unique_id:
             await self._fetch_customer_unique_id()
@@ -1511,7 +1525,7 @@ class GoldLoanApiTest:
             "OVD verified": self.ovd_verified,
         }
         if self.ovd_verified and self.ovd_name:
-            details["Name on OVD"] = f"{self.ovd_name}  (customer: {self.first_name} {self.last_name})"
+            details["Name on OVD"] = f"{self.ovd_name}  (customer: {self.full_name})"
         self._print_summary_table("KYC VERIFICATION RESULT", details)
         for step, outcome, detail in self.kyc_verification_log:
             print(f"    {self._G['dot']} {step}: {outcome}" + (f" - {detail}" if detail else ""))
@@ -1581,8 +1595,7 @@ class GoldLoanApiTest:
         self.first_name = self.kyc_profile.get("firstName") or random_names['firstName']
         self.last_name = self.kyc_profile.get("lastName") or random_names['lastName']
         if self.kyc_uses_real_identity and self.kyc_profile.get("firstName"):
-            print(f"Using the identity profile's name for the new customer: "
-                  f"{self.first_name} {self.last_name}")
+            print(f"Using the identity profile's name for the new customer: {self.full_name}")
         self.random_pincode = self._generate_random_pincode()
         # Always mint a FRESH PAN for a new customer. A loaded session may have restored a PAN from a
         # prior run that is already registered on the server -> "PAN Card already exists!". Generating
@@ -2401,7 +2414,7 @@ class GoldLoanApiTest:
         # A verified document's own name is authoritative (CR-1: Aadhaar name overrides the LOS
         # name; CR-2: the OVD/PAN name drives reconciliation in the fallback paths).
         if not self.name_as_per_aadhaar:
-            self.name_as_per_aadhaar = self.ovd_name or f"{self.first_name} {self.last_name}"
+            self.name_as_per_aadhaar = self.ovd_name or self.full_name
 
         # The Aadhaar masking service needs a real Aadhaar *image* (not the dummy PDF); masking a
         # dummy PDF yields an invalid masked file that customer-kyc-address rejects with
@@ -2895,7 +2908,7 @@ class GoldLoanApiTest:
         request_body = {
             "id": None,
             "customerId": int(self.customer_id) if self.customer_id else None, # Convert to int
-            "customerName": f'{self.first_name} {self.last_name}',
+            "customerName": self.full_name,
             "customerUniqueId": self.customer_unique_id,
             "mobileNumber": self.mobile_number,
             "moduleId": int(self.module_id) if self.module_id else None, # Convert to int
@@ -3212,7 +3225,7 @@ class GoldLoanApiTest:
             "panImg": self.pan_image,
             "partReleaseId": None,
             "requestId": int(self.appraiser_request_id) if self.appraiser_request_id else None, # Convert to int
-            "customerName": f'{self.first_name} {self.last_name}',
+            "customerName": self.full_name,
             "form60Img": self.form60_image,
             "age": str(self.age),
             "branchName": "Augmont",
@@ -4260,11 +4273,16 @@ class GoldLoanApiTest:
         bank_branch_name = self.bank_branch_name or "SBI CAPITAL MARKET BRANCH, MUMBAI"
         account_holder_name = self.account_holder_name or "LIC MUTUAL FUND"
 
-        # Bank proof = cancelled cheque image (both proof slots use it).
-        passbook_proof_1 = (await self._upload_file(
-            "loan", file_type="image", file_path_override=self.CHEQUE_IMAGE_PATH))['uploadFile']['path']
-        passbook_proof_2 = (await self._upload_file(
-            "loan", file_type="image", file_path_override=self.CHEQUE_IMAGE_PATH))['uploadFile']['path']
+        if self._passbook_from_saved and self.passbook_proofs:
+            # A saved account keeps the proof already on file.
+            passbook_proofs = list(self.passbook_proofs)
+        else:
+            # Bank proof = cancelled cheque image (both proof slots use it).
+            passbook_proofs = [
+                (await self._upload_file(
+                    "loan", file_type="image", file_path_override=self.CHEQUE_IMAGE_PATH))['uploadFile']['path']
+                for _ in range(2)
+            ]
 
         # Persist disbursement bank details so validate-account and loan-documents can reuse them.
         self.bank_name = bank_name
@@ -4272,7 +4290,7 @@ class GoldLoanApiTest:
         self.bank_ifsc_code = ifsc_code
         self.account_holder_name = account_holder_name
         self.bank_branch_name = bank_branch_name
-        self.passbook_proofs = [passbook_proof_1, passbook_proof_2]
+        self.passbook_proofs = passbook_proofs
 
         # "To Be Paid" = final loan amount MINUS the scheme's processing charge and upfront interest.
         # The server rejects bank-details with "To Be Paid amount is incorrect" if this doesn't match
@@ -4296,13 +4314,14 @@ class GoldLoanApiTest:
             "accountNumber": account_number,
             "ifscCode": ifsc_code,
             "accountType": None,
-            "customerName": f"{self.first_name} {self.last_name}",
+            "customerName": self.full_name,
             "paymentMultiSelect": {"multiSelect": ["bank"]},
             "accountHolderName": account_holder_name,
             "bankBranchName": bank_branch_name,
-            "passbookProof": [passbook_proof_1, passbook_proof_2],
-            "passbookProofImage": [f"{self.BASE_URL}/{passbook_proof_1}", f"{self.BASE_URL}/{passbook_proof_2}"],
-            "passbookProofImageName": [os.path.basename(passbook_proof_1), os.path.basename(passbook_proof_2)],
+            "passbookProof": passbook_proofs,
+            "passbookProofImage": [p if p.startswith("http") else f"{self.BASE_URL}/{p}"
+                                   for p in passbook_proofs],
+            "passbookProofImageName": [os.path.basename(p) for p in passbook_proofs],
             "account": 1508,  # Example
             "detailsFor": "customer",
             "customerTransferBalance": 0,
@@ -4604,7 +4623,7 @@ class GoldLoanApiTest:
         api_path = "/api/loan-process/bank-verification-manual"
         request_body = {
             "accountNumber": self.bank_account_number or "00000036150491589",
-            "accountHolderName": self.account_holder_name or f"{self.first_name} {self.last_name}",
+            "accountHolderName": self.account_holder_name or self.full_name,
             "ifscCode": self.bank_ifsc_code or "SBIN0011777",
             "detailsFor": "customer",
             "customerId": int(self.customer_id) if self.customer_id else None,
@@ -5009,11 +5028,51 @@ class GoldLoanApiTest:
         api_path = f"/api/loan-process/bank-details?masterLoanId={self.master_loan_id}"
         try:
             response = await self._make_authenticated_request('GET', api_path)
-            print(f"Fetched bank details for master loan {self.master_loan_id}.")
-            return response.json()
         except httpx.HTTPStatusError as e:
             print(f"Fetch bank details failed (non-fatal): {e.response.status_code}")
             return {}
+        data = response.json()
+        body = data.get("data") if isinstance(data, dict) else None
+        details = body.get("bankDetails") if isinstance(body, dict) else None
+        saved = [self._normalize_saved_bank_account(d) for d in details or []
+                 if isinstance(d, dict) and d.get("accountNumber") and d.get("ifscCode")]
+        # Verified accounts first -- they are the likeliest to clear the penny-drop.
+        saved.sort(key=lambda a: not a["verified"])
+        # One entry per account number (a re-used account can appear once per loan).
+        unique = {}
+        for account in saved:
+            unique.setdefault(account["accountNumber"], account)
+        self.saved_bank_accounts = list(unique.values())
+        if self.saved_bank_accounts:
+            listed = ", ".join(f"{a['label']} ({a['ifscCode']}/{a['accountNumber']}"
+                               f"{', verified' if a['verified'] else ''})"
+                               for a in self.saved_bank_accounts)
+            print(self._c(f"Customer already has {len(self.saved_bank_accounts)} saved bank "
+                          f"account(s); using those: {listed}.", "green"))
+        else:
+            print(f"Fetched bank details for master loan {self.master_loan_id}: no saved accounts; "
+                  "a new account will be added from the reference list.")
+        return data
+
+    @staticmethod
+    def _normalize_saved_bank_account(detail: dict) -> dict:
+        """A saved bank-details row, in the shape _apply_bank_account expects."""
+        proofs = detail.get("passbookProof") or []
+        if isinstance(proofs, str):
+            proofs = [proofs]
+        status = str(detail.get("bankVerificationStatus") or "").lower()
+        return {
+            "label": f"saved {detail.get('bankName') or 'account'}",
+            "accountNumber": str(detail.get("accountNumber")),
+            "ifscCode": str(detail.get("ifscCode")),
+            "bankName": detail.get("bankName") or "",
+            "bankBranchName": detail.get("bankBranchName") or detail.get("branchName") or "",
+            "accountHolderName": detail.get("accountHolderName") or "",
+            "passbookProof": [p for p in proofs if p],
+            "verified": bool(detail.get("isVerified") or detail.get("isManuallyVerified")
+                             or status in ("verified", "approved")),
+            "saved": True,
+        }
 
     async def fetch_loan_stages(self) -> dict:
         api_path = "/api/loan-process/get-loan-stages"
@@ -5210,6 +5269,8 @@ class GoldLoanApiTest:
         number = str(number)
         self._bank_accounts_rejected.add(number)
         self._bank_rejection_reasons[number] = reason
+        if self._is_saved_bank_account(number):
+            return  # the customer's own account: an in-run flag only, not the shared file
         def mutate(env_block):
             env_block["rejected"][number] = {
                 "reason": reason[:200],
@@ -5227,10 +5288,15 @@ class GoldLoanApiTest:
         """Record the account that worked so the next run starts with it (one call, not twelve)."""
         number = str(number)
         self._bank_accounts_rejected.discard(number)
+        if self._is_saved_bank_account(number):
+            return
         def mutate(env_block):
             env_block["preferred"] = number
             env_block["rejected"].pop(number, None)
         self._write_bank_status(mutate)
+
+    def _is_saved_bank_account(self, number: str) -> bool:
+        return any(a["accountNumber"] == str(number) for a in self.saved_bank_accounts)
 
     def _load_bank_accounts(self) -> list:
         """The candidate customer payout accounts for the penny-drop, in the order to try them.
@@ -5271,6 +5337,12 @@ class GoldLoanApiTest:
             flagged in `_bank_accounts_rejected` and cost two calls each (the IFSC lookup plus
             the penny-drop itself) every time they are retried.
         """
+        if self.saved_bank_accounts:
+            # The customer's own accounts, and nothing else: a new account is only added for a
+            # customer who has none. The recorded LIC-account rejections do not apply to these.
+            keep = [a for a in self.saved_bank_accounts
+                    if a["accountNumber"] not in self._bank_accounts_rejected]
+            return keep or list(self.saved_bank_accounts[:1])
         if not self._bank_status_loaded:
             self._bank_status_loaded = True
             self._load_bank_status()
@@ -5306,6 +5378,13 @@ class GoldLoanApiTest:
         self.bank_account_number = str(account.get("accountNumber"))
         self.bank_ifsc_code = str(account.get("ifscCode"))
         self.bank_account_label = account.get("label") or self.bank_ifsc_code
+        if account.get("saved"):
+            self.account_holder_name = account.get("accountHolderName") or self.account_holder_name
+            self.bank_name = account.get("bankName") or self.bank_name
+            self.bank_branch_name = account.get("bankBranchName") or self.bank_branch_name
+            if account.get("passbookProof"):
+                self.passbook_proofs = list(account["passbookProof"])
+                self._passbook_from_saved = True
         self.account_holder_name = self.account_holder_name or "LIC MUTUAL FUND"
 
     async def validate_account(self):
@@ -5329,11 +5408,21 @@ class GoldLoanApiTest:
         """
         api_path = "/api/loan-process/validate-account"
         # Passbook proof is a cheque IMAGE (PNG), matching the real call; penny-drop verifies by
-        # account/IFSC, not the image. Upload it ONCE, not per candidate.
-        passbook = self.passbook_proofs or [
-            (await self._upload_file(
-                "loan", file_type="image", file_path_override=self.CHEQUE_IMAGE_PATH))['uploadFile']['path']
-        ]
+        # account/IFSC, not the image. Upload it ONCE, not per candidate, and only when needed:
+        # a saved account brings its own proof.
+        uploaded = None
+
+        async def passbook_for(account):
+            nonlocal uploaded
+            if account.get("saved") and account.get("passbookProof"):
+                return list(account["passbookProof"])
+            if self.passbook_proofs and not self._passbook_from_saved:
+                return self.passbook_proofs
+            if uploaded is None:
+                uploaded = [(await self._upload_file(
+                    "loan", file_type="image",
+                    file_path_override=self.CHEQUE_IMAGE_PATH))['uploadFile']['path']]
+            return uploaded
 
         if self._bank_penny_drop_unavailable and not self.bank_retry_all_accounts:
             # A full walk already rejected every account it tried. Re-walking costs two calls per
@@ -5372,14 +5461,16 @@ class GoldLoanApiTest:
                 self._flag_bank_account(self.bank_account_number, reason,
                                         karza_error.get("status"), definitive=True)
                 continue
+            passbook = await passbook_for(account)
             request_body = {
                 "ifscCode": self.bank_ifsc_code,
                 "accountNumber": self.bank_account_number,
-                "accountHolderName": self.account_holder_name or f"{self.first_name} {self.last_name}",
+                "accountHolderName": self.account_holder_name or self.full_name,
                 "bankName": self.bank_name or "STATE BANK OF INDIA",
                 "bankBranchName": self.bank_branch_name or "SBI CAPITAL MARKET BRANCH, MUMBAI",
                 "passbookProof": passbook,
-                "passbookProofImage": [f"{self.BASE_URL}/{p}" for p in passbook],
+                "passbookProofImage": [p if p.startswith("http") else f"{self.BASE_URL}/{p}"
+                                       for p in passbook],
                 "passbookProofImageName": [],
                 "detailsFor": "customer",
                 "detailsForId": int(self.customer_id) if self.customer_id else None,
@@ -5426,7 +5517,8 @@ class GoldLoanApiTest:
             return
 
         # Nothing worked at all: leave the fields on the first candidate so the rest of the flow
-        # has a consistent account, and let store_bank_details' ops fallback take over.
+        # has a consistent account, and let store_bank_details' ops fallback take over. For a
+        # customer with saved accounts that is still their own account -- no new one is added.
         self._apply_bank_account(candidates[0])
         self._bank_penny_drop_unavailable = True  # do not walk the list again this run
         self.bank_account_verified = False

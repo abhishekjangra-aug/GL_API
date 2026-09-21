@@ -221,6 +221,7 @@ All optional; sensible defaults are baked in. Common ones:
 |---------------------------------------|------------------------------------------------------------|
 | `GOLD_LOAN_ENV`                       | Target environment, `test` or `uat` (also settable via `--env`) |
 | `GOLD_LOAN_BASE_URL`                  | API base URL — overrides the environment's host            |
+| `GOLD_LOAN_ORIGIN`                    | `Origin` header — overrides the environment's web-app origin (`ap.gfat` / `ap.gfau`) |
 | `GOLD_LOAN_PARTNER_USER_MOBILE`       | Partner-branch user for submit-packet (overrides the environment's) |
 | `GOLD_LOAN_AUTH_TOKEN`                | Supply a JWT to skip login (must contain `internalBranchId`, `id`) |
 | `GOLD_LOAN_AMOUNT`                    | Requested loan amount (also settable via `--amount`)       |

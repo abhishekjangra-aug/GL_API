@@ -1295,6 +1295,93 @@ def _():
     ok("skipping it" in out, "and it said what it was doing")
     close(s)
 
+SAVED_ROWS = [
+    {"accountNumber": "111122223333", "ifscCode": "HDFC0000001", "bankName": "HDFC BANK",
+     "bankBranchName": "FORT", "accountHolderName": "RAMESH", "isVerified": False,
+     "passbookProof": ["public/uploads/loan/old-cheque.png"]},
+    {"accountNumber": "444455556666", "ifscCode": "ICIC0000002", "bankName": "ICICI BANK",
+     "bankBranchName": "ANDHERI", "accountHolderName": "RAMESH", "isManuallyVerified": True,
+     "passbookProof": "public/uploads/loan/verified-cheque.png"},
+]
+
+def _load_saved(s, rows):
+    """Run fetch_bank_details against a GET that answers with `rows`, then restore the stub."""
+    inner = s._make_authenticated_request
+
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        if method == "GET" and path.startswith("/api/loan-process/bank-details"):
+            return _json_response({"data": {"bankDetails": rows, "cashLimit": 1}})
+        return await inner(method, path, json_data=json_data, params=params,
+                           files=files, headers=headers)
+
+    s._make_authenticated_request = fake
+    _r, out = quiet(lambda: asyncio.run(s.fetch_bank_details()))
+    s._make_authenticated_request = inner
+    return out
+
+@test("bank: an existing customer's saved accounts are penny-dropped first, verified first")
+def _():
+    s = _bank_suite()
+    state = _accounts_stub(s, {"444455556666": {"data": {"bankTxnStatus": True}}})
+    out = _load_saved(s, SAVED_ROWS + [dict(SAVED_ROWS[0])])  # duplicate row collapses
+    eq([a["accountNumber"] for a in s.saved_bank_accounts], ["444455556666", "111122223333"],
+       "verified saved account ranked first, duplicates dropped")
+    ok("saved bank account" in out, "said it found saved accounts")
+    quiet(lambda: asyncio.run(s.validate_account()))
+    eq(state["tried"], ["444455556666"], "only the customer's own account was tried")
+    eq(s.account_holder_name, "RAMESH", "holder name comes from the saved account")
+    eq(s.passbook_proofs, ["public/uploads/loan/verified-cheque.png"], "and its passbook proof")
+    close(s)
+
+@test("bank: saved accounts that all fail are still used -- no new account is added")
+def _():
+    path = _status_file()
+    s = _bank_suite(GOLD_LOAN_BANK_STATUS_FILE=path)
+    state = _accounts_stub(s, {})  # every penny-drop 400s
+    _load_saved(s, SAVED_ROWS)
+    quiet(lambda: asyncio.run(s.validate_account()))
+    eq(sorted(state["tried"]), ["111122223333", "444455556666"], "never walked the LIC list")
+    eq(s.bank_account_number, "444455556666", "stayed on the customer's first saved account")
+    eq(s.bank_for_ops_approval, True, "left for the ops manual verification")
+    ok(not os.path.exists(path) or not _read_status(path)["environments"][s.env_name]["rejected"],
+       "the customer's own accounts are not written to the shared rejection file")
+    close(s)
+
+@test("bank: store_bank_details reuses a saved account's passbook proof")
+def _():
+    s = _bank_suite()
+    uploads = []
+    async def counting_upload(*a, **kw):
+        uploads.append(1)
+        return {"uploadFile": {"path": "uploads/cheque.png"}}
+    s._upload_file = counting_upload
+    _accounts_stub(s, {"444455556666": {"data": {"bankTxnStatus": True}}})
+    _load_saved(s, SAVED_ROWS)
+    quiet(lambda: asyncio.run(s.validate_account()))
+    state = _bank_stub(s)
+    state["ops_calls"] = 1
+    quiet(lambda: asyncio.run(s.store_bank_details()))
+    body = state["bodies"][0]
+    eq(uploads, [], "no new cheque upload")
+    eq(body["accountNumber"], "444455556666", "the saved account is sent")
+    eq(body["accountHolderName"], "RAMESH", "with its holder name")
+    eq(body["passbookProof"], ["public/uploads/loan/verified-cheque.png"], "and its proof")
+    eq(body["passbookProofImage"], [f"{s.BASE_URL}/public/uploads/loan/verified-cheque.png"],
+       "as a full URL")
+    close(s)
+
+@test("bank: a customer with no saved accounts gets a new one from the reference list")
+def _():
+    s = _bank_suite()
+    first = s._load_bank_accounts()[0]["accountNumber"]
+    state = _accounts_stub(s, {first: {"data": {"bankTxnStatus": True}}})
+    out = _load_saved(s, [])
+    eq(s.saved_bank_accounts, [], "nothing saved")
+    ok("new account will be added" in out, "said a new account is being added")
+    quiet(lambda: asyncio.run(s.validate_account()))
+    eq(state["tried"], [first], "walked the reference list")
+    close(s)
+
 @test("bank: GOLD_LOAN_BANK_RETRY_ALL re-tries the flagged accounts")
 def _():
     s = _bank_suite(GOLD_LOAN_BANK_RETRY_ALL="true")
