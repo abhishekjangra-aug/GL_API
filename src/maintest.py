@@ -4636,7 +4636,19 @@ class GoldLoanApiTest:
             print(f"BM rating skipped: loan amount {amount:.2f} < {self.BM_RATING_THRESHOLD} threshold.")
             return
         print(f"BM rating required: loan amount {amount:.2f} >= {self.BM_RATING_THRESHOLD} threshold.")
-        await self._submit_bm_rating()
+        try:
+            await self._submit_bm_rating()
+        except httpx.HTTPStatusError as e:
+            # The amount rule is only our guess at the server's: an exactly-5L ARVOG loan on UAT went
+            # straight to "upload documents" and bm-rating then 400'd "Loan Stage has been changed to:
+            # upload documents". A stage other than "bm rating" means the server is NOT waiting on a
+            # BM rating, so skip it. If it does want one later, loan-documents / ops-rating get "bm
+            # rating" back and _settle_pending_stage submits it then.
+            stage = self._stage_changed_to(e.response.text or "") if e.response.status_code == 400 else ""
+            if not stage or stage == "bm rating":
+                raise
+            print(self._c(f"BM rating not needed: the server already moved the loan to '{stage}' "
+                          "(no BM approval stage for this loan). Continuing.", "yellow"))
 
     async def _submit_bm_rating(self) -> None:
         """Post the BM rating under the BM's own login, then restore the appraiser session."""
