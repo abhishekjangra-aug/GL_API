@@ -304,6 +304,12 @@ class GoldLoanApiTest:
         self.interest_rate = 0
         self.secured_processing_charge = 0
         self.upfront_interest_amount = 0
+        # Stamp duty charged by the (Augmont) branch, deducted from bank-details' toBePaid. Default
+        # 1500 (GOLD_LOAN_STAMP_DUTY overrides); a positive stampDutyCharges in the final-loan-details
+        # response replaces it, along with the server's stampDutyDefinitionType.
+        self.stamp_duty_charges = float(os.getenv("GOLD_LOAN_STAMP_DUTY", "1500"))
+        self.stamp_duty_definition_type = None
+        self.stamp_duty_from_server = False  # True once a server payload stated it (ARVOG needs this)
         self.secured_exposure = "0"
         self.secured_rebate_interest = 0
         self.loan_start_date = ""
@@ -4209,6 +4215,7 @@ class GoldLoanApiTest:
                 json_data=request_body
             )
             print('Get final loan details successful.')
+            self._capture_stamp_duty(response)
             return
         except httpx.HTTPStatusError as e:
             body = e.response.text if e.response is not None else ""
@@ -4250,6 +4257,60 @@ class GoldLoanApiTest:
             "'single_loan_on_mismatch' in loan_calc_debug.json for the server's stored ornaments."
         )
 
+    def _is_arvog_loan(self) -> bool:
+        return self._partner_key() == self.ARVOG_PARTNER_ID
+
+    def _capture_stamp_duty(self, response):
+        """Adopt final-loan-details' stampDutyCharges when the server reports a positive one;
+        otherwise keep the configured default (1500 / GOLD_LOAN_STAMP_DUTY). For an ARVOG loan the
+        server's figure is adopted whatever it is (0 included) -- see _ensure_stamp_duty."""
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
+        self._adopt_server_stamp_duty(data if isinstance(data, dict) else {}, "final-loan-details")
+
+    def _adopt_server_stamp_duty(self, data: dict, source: str) -> bool:
+        """Take stampDutyCharges (+ definition type) from a server payload. Returns True when the
+        server's figure was adopted. Non-Arvog loans only adopt a positive figure, keeping the
+        configured default otherwise; Arvog loans adopt any figure the server states."""
+        raw = data.get('stampDutyCharges')
+        try:
+            server_duty = float(raw) if raw not in (None, "") else None
+        except (TypeError, ValueError):
+            server_duty = None
+        arvog = self._is_arvog_loan()
+        adopt = server_duty is not None and (arvog or server_duty > 0)
+        if adopt:
+            self.stamp_duty_charges = server_duty
+            self.stamp_duty_definition_type = data.get('stampDutyDefinitionType')
+            self.stamp_duty_from_server = True
+        print(f"  -> stamp duty: {self.stamp_duty_charges} "
+              f"({'from ' + source if adopt else 'configured default'}"
+              f"{', ARVOG' if arvog else ''})")
+        return adopt
+
+    async def _ensure_stamp_duty(self):
+        """ARVOG loans must carry the SERVER's stamp duty into bank-details, never the default.
+        If final-loan-details did not state one, read it from single-loan (data.stampDutyCharges).
+        If the server still gives none, stop here rather than send a guessed toBePaid -- unless
+        GOLD_LOAN_STAMP_DUTY was set explicitly, which is then taken as a deliberate override."""
+        if not self._is_arvog_loan() or self.stamp_duty_from_server:
+            return
+        print("ARVOG loan: fetching stamp duty from single-loan before bank details.")
+        payload = await self.fetch_single_loan()
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if isinstance(data, dict) and self._adopt_server_stamp_duty(data, "single-loan"):
+            return
+        if os.getenv("GOLD_LOAN_STAMP_DUTY"):
+            print(f"  -> server gave no stamp duty; using GOLD_LOAN_STAMP_DUTY={self.stamp_duty_charges}.")
+            return
+        raise RuntimeError(
+            f"ARVOG loan {self.loan_id}: neither final-loan-details nor single-loan returned "
+            "stampDutyCharges, so bank-details' toBePaid cannot be computed. Set "
+            "GOLD_LOAN_STAMP_DUTY to the branch's stamp duty to proceed."
+        )
+
     def _dump_loan_calc_diagnostics(self):
         debug_path = os.path.join(os.getcwd(), "loan_calc_debug.json")
         try:
@@ -4264,6 +4325,8 @@ class GoldLoanApiTest:
 
     async def store_bank_details(self):
         api_path = "/api/loan-process/bank-details"
+        # ARVOG: the server's stamp duty must be known before toBePaid is computed below.
+        await self._ensure_stamp_duty()
         # Use whatever account validate_account settled on (it walks reference/bank_accounts.json
         # until the penny-drop accepts one). The hard-coded SBI account is only the fallback for
         # when validate_account never ran or every candidate failed.
@@ -4292,10 +4355,11 @@ class GoldLoanApiTest:
         self.bank_branch_name = bank_branch_name
         self.passbook_proofs = passbook_proofs
 
-        # "To Be Paid" = final loan amount MINUS the scheme's processing charge and upfront interest.
-        # The server rejects bank-details with "To Be Paid amount is incorrect" if this doesn't match
-        # its own computation. processingCharge/upfrontInterestAmount are captured from check-loan-type
-        # (data.securedprocessingCharge / upfrontInterestAmount), e.g. proc = max(fixed, percent%).
+        # "To Be Paid" = final loan amount MINUS the scheme's processing charge, upfront interest and
+        # the branch's stamp duty. The server rejects bank-details with "To Be Paid amount is
+        # incorrect" if this doesn't match its own computation. processingCharge/upfrontInterestAmount
+        # are captured from check-loan-type (data.securedprocessingCharge / upfrontInterestAmount),
+        # e.g. proc = max(fixed, percent%); stamp duty comes from _capture_stamp_duty.
         try:
             proc_charge = float(self.secured_processing_charge or 0)
         except (TypeError, ValueError):
@@ -4304,8 +4368,12 @@ class GoldLoanApiTest:
             upfront_interest = float(self.upfront_interest_amount or 0)
         except (TypeError, ValueError):
             upfront_interest = 0.0
+        try:
+            stamp_duty = float(self.stamp_duty_charges or 0)
+        except (TypeError, ValueError):
+            stamp_duty = 0.0
         final_amt = float(self.final_loan_amount or 0)
-        to_be_paid = self._round_double(final_amt - proc_charge - upfront_interest, 2)
+        to_be_paid = self._round_double(final_amt - proc_charge - upfront_interest - stamp_duty, 2)
 
         request_body = {
             "paymentType": ["bank"],
@@ -4336,7 +4404,7 @@ class GoldLoanApiTest:
             "advanceCashDeclarationId": [],
             "bTMoney": 0,
             "actualProcessingCharge": proc_charge,
-            "toBePaid": to_be_paid,  # finalLoanAmount - processingCharge - upfrontInterest
+            "toBePaid": to_be_paid,  # finalLoanAmount - processingCharge - upfrontInterest - stampDuty
             "remark": None,
             "upfrontInterestAmount": upfront_interest,
             "upfrontTransactionId": None,
@@ -4373,8 +4441,8 @@ class GoldLoanApiTest:
             "actualCashGiven": 0,
             "availableLimitForDisbuserment": to_be_paid,
             "wavierAppraiserCharges": 0,
-            "stampDutyCharges": 0,
-            "stampDutyDefinitionType": None,
+            "stampDutyCharges": stamp_duty,
+            "stampDutyDefinitionType": self.stamp_duty_definition_type,
             "stampDutyRemarks": "",
             "totalLimitForCashDisbursal": 200000,  # Example
             "multiModeDisbursement": True,
@@ -5818,7 +5886,8 @@ class GoldLoanApiTest:
             "advancedCashReceiptImage": None, "advanceCashDeclarationImage": None,
             "receiptNumber": None, "appraiserCharges": 0,
             "actualProcessingCharge": first_interest,
-            "actualCashGiven": 0, "stampDutyCharges": "0.00", "stampDutyRemarks": "",
+            "actualCashGiven": 0, "stampDutyRemarks": "",
+            "stampDutyCharges": detail.get("stampDutyCharges") or f"{float(self.stamp_duty_charges or 0):.2f}",
             "paymentGatewayId": 5,  # env constant from HAR (Roshan partner gateway)
             "partnerId": int(self.partner_id) if self.partner_id and str(self.partner_id).isdigit() else 152,
             "loanType": "Fresh Loan",
@@ -6133,6 +6202,10 @@ class GoldLoanApiTest:
                 setattr(self, field, type(current)())
             else:
                 setattr(self, field, "")
+        # Stamp duty goes back to the configured default, not 0 -- the next loan still pays it.
+        self.stamp_duty_charges = float(os.getenv("GOLD_LOAN_STAMP_DUTY", "1500"))
+        self.stamp_duty_definition_type = None
+        self.stamp_duty_from_server = False
         # Containers
         self.customer_details = {}
         self.selected_scheme = {}
