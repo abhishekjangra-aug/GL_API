@@ -1,0 +1,2787 @@
+{
+  "info": {
+    "_postman_id": "b830020e-c512-4de3-9fdd-615ef888537c",
+    "name": "gold-loan-backend-api API — 2026-07-01",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{AUTH_TOKEN}}",
+        "type": "string"
+      }
+    ]
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "pm.collectionVariables.set(\"REQUEST_TIMESTAMP\", new Date().toISOString());"
+        ]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "Create/submit user send otp for user otp",
+      "description": "Create/submit user send otp for user otp — auto-generated from HAR",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{BASE_URL}}/api/user-otp/user-send-otp",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "user-otp",
+            "user-send-otp"
+          ]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\"mobileNumber\":\"9990009991\",\"type\":\"login\",\"id\":null}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create/submit verify login for auth",
+      "description": "Create/submit verify login for auth — auto-generated from HAR",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{BASE_URL}}/api/auth/verify-login",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "auth",
+            "verify-login"
+          ]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\"referenceCode\":\"khIf3\",\"otp\":1234,\"type\":\"login\",\"isFromWeb\":true}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch global setting",
+      "description": "Fetch global setting — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/global-setting",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "global-setting"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch gold rate",
+      "description": "Fetch gold rate — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/gold-rate",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "gold-rate"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch get my branches for user",
+      "description": "Fetch get my branches for user — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/user/get-my-branches",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "user",
+            "get-my-branches"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch status",
+      "description": "Fetch status — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/status",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "status"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch modules",
+      "description": "Fetch modules — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/modules",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "modules"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch customer",
+      "description": "Fetch customer — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/customer?viewAllCustomer=false&from=1&to=25",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "customer"
+          ],
+          "query": [
+            {
+              "key": "viewAllCustomer",
+              "value": "false"
+            },
+            {
+              "key": "from",
+              "value": "1"
+            },
+            {
+              "key": "to",
+              "value": "25"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch appraiser request module for modules",
+      "description": "Fetch appraiser request module for modules — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/modules/appraiser-request-module?isFor=request",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "modules",
+            "appraiser-request-module"
+          ],
+          "query": [
+            {
+              "key": "isFor",
+              "value": "request"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch get my branches for user",
+      "description": "Fetch get my branches for user — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/user/get-my-branches",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "user",
+            "get-my-branches"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch appraiser list for user",
+      "description": "Fetch appraiser list for user — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/user/appraiser-list?internalBranchId=1",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "user",
+            "appraiser-list"
+          ],
+          "query": [
+            {
+              "key": "internalBranchId",
+              "value": "1"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create/submit appraiser request",
+      "description": "Create/submit appraiser request — auto-generated from HAR",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{BASE_URL}}/api/appraiser-request",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "appraiser-request"
+          ]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\"id\":null,\"customerId\":12223,\"customerName\":\"Abhishek \",\"customerUniqueId\":\"MPV3Z7LR\",\"mobileNumber\":\"9468001290\",\"moduleId\":1,\"internalBranchId\":1,\"appraiserId\":3179,\"loanType\":\"Fresh Loan\",\"trackProccesingTime\":true}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch view all for appraiser request",
+      "description": "Fetch view all for appraiser request — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/appraiser-request/view-all?from=1&to=25&origin=leads",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "appraiser-request",
+            "view-all"
+          ],
+          "query": [
+            {
+              "key": "from",
+              "value": "1"
+            },
+            {
+              "key": "to",
+              "value": "25"
+            },
+            {
+              "key": "origin",
+              "value": "leads"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create/submit  for appraiser request",
+      "description": "Create/submit  for appraiser request — auto-generated from HAR",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{BASE_URL}}/api/appraiser-request/track-loan-history",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "appraiser-request",
+            "track-loan-history"
+          ]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\"appraiserRequestId\":12174,\"action\":3}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch 12223 for loan process",
+      "description": "Fetch 12223 for loan process — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/loan-process/max-loan-limit/12223?loanType=Fresh Loan",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "loan-process",
+            "max-loan-limit",
+            "12223"
+          ],
+          "query": [
+            {
+              "key": "loanType",
+              "value": "Fresh Loan"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch annual income",
+      "description": "Fetch annual income — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/annual-income",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "annual-income"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch qualification",
+      "description": "Fetch qualification — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/qualification",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "qualification"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch list for occupation",
+      "description": "Fetch list for occupation — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/occupation/list",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "occupation",
+            "list"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch purpose",
+      "description": "Fetch purpose — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/purpose?search=&from=1&to=-1",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "purpose"
+          ],
+          "query": [
+            {
+              "key": "search",
+              "value": ""
+            },
+            {
+              "key": "from",
+              "value": "1"
+            },
+            {
+              "key": "to",
+              "value": "-1"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch religion",
+      "description": "Fetch religion — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/religion",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "religion"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch physical challenge",
+      "description": "Fetch physical challenge — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/physical-challenge",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "physical-challenge"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch political exposed",
+      "description": "Fetch political exposed — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/political-exposed",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "political-exposed"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch special category",
+      "description": "Fetch special category — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/special-category",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "special-category"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch ornament type",
+      "description": "Fetch ornament type — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/ornament-type?from=1&to=-1&search=",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "ornament-type"
+          ],
+          "query": [
+            {
+              "key": "from",
+              "value": "1"
+            },
+            {
+              "key": "to",
+              "value": "-1"
+            },
+            {
+              "key": "search",
+              "value": ""
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch list for nominee relation",
+      "description": "Fetch list for nominee relation — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/nominee-relation/list",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "nominee-relation",
+            "list"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch karat details",
+      "description": "Fetch karat details — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/karat-details",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "karat-details"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch 12174 for loan process",
+      "description": "Fetch 12174 for loan process — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/loan-process/customer-loan-details/12174",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "loan-process",
+            "customer-loan-details",
+            "12174"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create/submit basic details for loan process",
+      "description": "Create/submit basic details for loan process — auto-generated from HAR",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{BASE_URL}}/api/loan-process/basic-details",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "loan-process",
+            "basic-details"
+          ]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\"customerUniqueId\":\"MPV3Z7LR\",\"mobileNumber\":\"9468001290\",\"panCardNumber\":\"BXDPA4371D\",\"startDate\":\"2026-07-01T09:20:18.317Z\",\"customerId\":12223,\"kycStatus\":\"approved\",\"purpose\":\"Property Booking (personal)\",\"panType\":\"pan\",\"loanId\":null,\"scrapId\":null,\"masterLoanId\":null,\"panImg\":\"https://gold-loan-uat-new-org.s3.ap-south-1.amazonaws.com/public/uploads/lead/1780312322568.png\",\"partReleaseId\":null,\"requestId\":\"12174\",\"customerName\":\"Abhishek \",\"form60Img\":null,\"age\":\"29\",\"branchName\":\"Augmont\",\"branchDistance\":null,\"gender\":\"m\",\"appraiserName\":\"Abhi userAppraiser\",\"tillDateOutstanding\":\"3122296.67\",\"appraiserMobileNumber\":\"9990009991\",\"currentActiveLoans\":2,\"cpvImageFullUrl\":\"https://gold-loan-uat-new-org.s3.ap-south-1.amazonaws.com/public/uploads/btApplication/12223/1781934908263.pdf\",\"annualIncome\":\"10 to 12 Lakh\",\"motherName\":\"Suman\",\"religionId\":4,\"physicalChallengeId\":1,\"occupationId\":23,\"signatureProof\":\"public/uploads/customer/12223/1780312477084.png\",\"signatureProofImg\":\"https://gold-loan-uat-new-org.s3.ap-south-1.amazonaws.com/public/uploads/customer/12223/1780312477084.png\",\"signatureProofFileName\":\"1780312477084.png\",\"referenceCustomerNumber\":null,\"qualificationId\":5,\"politicalExposedId\":1,\"specialCategoryId\":15,\"incomeGeneratingDocuments\":null,\"purposeType\":\"Consumption Based\",\"checkPointers\":{}}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch rating reason",
+      "description": "Fetch rating reason — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/rating-reason?from=1&to=-1",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "rating-reason"
+          ],
+          "query": [
+            {
+              "key": "from",
+              "value": "1"
+            },
+            {
+              "key": "to",
+              "value": "-1"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create/submit nominee details for loan process",
+      "description": "Create/submit nominee details for loan process — auto-generated from HAR",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{BASE_URL}}/api/loan-process/nominee-details",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "loan-process",
+            "nominee-details"
+          ]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\"nomineeName\":\"test\",\"nomineeAge\":33,\"relationship\":\"brother\",\"mobileNumber\":\"9777237423\",\"referenceCode\":null,\"nomineeType\":\"major\",\"guardianName\":\"\",\"guardianAge\":0,\"guardianRelationship\":\"\",\"checkPointers\":{},\"loanId\":10930,\"masterLoanId\":9557,\"loanType\":\"Fresh Loan\",\"createdBy\":3179,\"internalBranchId\":1}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create/submit upload file",
+      "description": "Create/submit upload file — auto-generated from HAR",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "content-type",
+            "value": "multipart/form-data; boundary=----WebKitFormBoundaryUQutc5CD56Uvi6ul"
+          }
+        ],
+        "url": {
+          "raw": "{{BASE_URL}}/api/upload-file?reason=loan&loanId=9557",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "upload-file"
+          ],
+          "query": [
+            {
+              "key": "reason",
+              "value": "loan"
+            },
+            {
+              "key": "loanId",
+              "value": "9557"
+            }
+          ]
+        },
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "avatar",
+              "value": "(binary)",
+              "type": "text"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create/submit ornaments details for loan process",
+      "description": "Create/submit ornaments details for loan process — auto-generated from HAR",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{BASE_URL}}/api/loan-process/ornaments-details",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "loan-process",
+            "ornaments-details"
+          ]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\"loanOrnaments\":[{\"ornamentType\":{\"id\":1,\"name\":\"Chain\",\"isActive\":true,\"createdAt\":\"2020-07-07T09:19:21.455Z\",\"updatedAt\":\"2020-07-07T09:19:21.455Z\"},\"ornamentTypeId\":1,\"quantity\":\"11\",\"grossWeight\":\"111\",\"netWeight\":\"110.00\",\"deductionWeight\":\"1\",\"ornamentImage\":\"public/uploads/loan/9557/1782897624720.jpeg\",\"weightMachineZeroWeight\":null,\"withOrnamentWeight\":null,\"stoneTouch\":null,\"acidTest\":null,\"karat\":\"22 K HM\",\"ltvRange\":[95,96,97,98,99,100],\"purityTest\":[],\"ltvPercent\":\"97\",\"ltvAmount\":null,\"loanAmount\":null,\"id\":null,\"currentLtvAmount\":7350,\"ornamentImageData\":\"https://gold-loan-uat-new-org.s3.ap-south-1.amazonaws.com/public/uploads/loan/9557/1782897624720.jpeg\",\"weightMachineZeroWeightData\":null,\"withOrnamentWeightData\":null,\"stoneTouchData\":null,\"acidTestData\":null,\"purityTestImage\":[],\"ornamentFullAmount\":null,\"currentGoldRate\":9800,\"ornamentImageWithWeight\":null,\"ornamentImageWithWeightData\":null,\"ornamentImageWithXrfMachineReading\":null,\"ornamentImageWithXrfMachineReadingData\":null,\"approxPurityReading\":null,\"scrapAmount\":null,\"purityReading\":null,\"customerConfirmation\":null,\"finalScrapAmountAfterMelting\":null,\"processingCharges\":null,\"packetId\":null,\"netWtAfterPurity\":106.7,\"remark\":null,\"isReleased\":null},{\"ornamentType\":{\"id\":3,\"name\":\"Rings\",\"isActive\":true,\"createdAt\":\"2020-07-07T09:19:21.455Z\",\"updatedAt\":\"2020-07-07T09:19:21.455Z\"},\"ornamentTypeId\":3,\"quantity\":\"11\",\"grossWeight\":\"112\",\"netWeight\":\"110.00\",\"deductionWeight\":\"2\",\"ornamentImage\":\"public/uploads/loan/9557/1782897638806.jpeg\",\"weightMachineZeroWeight\":null,\"withOrnamentWeight\":null,\"stoneTouch\":null,\"acidTest\":null,\"karat\":\"22 K HM\",\"ltvRange\":[95,96,97,98,99,100],\"purityTest\":[],\"ltvPercent\":\"98\",\"ltvAmount\":null,\"loanAmount\":null,\"id\":null,\"currentLtvAmount\":7350,\"ornamentImageData\":\"https://gold-loan-uat-new-org.s3.ap-south-1.amazonaws.com/public/uploads/loan/9557/1782897638806.jpeg\",\"weightMachineZeroWeightData\":null,\"withOrnamentWeightData\":null,\"stoneTouchData\":null,\"acidTestData\":null,\"purityTestImage\":[],\"ornamentFullAmount\":null,\"currentGoldRate\":9800,\"ornamentImageWithWeight\":null,\"ornamentImageWithWeightData\":null,\"ornamentImageWithXrfMachineReading\":null,\"ornamentImageWithXrfMachineReadingData\":null,\"approxPurityReading\":null,\"scrapAmount\":null,\"purityReading\":null,\"customerConfirmation\":null,\"finalScrapAmountAfterMelting\":null,\"processingCharges\":null,\"packetId\":null,\"netWtAfterPurity\":107.8,\"remark\":null,\"isReleased\":null}],\"totalEligibleAmt\":0,\"loanId\":10930,\"masterLoanId\":9557,\"fullAmount\":0,\"checkPointers\":{}}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch 1 for scheme",
+      "description": "Fetch 1 for scheme — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/scheme/partner-scheme-amount/1?masterLoanId=9557",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "scheme",
+            "partner-scheme-amount",
+            "1"
+          ],
+          "query": [
+            {
+              "key": "masterLoanId",
+              "value": "9557"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch get balance for loan process",
+      "description": "Fetch get balance for loan process — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/loan-process/get-balance?appraiserRequestId=12174",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "loan-process",
+            "get-balance"
+          ],
+          "query": [
+            {
+              "key": "appraiserRequestId",
+              "value": "12174"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch co lender bank",
+      "description": "Fetch co lender bank — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/co-lender-bank",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "co-lender-bank"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create/submit check loan type for loan process",
+      "description": "Create/submit check loan type for loan process — auto-generated from HAR",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{BASE_URL}}/api/loan-process/check-loan-type",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "loan-process",
+            "check-loan-type"
+          ]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\"loanAmount\":400000,\"securedSchemeId\":\"533\",\"fullAmount\":0,\"partnerId\":\"89\",\"isLoanTransfer\":false,\"isNewLoanFromPartRelease\":false,\"unsecuredSchemeId\":null,\"isUnsecuredSchemeApplied\":false,\"loanTransferExtraAmount\":null,\"isNewLoanFromRenew\":false,\"loanId\":10930,\"masterLoanId\":9557,\"loanType\":\"Fresh Loan\",\"createdBy\":3179,\"internalBranchId\":1,\"coLenderBankId\":null}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create/submit generate interest table for loan process",
+      "description": "Create/submit generate interest table for loan process — auto-generated from HAR",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{BASE_URL}}/api/loan-process/generate-interest-table",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "loan-process",
+            "generate-interest-table"
+          ]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\"partnerId\":\"89\",\"coLenderBankId\":null,\"schemeId\":\"533\",\"finalLoanAmount\":400000,\"tenure\":4,\"loanStartDate\":\"2026-07-01\",\"loanEndDate\":\"2026-10-28\",\"paymentFrequency\":\"30 Days\",\"totalFinalInterestAmt\":null,\"unsecuredInterestRate\":null,\"interestRate\":1.2,\"processingCharge\":0,\"unsecuredSchemeId\":null,\"securedLoanAmount\":400000,\"unsecuredLoanAmount\":null,\"isUnsecuredSchemeApplied\":false,\"unsecuredRebateInterest\":null,\"securedRebateInterest\":null,\"otherAmount\":null,\"loanTransferExtraAmount\":null,\"upfrontInterestAmount\":0,\"topUpAmount\":0,\"securedTopUpAmount\":0,\"unsecuredTopUpAmount\":0,\"manualCharges\":[],\"unsecuredRpg\":null,\"securedRpg\":4480,\"unsecuredPartnerId\":null,\"unsecuredprocessingCharge\":0,\"securedprocessingCharge\":0,\"securedExposure\":\"0.13\"}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create/submit final loan details for loan process",
+      "description": "Create/submit final loan details for loan process — auto-generated from HAR",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{BASE_URL}}/api/loan-process/final-loan-details",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "loan-process",
+            "final-loan-details"
+          ]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\"manualCharges\":[],\"loanFinalCalculator\":{\"partnerId\":\"89\",\"coLenderBankId\":null,\"schemeId\":\"533\",\"finalLoanAmount\":400000,\"tenure\":4,\"loanStartDate\":\"2026-07-01\",\"loanEndDate\":\"2026-10-28\",\"paymentFrequency\":\"30 Days\",\"totalFinalInterestAmt\":19200,\"unsecuredInterestRate\":null,\"interestRate\":1.2,\"processingCharge\":0,\"unsecuredSchemeId\":null,\"securedLoanAmount\":400000,\"unsecuredLoanAmount\":null,\"isUnsecuredSchemeApplied\":false,\"unsecuredRebateInterest\":0,\"securedRebateInterest\":1.7,\"otherAmount\":null,\"loanTransferExtraAmount\":null,\"upfrontInterestAmount\":0,\"topUpAmount\":0,\"securedTopUpAmount\":0,\"unsecuredTopUpAmount\":0,\"manualCharges\":[],\"unsecuredRpg\":null,\"securedRpg\":4480,\"unsecuredPartnerId\":null,\"unsecuredprocessingCharge\":0,\"securedprocessingCharge\":0,\"securedExposure\":\"0.13\"},\"interestTable\":[{\"emiStartDate\":\"2026-07-01\",\"emiDueDate\":\"2026-07-30\",\"emiEndDate\":\"2026-07-30\",\"noOfDays\":30,\"month\":\"Month 1\",\"securedInterestAmount\":\"4800.00\",\"secureHighestInterestAmount\":\"6800.00\",\"unsecuredInterestAmount\":0,\"unsecureHighestInterestAmount\":0,\"securedRebateAmount\":2000,\"unsecuredRebateAmount\":0,\"totalAmount\":4800},{\"emiStartDate\":\"2026-07-31\",\"emiDueDate\":\"2026-08-29\",\"emiEndDate\":\"2026-08-29\",\"noOfDays\":30,\"month\":\"Month 2\",\"securedInterestAmount\":\"4800.00\",\"secureHighestInterestAmount\":\"6800.00\",\"unsecuredInterestAmount\":0,\"unsecureHighestInterestAmount\":0,\"securedRebateAmount\":2000,\"unsecuredRebateAmount\":0,\"totalAmount\":4800},{\"emiStartDate\":\"2026-08-30\",\"emiDueDate\":\"2026-09-28\",\"emiEndDate\":\"2026-09-28\",\"noOfDays\":30,\"month\":\"Month 3\",\"securedInterestAmount\":\"4800.00\",\"secureHighestInterestAmount\":\"6800.00\",\"unsecuredInterestAmount\":0,\"unsecureHighestInterestAmount\":0,\"securedRebateAmount\":2000,\"unsecuredRebateAmount\":0,\"totalAmount\":4800},{\"emiStartDate\":\"2026-09-29\",\"emiDueDate\":\"2026-10-28\",\"emiEndDate\":\"2026-10-28\",\"noOfDays\":30,\"month\":\"Month 4\",\"securedInterestAmount\":\"4800.00\",\"secureHighestInterestAmount\":\"6800.00\",\"unsecuredInterestAmount\":0,\"unsecureHighestInterestAmount\":0,\"securedRebateAmount\":2000,\"unsecuredRebateAmount\":0,\"totalAmount\":4800}],\"loanId\":10930,\"masterLoanId\":9557,\"ornaments\":[{\"id\":19024,\"loanAmount\":478016,\"ornamentsCal\":106.7,\"rpg\":4480},{\"id\":19025,\"loanAmount\":482944,\"ornamentsCal\":107.8,\"rpg\":4480}],\"totalEligibleAmt\":960960,\"checkPointers\":{}}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch bank details for loan process",
+      "description": "Fetch bank details for loan process — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/loan-process/bank-details?masterLoanId=9557",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "loan-process",
+            "bank-details"
+          ],
+          "query": [
+            {
+              "key": "masterLoanId",
+              "value": "9557"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create/submit bank details for loan process",
+      "description": "Create/submit bank details for loan process — auto-generated from HAR",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{BASE_URL}}/api/loan-process/bank-details",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "loan-process",
+            "bank-details"
+          ]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\"paymentType\":[\"bank\"],\"finalScrapAmount\":null,\"bankName\":\"STATE BANK OF INDIA\",\"accountNumber\":\"00000036150491589\",\"ifscCode\":\"SBIN0011777\",\"accountType\":null,\"customerName\":\"Abhishek \",\"paymentMultiSelect\":{\"multiSelect\":[\"bank\"]},\"accountHolderName\":\"LIC MUTUAL FUND\",\"bankBranchName\":\"SBI CAPITAL MARKET BRANCH, MUMBAI\",\"passbookProof\":[\"public/uploads/images/1782811478866.jpeg\",\"public/uploads/images/1782811479025.jpeg\"],\"passbookProofImage\":[],\"passbookProofImageName\":[],\"account\":1508,\"detailsFor\":\"customer\",\"customerTransferBalance\":0,\"internalBranchTransferBalance\":17882793.96,\"internalBranchBlockedBalance\":11916017.72,\"advanceBankTransfer\":0,\"advanceBankTransactionId\":null,\"advanceCash\":0,\"advanceCashTransactionId\":[],\"advanceCashTransactionImage\":[],\"advanceCashTransactionImageName\":\"\",\"advanceCashDeclarationId\":[],\"bTMoney\":0,\"actualProcessingCharge\":0,\"toBePaid\":400000,\"remark\":null,\"upfrontInterestAmount\":0,\"upfrontTransactionId\":null,\"upfrontReceipt\":[],\"upfrontReceiptImage\":[],\"upfrontReceiptImageName\":\"\",\"amountDisbursedByCash\":0,\"amountDisbursedByBank\":0,\"forOpsApproval\":false,\"isManuallyVerified\":true,\"isVerified\":false,\"isDummyDetails\":false,\"manualVerifiedStatus\":\"\",\"wavier\":0,\"processingCharge\":0,\"receiptNumber\":\"\",\"signature\":\"https://gold-loan-uat-new-org.s3.ap-south-1.amazonaws.com/public/uploads/customer/12223/1780312477084.png\",\"pendingAmount\":\"\",\"totalPledgedGoldAmount\":\"\",\"extraAmountDisbursed\":\"\",\"advanceAmount\":\"\",\"modeOfPayment\":\"\",\"appraiserCharges\":0,\"actualAppraiserCharges\":0,\"appraiserChargesPercentage\":0,\"actualCashGiven\":0,\"availableLimitForDisbuserment\":400000,\"wavierAppraiserCharges\":0,\"stampDutyCharges\":0,\"stampDutyDefinitionType\":null,\"stampDutyRemarks\":\"\",\"totalLimitForCashDisbursal\":200000,\"multiModeDisbursement\":true,\"checkPointers\":{},\"loanId\":10930,\"masterLoanId\":9557,\"loanType\":\"Fresh Loan\",\"createdBy\":3179,\"internalBranchId\":1}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch available packet for packet",
+      "description": "Fetch available packet for packet — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/packet/available-packet?masterLoanId=9557",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "packet",
+            "available-packet"
+          ],
+          "query": [
+            {
+              "key": "masterLoanId",
+              "value": "9557"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch single loan for loan process",
+      "description": "Fetch single loan for loan process — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/loan-process/single-loan?customerLoanId=10930&from=undefined",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "loan-process",
+            "single-loan"
+          ],
+          "query": [
+            {
+              "key": "customerLoanId",
+              "value": "10930"
+            },
+            {
+              "key": "from",
+              "value": "undefined"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch available packet for packet",
+      "description": "Fetch available packet for packet — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/packet/available-packet?masterLoanId=9557",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "packet",
+            "available-packet"
+          ],
+          "query": [
+            {
+              "key": "masterLoanId",
+              "value": "9557"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch single loan for loan process",
+      "description": "Fetch single loan for loan process — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/loan-process/single-loan?customerLoanId=10930&from=undefined",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "loan-process",
+            "single-loan"
+          ],
+          "query": [
+            {
+              "key": "customerLoanId",
+              "value": "10930"
+            },
+            {
+              "key": "from",
+              "value": "undefined"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create/submit base for upload file",
+      "description": "Create/submit base for upload file — auto-generated from HAR",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{BASE_URL}}/api/upload-file/base",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "upload-file",
+            "base"
+          ]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\"avatar\":\"data:image/jpeg;base64,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\"}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create/submit add packet images for loan process",
+      "description": "Create/submit add packet images for loan process — auto-generated from HAR",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{BASE_URL}}/api/loan-process/add-packet-images",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "loan-process",
+            "add-packet-images"
+          ]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\"emptyPacketWithNoOrnament\":\"public/uploads/images/1782897676038.jpeg\",\"emptyPacketWithNoOrnamentImage\":\"https://gold-loan-uat-new-org.s3.ap-south-1.amazonaws.com/public/uploads/images/1782897676038.jpeg\",\"sealingPacketWithWeight\":\"public/uploads/images/1782897678116.jpeg\",\"sealingPacketWithWeightImage\":\"https://gold-loan-uat-new-org.s3.ap-south-1.amazonaws.com/public/uploads/images/1782897678116.jpeg\",\"sealingPacketWithCustomer\":\"public/uploads/images/1782897682474.jpeg\",\"sealingPacketWithCustomerImage\":\"https://gold-loan-uat-new-org.s3.ap-south-1.amazonaws.com/public/uploads/images/1782897682474.jpeg\",\"sealedPacketWithWeight\":\"\",\"sealedPacketWithWeightImage\":\"\",\"ornamentImageWithWeight\":\"\",\"ornamentImageWithWeightImage\":\"\",\"ornamentImageWithXrfMachineReading\":\"\",\"ornamentImageWithXrfMachineReadingImage\":\"\",\"sealedPacket\":\"public/uploads/images/1782897680299.jpeg\",\"sealedPacketImage\":\"https://gold-loan-uat-new-org.s3.ap-south-1.amazonaws.com/public/uploads/images/1782897680299.jpeg\",\"packetOrnamentArray\":[{\"packetId\":\"8277\",\"ornamentsId\":[19024,19025],\"packetsName\":\"pac-066\",\"ornamentsName\":\"Chain, Rings\"}],\"checkPointers\":{},\"loanType\":\"Fresh Loan\",\"loanId\":10930,\"masterLoanId\":9557,\"createdBy\":3179,\"internalBranchId\":1}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch get loan stages for loan process",
+      "description": "Fetch get loan stages for loan process — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/loan-process/get-loan-stages",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "loan-process",
+            "get-loan-stages"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch applied loan details for loan process",
+      "description": "Fetch applied loan details for loan process — auto-generated from HAR",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{BASE_URL}}/api/loan-process/applied-loan-details?from=1&to=25&isRejectedLoan=true",
+          "host": [
+            "{{BASE_URL}}"
+          ],
+          "path": [
+            "api",
+            "loan-process",
+            "applied-loan-details"
+          ],
+          "query": [
+            {
+              "key": "from",
+              "value": "1"
+            },
+            {
+              "key": "to",
+              "value": "25"
+            },
+            {
+              "key": "isRejectedLoan",
+              "value": "true"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// ── HMAC Signature Pre-Request Script (EMI — full URL) ───────────────────",
+              "const secret = pm.collectionVariables.get(\"HMAC_SECRET\");",
+              "let url = pm.request.url.toString().split('?')[0];",
+              "const query = pm.request.url.getQueryString();",
+              "if (query) url += `?${query}`;",
+              "url = url.replace(/%20/g, \" \");",
+              "url = url.replace(/\\/\\/+/g, \"/\").replace(/:\\/([^/])/, '://$1');",
+              "let valuebody = {};",
+              "if ([\"POST\", \"PUT\", \"PATCH\"].includes(pm.request.method)) {",
+              "    if (pm.request.body && pm.request.body.raw) {",
+              "        try { valuebody = JSON.parse(pm.request.body.raw); } catch(e) { valuebody = {}; }",
+              "    }",
+              "}",
+              "const finalPayload = Object.assign({}, valuebody, { url: url });",
+              "const hmacString = JSON.stringify(finalPayload);",
+              "const signature = CryptoJS.HmacSHA256(hmacString, secret).toString(CryptoJS.enc.Hex);",
+              "pm.request.headers.upsert({ key: \"signature\", value: signature });",
+              "console.log(\"🔍 URL:\", url);",
+              "console.log(\"📦 BODY:\", valuebody);",
+              "console.log(\"🧠 PAYLOAD:\", hmacString);",
+              "console.log(\"✅ SIGNATURE:\", signature);"
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "BASE_URL",
+      "value": "https://gold-loan-backend-api.gfau.augmont.com",
+      "type": "default"
+    },
+    {
+      "key": "HMAC_SECRET",
+      "value": "",
+      "type": "secret"
+    },
+    {
+      "key": "AUTH_TOKEN",
+      "value": "",
+      "type": "secret"
+    }
+  ]
+}
