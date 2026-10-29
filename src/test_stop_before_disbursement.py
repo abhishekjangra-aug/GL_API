@@ -66,6 +66,10 @@ class StopBeforeDisbursementTest(maintest.GoldLoanApiTest):
             if self.co_lender_interactive:
                 await self.choose_co_lender_interactive()
 
+            # Every run starts by generating its own packet (admin create + assign to the appraiser).
+            self._log_step("Generate Packet (admin)")
+            await self.prepare_packet()
+
             if self.existing_customer_id or self.existing_customer_unique_id:
                 self._log_step("Load Existing Customer")
                 await self._use_existing_customer()

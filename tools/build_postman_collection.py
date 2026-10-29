@@ -743,19 +743,51 @@ def folder_loan_basics():
         req("LOAN: customer loan details", "GET",
             "/api/loan-process/customer-loan-details/{{appraiser_request_id}}",
             pre="GL.role('appraiser'); GL.sign();",
-            test="GL.soft('customer-loan-details');"),
+            test=("GL.soft('customer-loan-details');\n"
+                  "// basic-details is filled from customerData, as in the web app.\n"
+                  "if (pm.response.code < 400) { GL.setJson('cld', GL.json().customerData || {}); }")),
         req("LOAN: purposes", "GET", "/api/purpose?search=&from=1&to=-1",
             pre="GL.role('appraiser'); GL.sign();",
+            # /api/purpose is GROUPED by type ({"Consumption Based": [...], "Income Generating":
+            # [...]}); flatten every group, keep each entry's type, then pick by purpose_name or
+            # purpose_type -- same rules as maintest._fetch_loan_purposes.
             test=("GL.ok('purposes');\n"
                   "var d = GL.json().data;\n"
-                  "if (!Array.isArray(d)) {\n"
-                  "  var lists = Object.keys(d).map(function (k) { return d[k]; })\n"
-                  "                  .filter(function (v) { return Array.isArray(v); });\n"
-                  "  d = lists[0] || [];\n"
+                  "var groups = Array.isArray(d) ? { '': d } : (d || {});\n"
+                  "var all = [];\n"
+                  "Object.keys(groups).forEach(function (k) {\n"
+                  "  if (!Array.isArray(groups[k])) return;\n"
+                  "  groups[k].forEach(function (p) {\n"
+                  "    if (p && p.name && p.isActive !== false) {\n"
+                  "      all.push({ name: p.name, purposeType: p.purposeType || k || 'Consumption Based' });\n"
+                  "    }\n"
+                  "  });\n"
+                  "});\n"
+                  "var types = { cb: 'consumption based', igl: 'income generating' };\n"
+                  "var wantName = String(GL.get('purpose_name', '')).trim().toLowerCase();\n"
+                  "var kind = String(GL.get('purpose_type', 'cb') || 'cb').trim().toLowerCase();\n"
+                  "var pool;\n"
+                  "if (wantName) {\n"
+                  "  pool = all.filter(function (p) { return p.name.trim().toLowerCase() === wantName; });\n"
+                  "  if (!pool.length) pool = all.filter(function (p) { return p.name.toLowerCase().indexOf(wantName) >= 0; });\n"
+                  "  pool = pool.slice(0, 1);\n"
+                  "} else if (kind === 'any') {\n"
+                  "  pool = all;\n"
+                  "} else {\n"
+                  "  pool = all.filter(function (p) { return p.purposeType.toLowerCase() === types[kind]; });\n"
                   "}\n"
-                  "GL.set('purpose', GL.pick(d).name);")),
+                  "pm.test('loan purpose available (' + (wantName || kind) + ')', function () {\n"
+                  "  pm.expect(pool.length, 'purposes: ' + JSON.stringify(all)).to.be.above(0);\n"
+                  "});\n"
+                  "var chosen = GL.pick(pool);\n"
+                  "GL.set('purpose', chosen.name);\n"
+                  "GL.set('purpose_type_value', chosen.purposeType);\n"
+                  "GL.log('purpose', chosen.name, '[' + chosen.purposeType + ']');")),
         req("LOAN: basic details", "POST", "/api/loan-process/basic-details",
             pre=("GL.role('appraiser');\n"
+                 "var cld = GL.getJson('cld', {});\n"
+                 "var cldBranch = cld.internalBranch || {};\n"
+                 "var cldKyc = cld.customerKycPersonal || {};\n"
                  "if (!GL.get('age') || !GL.get('dob')) {\n"
                  "  var da = GL.dobAge(); GL.set('dob', da.dob); GL.set('age', da.age);\n"
                  "}\n"
@@ -770,12 +802,12 @@ def folder_loan_basics():
                  "  panImg: GL.get('pan_image') || null, partReleaseId: null,\n"
                  "  requestId: GL.int(GL.get('appraiser_request_id')),\n"
                  "  customerName: GL.get('first_name') + ' ' + GL.get('last_name'),\n"
-                 "  form60Img: null, age: String(GL.get('age')), branchName: 'Augmont',\n"
+                 "  form60Img: null, age: String(GL.get('age')), branchName: cldBranch.name || 'Augmont',\n"
                  "  branchDistance: null, gender: GL.get('gender'),\n"
-                 "  appraiserName: GL.get('appraiser_name'), tillDateOutstanding: '3122296.67',\n"
-                 "  appraiserMobileNumber: GL.get('appraiser_mobile'), currentActiveLoans: 2,\n"
+                 "  appraiserName: GL.get('appraiser_name'), tillDateOutstanding: String(cld.tillDateOutstanding != null ? cld.tillDateOutstanding : '0.00'),\n"
+                 "  appraiserMobileNumber: GL.get('appraiser_mobile'), currentActiveLoans: cld.currentActiveLoans != null ? cld.currentActiveLoans : 0,\n"
                  "  cpvImageFullUrl: GL.fullUrl('assets/CPV.pdf'),\n"
-                 "  annualIncome: GL.get('annual_income'), motherName: GL.get('mother_name'),\n"
+                 "  annualIncome: cldKyc.annualIncome || GL.get('annual_income'), motherName: GL.get('mother_name'),\n"
                  "  religionId: GL.int(GL.get('religion_id')),\n"
                  "  physicalChallengeId: GL.int(GL.get('physical_challenge_id')),\n"
                  "  occupationId: GL.int(GL.get('occupation_id')),\n"
@@ -785,7 +817,8 @@ def folder_loan_basics():
                  "  qualificationId: GL.int(GL.get('qualification_id')),\n"
                  "  politicalExposedId: GL.int(GL.get('political_exposed_id')),\n"
                  "  specialCategoryId: GL.int(GL.get('special_category_id')),\n"
-                 "  incomeGeneratingDocuments: null, purposeType: 'Consumption Based',\n"
+                 "  incomeGeneratingDocuments: null,\n"
+                 "  purposeType: GL.get('purpose_type_value') || 'Consumption Based',\n"
                  "  checkPointers: {}\n"
                  "});"),
             test=("GL.ok('loan basic-details');\n"
@@ -1115,6 +1148,8 @@ def folder_scheme():
                   "} else {\n"
                   "  var d = GL.json().data || {};\n"
                   "  var ss = d.securedScheme || {};\n"
+                  "  var cyc = String(ss.interestBillingCycleType || '').toLowerCase().replace(/days?/, '').trim();\n"
+                  "  GL.set('payment_frequency', /^\\d+$/.test(cyc) ? cyc + ' Days' : '30 Days');\n"
                   "  // Capture the scheme's real rate/gram + LTV, and the loan-calculator params the\n"
                   "  // server computed. final-loan-details must echo these or it 400s.\n"
                   "  if (ss.rpg) { GL.set('secured_rpg', GL.num(ss.rpg)); }\n"
@@ -1174,7 +1209,7 @@ def folder_scheme():
                  "  schemeId: GL.int(GL.get('scheme_id')),\n"
                  "  finalLoanAmount: GL.num(GL.get('final_loan_amount')),\n"
                  "  tenure: tenure, loanStartDate: start, loanEndDate: end,\n"
-                 "  paymentFrequency: '30 Days', totalFinalInterestAmt: null,\n"
+                 "  paymentFrequency: GL.get('payment_frequency', '30 Days'), totalFinalInterestAmt: null,\n"
                  "  unsecuredInterestRate: null, interestRate: GL.num(GL.get('interest_rate')),\n"
                  "  processingCharge: GL.num(GL.get('secured_processing_charge')),\n"
                  "  unsecuredSchemeId: null,\n"
@@ -1182,11 +1217,13 @@ def folder_scheme():
                  "  unsecuredLoanAmount: null, isUnsecuredSchemeApplied: false,\n"
                  "  unsecuredRebateInterest: null, securedRebateInterest: null,\n"
                  "  otherAmount: null, loanTransferExtraAmount: null,\n"
-                 "  upfrontInterestAmount: 0, topUpAmount: 0, securedTopUpAmount: 0,\n"
+                 "  upfrontInterestAmount: GL.num(GL.get('upfront_interest_amount')), topUpAmount: 0,\n"
+                 "  securedTopUpAmount: 0,\n"
                  "  unsecuredTopUpAmount: 0, manualCharges: [], unsecuredRpg: null,\n"
                  "  securedRpg: GL.num(GL.get('secured_rpg'), 4480), unsecuredPartnerId: null,\n"
-                 "  unsecuredprocessingCharge: 0, securedprocessingCharge: 0,\n"
-                 "  securedExposure: '0.13'\n"
+                 "  unsecuredprocessingCharge: 0,\n"
+                 "  securedprocessingCharge: GL.num(GL.get('secured_processing_charge')),\n"
+                 "  securedExposure: String(GL.get('secured_exposure', '0'))\n"
                  "});"),
             test=("GL.ok('generate-interest-table');\n"
                   "// The payload is wrapped in data: reading the top level silently yields an empty\n"
@@ -1238,7 +1275,7 @@ def folder_scheme():
                  "    partnerId: GL.int(GL.get('partner_id')), coLenderBankId: co ? GL.int(co) : null,\n"
                  "    schemeId: GL.int(GL.get('scheme_id')), finalLoanAmount: finalAmt,\n"
                  "    tenure: tenure, loanStartDate: start, loanEndDate: end,\n"
-                 "    paymentFrequency: '30 Days',\n"
+                 "    paymentFrequency: GL.get('payment_frequency', '30 Days'),\n"
                  "    totalFinalInterestAmt: GL.num(GL.get('total_final_interest_amt')),\n"
                  "    unsecuredInterestRate: null, interestRate: GL.num(GL.get('interest_rate')),\n"
                  "    processingCharge: GL.num(GL.get('secured_processing_charge')),\n"
@@ -1259,6 +1296,9 @@ def folder_scheme():
                  "  ornaments: rows, totalEligibleAmt: total, checkPointers: {}\n"
                  "});"),
             test=("GL.ok('final-loan-details');\n"
+                  "// bank-details is filled from this response (balances, cash limits, charges,\n"
+                  "// stamp duty), as in the web app.\n"
+                  "if (pm.response.code < 400) { GL.setJson('fld', GL.json()); }\n"
                   "if (pm.response.code >= 400 &&\n"
                   "    pm.response.text().toLowerCase().indexOf('eligible amount') >= 0) {\n"
                   "  GL.log('ELIGIBILITY MISMATCH. Sent', GL.get('total_eligible_amount'),\n"
@@ -1319,12 +1359,20 @@ def folder_bank():
                         "is not verified'."),
         req("BANK: store bank details", "POST", "/api/loan-process/bank-details",
             pre=("GL.role('appraiser');\n"
-                 "var proc = GL.num(GL.get('secured_processing_charge'));\n"
-                 "var upfront = GL.num(GL.get('upfront_interest_amount'));\n"
+                 "var fld = GL.getJson('fld', {});\n"
+                 "var bal = fld.getBalance || {};\n"
+                 "var cash = fld.getAdvanceCashParameters || {};\n"
+                 "function srv(v, fallback) { return (v === undefined || v === null || v === '') ? GL.num(fallback) : GL.num(v); }\n"
+                 "// The server's own figures from final-loan-details (fallback: check-loan-type's).\n"
+                 "var proc = srv(fld.actualProcessingCharge, GL.get('secured_processing_charge'));\n"
+                 "var upfront = srv(fld.upfrontInterestAmount, GL.get('upfront_interest_amount'));\n"
+                 "// Stamp duty: the server's figure always wins (0 included); 1500 only if none stated.\n"
+                 "var stamp = srv(fld.stampDutyCharges, GL.get('stamp_duty_fallback', '1500'));\n"
+                 "var apprPct = fld.appraiserChargesApplied ? (fld.appraiserCharges || 0) : 0;\n"
                  "var finalAmt = GL.num(GL.get('final_loan_amount'));\n"
-                 "// toBePaid MUST equal finalLoanAmount - processingCharge - upfrontInterest, or the\n"
-                 "// server rejects with 'To Be Paid amount is incorrect'.\n"
-                 "var toBePaid = GL.round2(finalAmt - proc - upfront);\n"
+                 "// toBePaid MUST equal finalLoanAmount - processingCharge - upfrontInterest - stampDuty,\n"
+                 "// or the server rejects with 'To Be Paid amount is incorrect'.\n"
+                 "var toBePaid = GL.round2(finalAmt - proc - upfront - stamp);\n"
                  "var verified = String(GL.get('bank_account_verified')) === 'true';\n"
                  "var p = GL.get('passbook_proof');\n"
                  "GL.body({\n"
@@ -1338,9 +1386,10 @@ def folder_bank():
                  "  passbookProof: [p, p],\n"
                  "  passbookProofImage: [GL.fullUrl(p), GL.fullUrl(p)],\n"
                  "  passbookProofImageName: [GL.baseName(p), GL.baseName(p)],\n"
-                 "  account: 1508, detailsFor: 'customer', customerTransferBalance: 0,\n"
-                 "  internalBranchTransferBalance: 17882793.96,\n"
-                 "  internalBranchBlockedBalance: 11916017.72,\n"
+                 "  account: null, detailsFor: 'customer',\n"
+                 "  customerTransferBalance: bal.customerTransferBalance || 0,\n"
+                 "  internalBranchTransferBalance: bal.branchTotalHolding,\n"
+                 "  internalBranchBlockedBalance: bal.branchTotalBlockedBalance,\n"
                  "  advanceBankTransfer: 0, advanceBankTransactionId: null, advanceCash: 0,\n"
                  "  advanceCashTransactionId: [], advanceCashTransactionImage: [],\n"
                  "  advanceCashTransactionImageName: '', advanceCashDeclarationId: [],\n"
@@ -1354,10 +1403,12 @@ def folder_bank():
                  "  signature: GL.get('signature_proof'), pendingAmount: '',\n"
                  "  totalPledgedGoldAmount: '', extraAmountDisbursed: '', advanceAmount: '',\n"
                  "  modeOfPayment: '', appraiserCharges: 0, actualAppraiserCharges: 0,\n"
-                 "  appraiserChargesPercentage: 0, actualCashGiven: 0,\n"
+                 "  appraiserChargesPercentage: apprPct, actualCashGiven: 0,\n"
                  "  availableLimitForDisbuserment: toBePaid, wavierAppraiserCharges: 0,\n"
-                 "  stampDutyCharges: 0, stampDutyDefinitionType: null, stampDutyRemarks: '',\n"
-                 "  totalLimitForCashDisbursal: 200000, multiModeDisbursement: true,\n"
+                 "  stampDutyCharges: stamp, stampDutyDefinitionType: fld.stampDutyDefinitionType || null,\n"
+                 "  stampDutyRemarks: '',\n"
+                 "  totalLimitForCashDisbursal: cash.totalLimitForCashDisbursal != null ? cash.totalLimitForCashDisbursal : 200000,\n"
+                 "  multiModeDisbursement: cash.multiModeDisbursement != null ? cash.multiModeDisbursement : true,\n"
                  "  checkPointers: {}, loanId: GL.int(GL.get('loan_id')),\n"
                  "  masterLoanId: GL.int(GL.get('master_loan_id')), loanType: 'Fresh Loan',\n"
                  "  createdBy: String(GL.get('logged_in_user_id')),\n"
@@ -1398,7 +1449,7 @@ def folder_packet():
         req("PKT: create packet (ADMIN)", "POST", "/api/packet",
             pre=("// Packet create + assign require ADMIN; sealing runs as the appraiser.\n"
                  "GL.role('admin');\n"
-                 "var unique = 'pac-' + GL.ri(10000000, 99999999);\n"
+                 "var unique = 'pac' + GL.ri(10000000, 99999999);\n"
                  "GL.set('packet_unique_id', unique);\n"
                  "GL.body({\n"
                  "  id: null, packetUniqueId: unique,\n"
@@ -1438,6 +1489,8 @@ def folder_packet():
                   "// loanUniqueId (AUGM-...) is assigned at the assign-packet stage.\n"
                   "var d = GL.json().data || {};\n"
                   "if (d.loanUniqueId) { GL.set('loan_unique_id', d.loanUniqueId); }\n"
+                  "// partner-wise-disbursement's penalInterest comes from here (not the scheme's).\n"
+                  "if (d.penalInterest !== undefined && d.penalInterest !== null) { GL.set('penal_interest', d.penalInterest); }\n"
                   "GL.log('loanUniqueId', GL.get('loan_unique_id'));")),
         packet_image(1, "packet_img_empty"),
         packet_image(2, "packet_img_weight"),
@@ -1745,11 +1798,12 @@ def folder_disbursement():
                  "  upfrontTransactionId: null, upfrontReceiptImage: null, upfrontReceipt: null,\n"
                  "  fullUnsecuredTopUpAmount: 0, fullSecuredTopUpAmount: 0, finalTopUpAmount: 0,\n"
                  "  securedTopUpAmount: 0, unsecuredTopUpAmount: 0,\n"
-                 "  advanceBankTransfer: 0, advanceCash: 0, bTMoney: 0, penalInterest: 2,\n"
+                 "  advanceBankTransfer: 0, advanceCash: 0, bTMoney: 0, penalInterest: pick('penalInterest', GL.num(GL.get('penal_interest', '2'))),\n"
                  "  advancedCashReceiptImage: null, advanceCashDeclarationImage: null,\n"
                  "  receiptNumber: null, appraiserCharges: 0,\n"
                  "  actualProcessingCharge: firstInterest, actualCashGiven: 0,\n"
-                 "  stampDutyCharges: '0.00', stampDutyRemarks: '', paymentGatewayId: 5,\n"
+                 "  stampDutyCharges: pick('stampDutyCharges', '0.00'), stampDutyRemarks: '',\n"
+                 "  paymentGatewayId: 5,\n"
                  "  partnerId: GL.int(GL.get('partner_id'), 152), loanType: 'Fresh Loan'\n"
                  "});"),
             test=("GL.ok('partner-wise-disbursement');\n"
@@ -1914,6 +1968,9 @@ def build_collection(lib_source, dummy_data_uri):
         ("partner_name", "ROSHAN PARTNER", "Partner name matched in partner-scheme-amount"),
         ("scheme_id_pin", "", "Pin one scheme id (e.g. 853); empty = auto-pick within the partner"),
         ("co_lender", "", "Co-lender bank name or id; empty = no co-lending"),
+        ("purpose_type", "cb", "Loan purpose type: cb = Consumption Based, igl = Income Generating, any"),
+        ("purpose_name", "", "Pin one loan purpose by name (e.g. Agricultural Purposes); overrides purpose_type"),
+        ("stamp_duty_fallback", "1500", "Stamp duty used ONLY when final-loan-details states none"),
         # --- fixed config ---
         ("hmac_secret", GoldLoanApiTest().HMAC_SECRET, "Request-signing secret"),
         ("kyc_type", "RE_KYC", ""),
@@ -1948,7 +2005,8 @@ def build_collection(lib_source, dummy_data_uri):
                  "political_exposed_id", "special_category_id", "cis_id", "bsr_id",
                  "annual_income", "qualification_id", "appraiser_id", "appraiser_name",
                  "appraiser_mobile", "appraiser_request_id", "loan_id", "master_loan_id",
-                 "purpose", "nominee_relation", "gold_rate", "karat", "ornament_image",
+                 "purpose", "purpose_type_value", "payment_frequency", "penal_interest",
+                 "nominee_relation", "gold_rate", "karat", "ornament_image",
                  "scheme_id", "partner_id", "co_lender_bank_id", "forced_co_lender_id",
                  "secured_rpg", "secured_ltv", "secured_processing_charge",
                  "upfront_interest_amount", "interest_rate", "secured_exposure",
@@ -1963,7 +2021,7 @@ def build_collection(lib_source, dummy_data_uri):
                  "ref_appraiser", "ref_admin", "ref_ops", "ref_bm", "ref_partner",
                  "kyc_reference_code", "partner_branch_id_resolved",
                  # JSON blobs carried between requests
-                 "kyc_personal", "kyc_addresses", "ornaments", "ornament_types", "karat_detail",
+                 "cld", "fld", "kyc_personal", "kyc_addresses", "ornaments", "ornament_types", "karat_detail",
                  "scheme_catalog", "scheme_candidates", "interest_table", "disb_detail",
                  "submit_barcodes",
                  # uploaded artefact paths

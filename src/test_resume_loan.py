@@ -388,6 +388,12 @@ class ResumeLoanTest:
                 await suite.fetch_loan_details()
                 return True
 
+            # Generate this run's packet up front, as maintest does -- but only when the loan still
+            # has to be sealed into one (the packet step is in the plan).
+            if any(step.key == "packet" for step in steps):
+                suite._log_step("Generate Packet (admin)")
+                await suite.prepare_packet()
+
             for step in steps:
                 suite._log_step(f"{step.key} - {step.label}")
                 await step.run(suite)

@@ -38,7 +38,7 @@ class GoldLoanApiTest:
     #   partner_mobiles      -- partner login used for approval + disbursement, keyed by partner id
     #                           (Roshan Partner = 152, Arvog = 10).
     #   partner_user_mobiles -- partner-BRANCH user who receives the packet at submit-packet, keyed
-    #                           by the same partner id. Test only has Roshan's captured.
+    #                           by the same partner id (TEST Arvog: 'newbranch user' 7777777788).
     # Anything else that is environment-specific (packet location id, partner branch id) is
     # resolved live from the API in submit_packet rather than pinned per environment.
     ENVIRONMENTS = {
@@ -49,9 +49,9 @@ class GoldLoanApiTest:
             "origin": "https://ap.gfat.augmont.com",
             "role_mobiles": {"admin": "8880008880", "appraiser": "8880008881",
                              "ops": "8880008882", "bm": "8880008883"},
-            "partner_mobiles": {"152": "8767002003", "10": "9375876473"},
+            "partner_mobiles": {"152": "8767002003", "10": "9375876473"},  # ROSHAN / ARVOG ARV10
             "partner_user_mobiles": {"152": "8652849318",   # roshan ghadge (id 170)
-                                     "10": "8899999999"},   # arvog branch user
+                                     "10": "7777777788"},   # arvog: newbranch user
         },
         "uat": {
             "base_url": "https://gold-loan-backend-api.gfau.augmont.com",
@@ -184,9 +184,14 @@ class GoldLoanApiTest:
         self._api_failures = 0
         self._failed_endpoints = []  # (call#, method, path, status, reason) for the end-of-run report
         self._step_no = 0
+        # httpx's default is a 5 s limit on every call; the servers regularly take longer (a live
+        # run lost a loan to a ReadTimeout on an 8.7 KB upload-file/base). Wait like a browser does:
+        # GOLD_LOAN_HTTP_TIMEOUT seconds for a reply (default 60), 15 s to connect.
+        http_timeout = float(os.getenv("GOLD_LOAN_HTTP_TIMEOUT", "60") or 60)
         self.client = httpx.AsyncClient(
             base_url=self.BASE_URL,
             headers={"Origin": self.ORIGIN},
+            timeout=httpx.Timeout(http_timeout, connect=min(15.0, http_timeout)),
             event_hooks={"response": [self._log_http_exchange]},
         )
         # --- Global Variables to store dynamic data ---
@@ -233,6 +238,13 @@ class GoldLoanApiTest:
         self.latitude = None
         self.longitude = None
         self.customer_details = {}  # To store the full customer KYC review object
+        # Server payloads later request bodies are filled from (instead of hard-coded values), as
+        # the web app does: customer-loan-details.customerData feeds basic-details; the
+        # final-loan-details response feeds bank-details; check-loan-type securedScheme feeds the
+        # interest table.
+        self.customer_loan_data = {}
+        self.final_loan_details_data = {}
+        self.secured_scheme = {}
         self.appraiser_id = ''
         self.appraiser_request_id = ''
         # An already-existing appraiser request is RESUMED by default; --fresh-request /
@@ -265,7 +277,14 @@ class GoldLoanApiTest:
         self.nominee_relation_id = ''
         self.ornament_type_id = ''
         self.karat_id = ''
-        self.purpose_id = ''
+        self.purpose_id = ''  # the purpose NAME (basic-details sends the name, not the id)
+        # Loan purpose selection (--purpose / --purpose-type). GOLD_LOAN_PURPOSE pins one purpose by
+        # name; otherwise GOLD_LOAN_PURPOSE_TYPE picks a random purpose of that type: cb (Consumption
+        # Based, the default), igl (Income Generating) or any.
+        self.purpose_choice = os.getenv("GOLD_LOAN_PURPOSE", "").strip()
+        self.purpose_type_choice = (os.getenv("GOLD_LOAN_PURPOSE_TYPE") or "cb").strip().lower()
+        self.purpose_type = ''      # the chosen purpose's purposeType, sent with basic-details
+        self.purpose_record = {}    # the chosen purpose as the server listed it
         self.scheme_id = ''
         self.selected_scheme = {}
         self.gold_rate = 0.0
@@ -304,9 +323,9 @@ class GoldLoanApiTest:
         self.interest_rate = 0
         self.secured_processing_charge = 0
         self.upfront_interest_amount = 0
-        # Stamp duty charged by the (Augmont) branch, deducted from bank-details' toBePaid. Default
-        # 1500 (GOLD_LOAN_STAMP_DUTY overrides); a positive stampDutyCharges in the final-loan-details
-        # response replaces it, along with the server's stampDutyDefinitionType.
+        # Stamp duty deducted from bank-details' toBePaid. The SERVER's figure (final-loan-details,
+        # else single-loan) always wins, 0 included; 1500 / GOLD_LOAN_STAMP_DUTY is only the fallback
+        # when the server states none.
         self.stamp_duty_charges = float(os.getenv("GOLD_LOAN_STAMP_DUTY", "1500"))
         self.stamp_duty_definition_type = None
         self.stamp_duty_from_server = False  # True once a server payload stated it (ARVOG needs this)
@@ -316,6 +335,7 @@ class GoldLoanApiTest:
         self.loan_end_date = ""
         self.max_loan_limit = 0.0  # From loan-process/max-loan-limit
         self.available_packet = {}  # From packet/available-packet
+        self.packet_prepared = False  # True once prepare_packet generated this run's packet
         self.lead_converter_id = ''  # From lead/lead-converter
         self.karza_account_details = {}  # From loan-process/account-details-karza
         self.bank_account_number = ''  # Disbursement bank account details
@@ -718,7 +738,7 @@ class GoldLoanApiTest:
             (4, 0, 1, 2, 3, 9, 5, 6, 7, 8),
             (5, 9, 8, 7, 6, 0, 4, 3, 2, 1),
             (6, 5, 9, 8, 7, 1, 0, 4, 3, 2),
-            (7, 0, 4, 6, 1, 3, 5, 8, 2, 9),
+            (7, 6, 5, 9, 8, 2, 1, 0, 4, 3),
             (8, 7, 6, 5, 9, 3, 2, 1, 0, 4),
             (9, 8, 7, 6, 5, 4, 3, 2, 1, 0),
         )
@@ -859,6 +879,9 @@ class GoldLoanApiTest:
     # That is infrastructure, not our request -- one blip should not lose a whole run, let alone
     # a whole --count batch.
     GATEWAY_STATUSES = (502, 503, 504)
+    # Writes that are safe to repeat after a lost reply: re-sending a file upload at worst leaves
+    # an unused file behind -- it cannot duplicate a customer, loan or rating.
+    RETRY_SAFE_WRITES = ("/api/upload-file",)
 
     @staticmethod
     def _is_html_error_page(text: str) -> bool:
@@ -893,6 +916,8 @@ class GoldLoanApiTest:
         when the connection never got established, because then nothing can have been processed.
         """
         attempts = max(1, self.gateway_retries)
+        # File uploads (RETRY_SAFE_WRITES) may be repeated after a lost reply, like a GET.
+        repeatable = verb == 'GET' or api_path.split('?')[0].startswith(self.RETRY_SAFE_WRITES)
         for attempt in range(1, attempts + 1):
             last = attempt == attempts
             try:
@@ -904,8 +929,9 @@ class GoldLoanApiTest:
                 await self._gateway_backoff(attempt, verb, api_path, f"{type(e).__name__}")
                 continue
             except httpx.TransportError as e:
-                # The request went out; the reply did not come back. Only a GET may be repeated.
-                if last or verb != 'GET':
+                # The request went out; the reply did not come back. Only a GET (or a file upload)
+                # may be repeated.
+                if last or not repeatable:
                     raise
                 await self._gateway_backoff(attempt, verb, api_path, f"{type(e).__name__}")
                 continue
@@ -3064,19 +3090,62 @@ class GoldLoanApiTest:
         print(f'Track loan history (action {action}) successful.')
 
 
+    # --purpose-type keys -> the purposeType the server groups /api/purpose by.
+    PURPOSE_TYPES = {"cb": "Consumption Based", "igl": "Income Generating"}
+
     async def _fetch_loan_purposes(self):
+        """Pick the loan purpose and its purposeType.
+
+        /api/purpose returns the purposes GROUPED by type -- {"Consumption Based": [...],
+        "Income Generating": [...]} -- so every group is flattened, each entry keeping its type.
+        GOLD_LOAN_PURPOSE pins one by name; otherwise a random active purpose of
+        GOLD_LOAN_PURPOSE_TYPE (cb / igl / any) is chosen.
+        """
         api_path = "/api/purpose?search=&from=1&to=-1"
         response = await self._make_authenticated_request('GET', api_path)
-        purposes = response.json().get('data')
-        if isinstance(purposes, dict):
-            # Test API may return a keyed object or nest the list one level down.
-            purposes = next(
-                (value for value in purposes.values() if isinstance(value, list)),
-                list(purposes.values()),
-            )
+        data = response.json().get('data')
+        groups = data if isinstance(data, dict) else {"": data or []}
+        purposes = []
+        for group, items in groups.items():
+            if not isinstance(items, list):
+                continue
+            for p in items:
+                if isinstance(p, dict) and p.get('name') and p.get('isActive', True) is not False:
+                    purposes.append({**p, "purposeType": p.get('purposeType') or group or "Consumption Based"})
         assert purposes, "No loan purposes found."
-        self.purpose_id = self.random.choice(purposes).get('name')
-        print(f'Fetched random purpose: {self.purpose_id}')
+
+        def describe(items):
+            return "; ".join(f"{p['name']} ({p['purposeType']})" for p in items)
+
+        if self.purpose_choice:
+            wanted = self.purpose_choice.lower()
+            matches = ([p for p in purposes if p['name'].strip().lower() == wanted]
+                       or [p for p in purposes if wanted in p['name'].lower()])
+            if not matches:
+                raise RuntimeError(f"No active loan purpose named {self.purpose_choice!r}. "
+                                   f"Available: {describe(purposes)}")
+            chosen = matches[0]
+            how = "pinned by --purpose"
+        else:
+            kind = self.purpose_type_choice
+            if kind == "any":
+                pool = purposes
+            elif kind in self.PURPOSE_TYPES:
+                pool = [p for p in purposes if p['purposeType'].lower() == self.PURPOSE_TYPES[kind].lower()]
+            else:
+                raise RuntimeError(f"Unknown purpose type {kind!r}; use one of "
+                                   f"{sorted(self.PURPOSE_TYPES) + ['any']}.")
+            if not pool:
+                raise RuntimeError(f"No active loan purpose of type {kind!r}. Available: {describe(purposes)}")
+            chosen = self.random.choice(pool)
+            how = f"random, type={kind}"
+
+        self.purpose_record = chosen
+        self.purpose_id = chosen['name']
+        self.purpose_type = chosen['purposeType']
+        docs = chosen.get('incomeGeneratingDocumentTypes')
+        print(f"Loan purpose: {self.purpose_id!r} [{self.purpose_type}] ({how})"
+              + (f" -- income-generating document types: {docs}" if docs else ""))
         return self.purpose_id
 
 
@@ -3211,6 +3280,15 @@ class GoldLoanApiTest:
         purpose = await self._fetch_loan_purposes()
         # Keep the real/KYC dob+age if already known (existing customer or the KYC step); only
         # generate when unset. Regenerating unconditionally overwrote the customer's actual values.
+        # The web app fills basic-details from customer-loan-details.customerData; refresh it if the
+        # earlier fetch did not run or failed.
+        if not self.customer_loan_data:
+            await self.fetch_customer_loan_details()
+        cld = self.customer_loan_data or {}
+        branch = cld.get('internalBranch') if isinstance(cld.get('internalBranch'), dict) else {}
+        kyc_personal = cld.get('customerKycPersonal') if isinstance(cld.get('customerKycPersonal'), dict) else {}
+        if not self.age and cld.get('age'):
+            self.age = cld.get('age')
         if not self.age or not self.dob:
             dob_and_age = self._generate_random_dob_and_age()
             self.age = self.age or int(dob_and_age['age'])
@@ -3234,15 +3312,15 @@ class GoldLoanApiTest:
             "customerName": self.full_name,
             "form60Img": self.form60_image,
             "age": str(self.age),
-            "branchName": "Augmont",
-            "branchDistance": None,  # Example from collection
+            "branchName": branch.get('name') or "Augmont",  # customerData.internalBranch.name
+            "branchDistance": None,  # the web app sends null too
             "gender": self.gender,
             "appraiserName": self.logged_in_appraiser_name,  # Use fetched appraiser name
-            "tillDateOutstanding": "3122296.67",  # Example from collection
+            "tillDateOutstanding": str(cld.get('tillDateOutstanding') if cld.get('tillDateOutstanding') is not None else "0.00"),
             "appraiserMobileNumber": self.logged_in_appraiser_mobile_number,  # Use fetched appraiser mobile
-            "currentActiveLoans": 2,  # Example from collection
+            "currentActiveLoans": cld.get('currentActiveLoans') if cld.get('currentActiveLoans') is not None else 0,
             "cpvImageFullUrl": f"{self.BASE_URL}/{self.DUMMY_PDF_PATH}",  # Placeholder
-            "annualIncome": self.annual_income,
+            "annualIncome": kyc_personal.get('annualIncome') or self.annual_income,
             "motherName": self.mother_name,
             "religionId": int(self.religion_id) if self.religion_id else None, # Convert to int
             "physicalChallengeId": int(self.physical_challenge_id) if self.physical_challenge_id else None, # Convert to int
@@ -3255,7 +3333,7 @@ class GoldLoanApiTest:
             "politicalExposedId": int(self.political_exposed_id) if self.political_exposed_id else None, # Convert to int
             "specialCategoryId": int(self.special_category_id) if self.special_category_id else None, # Convert to int
             "incomeGeneratingDocuments": None,
-            "purposeType": "Consumption Based",  # Example from collection
+            "purposeType": self.purpose_type or "Consumption Based",  # from the chosen purpose's group
             "checkPointers": {},
         }
         try:
@@ -3937,6 +4015,7 @@ class GoldLoanApiTest:
                 data = resp_json.get('data') if isinstance(resp_json, dict) else None
                 secured_scheme = data.get('securedScheme') if isinstance(data, dict) else None
                 if isinstance(secured_scheme, dict):
+                    self.secured_scheme = secured_scheme
                     if secured_scheme.get('ltv'):
                         try:
                             self.secured_ltv = float(secured_scheme['ltv'])
@@ -4045,7 +4124,7 @@ class GoldLoanApiTest:
             "tenure": tenure_months,
             "loanStartDate": loan_start_date,
             "loanEndDate": loan_end_date,
-            "paymentFrequency": "30 Days",  # Example from collection
+            "paymentFrequency": self._payment_frequency(),  # scheme interestBillingCycleType
             "totalFinalInterestAmt": None,
             "unsecuredInterestRate": None,
             "interestRate": self.interest_rate,  # scheme's real rate (from check-loan-type)
@@ -4058,7 +4137,7 @@ class GoldLoanApiTest:
             "securedRebateInterest": None,
             "otherAmount": None,
             "loanTransferExtraAmount": None,
-            "upfrontInterestAmount": 0,
+            "upfrontInterestAmount": self.upfront_interest_amount or 0,  # from check-loan-type
             "topUpAmount": 0,
             "securedTopUpAmount": 0,
             "unsecuredTopUpAmount": 0,
@@ -4067,8 +4146,8 @@ class GoldLoanApiTest:
             "securedRpg": self.secured_rpg if self.secured_rpg else 4480,  # scheme rate-per-gram
             "unsecuredPartnerId": None,
             "unsecuredprocessingCharge": 0,
-            "securedprocessingCharge": 0,
-            "securedExposure": "0.13",  # Example from collection
+            "securedprocessingCharge": self.secured_processing_charge,  # from check-loan-type
+            "securedExposure": str(self.secured_exposure),  # posExposureAgainstScheme (check-loan-type)
         }
         response = await self._make_authenticated_request(
             'POST',
@@ -4215,7 +4294,7 @@ class GoldLoanApiTest:
                 json_data=request_body
             )
             print('Get final loan details successful.')
-            self._capture_stamp_duty(response)
+            self._capture_final_loan_details(response)
             return
         except httpx.HTTPStatusError as e:
             body = e.response.text if e.response is not None else ""
@@ -4260,10 +4339,26 @@ class GoldLoanApiTest:
     def _is_arvog_loan(self) -> bool:
         return self._partner_key() == self.ARVOG_PARTNER_ID
 
+    def _payment_frequency(self) -> str:
+        """The scheme's billing cycle as the interest table names it ("30Days" -> "30 Days")."""
+        cycle = str((self.secured_scheme or {}).get('interestBillingCycleType') or '').strip()
+        digits = cycle.lower().replace('days', '').replace('day', '').strip()
+        return f"{digits} Days" if digits.isdigit() else "30 Days"
+
+    def _capture_final_loan_details(self, response):
+        """Keep the final-loan-details response: bank-details is filled from it (balances, cash
+        limits, charges, stamp duty), exactly as the web app does."""
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
+        self.final_loan_details_data = data if isinstance(data, dict) else {}
+        self._capture_stamp_duty(response)
+
     def _capture_stamp_duty(self, response):
-        """Adopt final-loan-details' stampDutyCharges when the server reports a positive one;
-        otherwise keep the configured default (1500 / GOLD_LOAN_STAMP_DUTY). For an ARVOG loan the
-        server's figure is adopted whatever it is (0 included) -- see _ensure_stamp_duty."""
+        """Adopt final-loan-details' stampDutyCharges whenever the server states one (0 included);
+        the configured default (1500 / GOLD_LOAN_STAMP_DUTY) is only a fallback -- see
+        _ensure_stamp_duty."""
         try:
             data = response.json()
         except ValueError:
@@ -4272,15 +4367,16 @@ class GoldLoanApiTest:
 
     def _adopt_server_stamp_duty(self, data: dict, source: str) -> bool:
         """Take stampDutyCharges (+ definition type) from a server payload. Returns True when the
-        server's figure was adopted. Non-Arvog loans only adopt a positive figure, keeping the
-        configured default otherwise; Arvog loans adopt any figure the server states."""
+        server stated a figure (0 included) and it was adopted. A live TEST run confirmed the server
+        validates toBePaid against ITS figure: final-loan-details said 0 on an Augmont-branch loan and
+        bank-details rejected the 1500 default with "To Be Paid amount is incorrect"."""
         raw = data.get('stampDutyCharges')
         try:
             server_duty = float(raw) if raw not in (None, "") else None
         except (TypeError, ValueError):
             server_duty = None
         arvog = self._is_arvog_loan()
-        adopt = server_duty is not None and (arvog or server_duty > 0)
+        adopt = server_duty is not None
         if adopt:
             self.stamp_duty_charges = server_duty
             self.stamp_duty_definition_type = data.get('stampDutyDefinitionType')
@@ -4291,19 +4387,23 @@ class GoldLoanApiTest:
         return adopt
 
     async def _ensure_stamp_duty(self):
-        """ARVOG loans must carry the SERVER's stamp duty into bank-details, never the default.
-        If final-loan-details did not state one, read it from single-loan (data.stampDutyCharges).
-        If the server still gives none, stop here rather than send a guessed toBePaid -- unless
-        GOLD_LOAN_STAMP_DUTY was set explicitly, which is then taken as a deliberate override."""
-        if not self._is_arvog_loan() or self.stamp_duty_from_server:
+        """bank-details must carry the SERVER's stamp duty. If final-loan-details did not state one,
+        read it from single-loan (data.stampDutyCharges). If the server still gives none:
+        GOLD_LOAN_STAMP_DUTY, when set, is a deliberate override; otherwise ARVOG loans stop here
+        rather than send a guessed toBePaid, and other partners fall back to the 1500 default."""
+        if self.stamp_duty_from_server:
             return
-        print("ARVOG loan: fetching stamp duty from single-loan before bank details.")
+        print("Stamp duty not in final-loan-details: fetching it from single-loan before bank details.")
         payload = await self.fetch_single_loan()
         data = payload.get("data") if isinstance(payload, dict) else None
         if isinstance(data, dict) and self._adopt_server_stamp_duty(data, "single-loan"):
             return
         if os.getenv("GOLD_LOAN_STAMP_DUTY"):
             print(f"  -> server gave no stamp duty; using GOLD_LOAN_STAMP_DUTY={self.stamp_duty_charges}.")
+            return
+        if not self._is_arvog_loan():
+            print(self._c(f"  -> server gave no stamp duty; falling back to the default "
+                          f"{self.stamp_duty_charges}.", "yellow"))
             return
         raise RuntimeError(
             f"ARVOG loan {self.loan_id}: neither final-loan-details nor single-loan returned "
@@ -4360,14 +4460,21 @@ class GoldLoanApiTest:
         # incorrect" if this doesn't match its own computation. processingCharge/upfrontInterestAmount
         # are captured from check-loan-type (data.securedprocessingCharge / upfrontInterestAmount),
         # e.g. proc = max(fixed, percent%); stamp duty comes from _capture_stamp_duty.
-        try:
-            proc_charge = float(self.secured_processing_charge or 0)
-        except (TypeError, ValueError):
-            proc_charge = 0.0
-        try:
-            upfront_interest = float(self.upfront_interest_amount or 0)
-        except (TypeError, ValueError):
-            upfront_interest = 0.0
+        fld = self.final_loan_details_data or {}
+        balance = fld.get('getBalance') if isinstance(fld.get('getBalance'), dict) else {}
+        cash_params = (fld.get('getAdvanceCashParameters')
+                       if isinstance(fld.get('getAdvanceCashParameters'), dict) else {})
+
+        def num(value, fallback):
+            try:
+                return float(value) if value not in (None, "") else float(fallback or 0)
+            except (TypeError, ValueError):
+                return float(fallback or 0)
+
+        # The server's own figures from final-loan-details, falling back to check-loan-type's.
+        proc_charge = num(fld.get('actualProcessingCharge'), self.secured_processing_charge)
+        upfront_interest = num(fld.get('upfrontInterestAmount'), self.upfront_interest_amount)
+        appraiser_pct = fld.get('appraiserCharges') if fld.get('appraiserChargesApplied') else 0
         try:
             stamp_duty = float(self.stamp_duty_charges or 0)
         except (TypeError, ValueError):
@@ -4390,11 +4497,12 @@ class GoldLoanApiTest:
             "passbookProofImage": [p if p.startswith("http") else f"{self.BASE_URL}/{p}"
                                    for p in passbook_proofs],
             "passbookProofImageName": [os.path.basename(p) for p in passbook_proofs],
-            "account": 1508,  # Example
+            "account": None,  # the web app sends null
             "detailsFor": "customer",
-            "customerTransferBalance": 0,
-            "internalBranchTransferBalance": 17882793.96,  # Example
-            "internalBranchBlockedBalance": 11916017.72,  # Example
+            # Branch/customer balances as final-loan-details reported them (getBalance).
+            "customerTransferBalance": balance.get('customerTransferBalance', 0),
+            "internalBranchTransferBalance": balance.get('branchTotalHolding'),
+            "internalBranchBlockedBalance": balance.get('branchTotalBlockedBalance'),
             "advanceBankTransfer": 0,
             "advanceBankTransactionId": None,
             "advanceCash": 0,
@@ -4437,20 +4545,20 @@ class GoldLoanApiTest:
             "modeOfPayment": "",
             "appraiserCharges": 0,
             "actualAppraiserCharges": 0,
-            "appraiserChargesPercentage": 0,
+            "appraiserChargesPercentage": appraiser_pct or 0,  # final-loan-details appraiserCharges
             "actualCashGiven": 0,
             "availableLimitForDisbuserment": to_be_paid,
             "wavierAppraiserCharges": 0,
             "stampDutyCharges": stamp_duty,
             "stampDutyDefinitionType": self.stamp_duty_definition_type,
             "stampDutyRemarks": "",
-            "totalLimitForCashDisbursal": 200000,  # Example
-            "multiModeDisbursement": True,
+            "totalLimitForCashDisbursal": cash_params.get('totalLimitForCashDisbursal', 200000),
+            "multiModeDisbursement": cash_params.get('multiModeDisbursement', True),
             "checkPointers": {},  # From collection example
             "loanId": int(self.loan_id) if self.loan_id else None,
             "masterLoanId": int(self.master_loan_id) if self.master_loan_id else None,
             "loanType": "Fresh Loan",
-            "createdBy": "3179",  # Placeholder
+            "createdBy": str(self.logged_in_user_id or balance.get('userId') or ""),  # the logged-in user
             "internalBranchId": int(self.internal_branch_id) if self.internal_branch_id else None, # Convert to int
         }
 
@@ -4839,7 +4947,7 @@ class GoldLoanApiTest:
         images needs the id for packetOrnamentArray.packetId). barcodeNumber and packetUniqueId are
         the SAME randomly-generated value. Sets and returns self.available_packet."""
         api_path = "/api/packet"
-        unique = f"pac-{self.random.randint(10000000, 99999999)}"
+        unique = f"pac{self.random.randint(10000000, 99999999)}"  # e.g. pac12345678 (no dash)
         request_body = {
             "id": None,
             "packetUniqueId": unique,
@@ -4907,10 +5015,11 @@ class GoldLoanApiTest:
               f"(loanUniqueId={self.loan_unique_id or 'n/a'}).")
         return payload
 
-    async def add_packet_images(self):
-        # Packet CREATE + ASSIGN require ADMIN rights; the sealing (add-packet-images) runs as the
-        # current appraiser. Swap to an admin token for just those two calls, then restore the
-        # appraiser session. appraiserId for the assignment is the loan's current (appraiser) user.
+    async def prepare_packet(self) -> None:
+        """Generate a FRESH packet before the loan flow starts: create it and assign it to the
+        logged-in appraiser (both ADMIN-only), so every run seals its ornaments into its own new
+        packet instead of depending on what happens to be available. add_packet_images then uses
+        this packet rather than creating one mid-flow."""
         appraiser_id = self.logged_in_user_id
         saved_token = self.auth_token
         try:
@@ -4918,7 +5027,19 @@ class GoldLoanApiTest:
             await self.create_packet()             # POST /api/packet (admin) + resolve numeric id
             await self.assign_packet(appraiser_id)  # PUT /api/packet/{id} (admin) -> bind appraiser
         finally:
-            self.auth_token = saved_token           # restore appraiser session for sealing
+            self.auth_token = saved_token           # back to the appraiser session
+        self.packet_prepared = bool(isinstance(self.available_packet, dict)
+                                    and self.available_packet.get("id"))
+        print(f"Packet ready for this run: {getattr(self, '_created_packet_unique', '?')} "
+              f"(id={self.available_packet.get('id') if isinstance(self.available_packet, dict) else None}, "
+              f"assigned to appraiser {appraiser_id}).")
+
+    async def add_packet_images(self):
+        # The packet is normally generated up front by prepare_packet (start of the run). Create +
+        # assign it here only when that did not happen (e.g. a resumed loan). Packet CREATE + ASSIGN
+        # require ADMIN rights; the sealing (add-packet-images) runs as the current appraiser.
+        if not getattr(self, "packet_prepared", False):
+            await self.prepare_packet()
         # Fall back to available-packet only if the created packet couldn't be resolved from the listing.
         if not (isinstance(self.available_packet, dict) and self.available_packet.get("id")):
             await self.fetch_available_packet()
@@ -5003,7 +5124,10 @@ class GoldLoanApiTest:
         try:
             response = await self._make_authenticated_request('GET', api_path)
             print(f"Fetched customer loan details for appraiser request {self.appraiser_request_id}.")
-            return response.json()
+            payload = response.json()
+            data = payload.get('customerData') if isinstance(payload, dict) else None
+            self.customer_loan_data = data if isinstance(data, dict) else {}
+            return payload
         except httpx.HTTPStatusError as e:
             print(f"Fetch customer loan details failed (non-fatal): {e.response.status_code}")
             return {}
@@ -5841,6 +5965,15 @@ class GoldLoanApiTest:
         final_amount = detail.get("finalLoanAmount") or float(self.final_loan_amount or 0)
         # Manually-entered bank UTR/reference (a random numeric string in the HAR).
         bank_txn_id = str(self.random.randint(10**14, 10**15 - 1))
+        # penalInterest comes from single-loan (data.penalInterest), as in the web app -- NOT the
+        # scheme's own penalInterest, which differs (27.18 vs 2 in the capture).
+        penal_interest = detail.get("penalInterest") if isinstance(detail, dict) else None
+        if penal_interest is None:
+            try:
+                single = await self.fetch_single_loan()
+                penal_interest = ((single or {}).get("data") or {}).get("penalInterest")
+            except httpx.HTTPStatusError:
+                penal_interest = None
         # First-month secured interest ~ actualProcessingCharge in the HAR (falls back to 0.00).
         first_interest = "0.00"
         if isinstance(self.interest_table_data, list) and self.interest_table_data:
@@ -5894,7 +6027,7 @@ class GoldLoanApiTest:
             "fullUnsecuredTopUpAmount": 0, "fullSecuredTopUpAmount": 0, "finalTopUpAmount": 0,
             "securedTopUpAmount": 0, "unsecuredTopUpAmount": 0,
             "advanceBankTransfer": 0, "advanceCash": 0, "bTMoney": 0,
-            "penalInterest": 2,
+            "penalInterest": penal_interest if penal_interest is not None else 2,
             "advancedCashReceiptImage": None, "advanceCashDeclarationImage": None,
             "receiptNumber": None, "appraiserCharges": 0,
             "actualProcessingCharge": first_interest,
@@ -6197,7 +6330,7 @@ class GoldLoanApiTest:
         "total_final_interest_amt", "secured_rpg", "secured_ltv", "tenure_months",
         "interest_rate", "secured_processing_charge", "upfront_interest_amount",
         "secured_exposure", "secured_rebate_interest", "loan_start_date", "loan_end_date",
-        "max_loan_limit", "min_loan_amount", "max_loan_amount", "purpose_id",
+        "max_loan_limit", "min_loan_amount", "max_loan_amount", "purpose_id", "purpose_type",
         "nominee_relation_id", "ornament_type_id", "karat_id", "reference_code",
         "lead_converter_id",
     )
@@ -6220,10 +6353,16 @@ class GoldLoanApiTest:
         self.stamp_duty_from_server = False
         # Containers
         self.customer_details = {}
+        self.customer_loan_data = {}
+        self.final_loan_details_data = {}
+        self.secured_scheme = {}
+        self.purpose_record = {}
         self.selected_scheme = {}
         self.loan_ornaments_details = []
         self.interest_table_data = []
         self.available_packet = {}
+        self.packet_prepared = False
+        self._created_packet_unique = None
         self.passbook_proofs = []
         self.karza_account_details = {}
         self._diagnostics = {}
@@ -6346,6 +6485,10 @@ class GoldLoanApiTest:
             # show the live co-lender menu and let the user choose before the loan flow starts.
             if self.co_lender_interactive:
                 await self.choose_co_lender_interactive()
+
+            # Every run starts by generating its own packet (admin create + assign to the appraiser).
+            self._log_step("Generate Packet (admin)")
+            await self.prepare_packet()
 
             if self.existing_customer_id or self.existing_customer_unique_id:
                 self._log_step("Load Existing Customer")
@@ -6581,6 +6724,14 @@ def main():
     parser.add_argument("--amount", type=float,
                         help="Requested loan amount (default 400000; capped at eligibility). "
                              "Over 500000 adds a BM-approval step.")
+    parser.add_argument("--purpose-type", choices=sorted(GoldLoanApiTest.PURPOSE_TYPES) + ["any"],
+                        default=os.getenv("GOLD_LOAN_PURPOSE_TYPE", "cb").strip().lower(),
+                        help="Loan purpose type (default: %(default)s): 'cb' = Consumption Based, "
+                             "'igl' = Income Generating (e.g. Agricultural Purposes), 'any' = either. "
+                             "A random active purpose of that type is chosen.")
+    parser.add_argument("--purpose", metavar="NAME",
+                        help="Pin one loan purpose by name, e.g. \"Agricultural Purposes\" "
+                             "(overrides --purpose-type; its own type is used).")
     parser.add_argument("--fresh-request", action="store_true",
                         help="If an appraiser request already exists for the customer, cancel its "
                              "loan and create a new request. Default is to RESUME the existing "
@@ -6611,6 +6762,9 @@ def main():
         os.environ["GOLD_LOAN_SCHEME_ID"] = args.scheme
     if args.fresh_request:
         os.environ["GOLD_LOAN_FRESH_APPRAISER_REQUEST"] = "true"
+    os.environ["GOLD_LOAN_PURPOSE_TYPE"] = args.purpose_type
+    if args.purpose:
+        os.environ["GOLD_LOAN_PURPOSE"] = args.purpose
 
     suite = GoldLoanApiTest()
     suite.existing_customer_id = ""
@@ -6639,6 +6793,8 @@ def main():
     print(f">> Partner: {args.partner} ({partner_env})"
           + (f"  |  scheme: {args.scheme}" if args.scheme else "")
           + f"  |  co-lending: {co_lender_label}")
+    print(f">> Purpose: {args.purpose!r} (pinned)" if args.purpose
+          else f">> Purpose: random, type={args.purpose_type}")
 
     if args.count > 1:
         who = (f"the SAME customer {args.customer}" if args.customer else "a NEW customer each")

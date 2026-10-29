@@ -2857,7 +2857,9 @@
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "GL.soft('customer-loan-details');"
+                  "GL.soft('customer-loan-details');",
+                  "// basic-details is filled from customerData, as in the web app.",
+                  "if (pm.response.code < 400) { GL.setJson('cld', GL.json().customerData || {}); }"
                 ]
               }
             }
@@ -2893,12 +2895,36 @@
                 "exec": [
                   "GL.ok('purposes');",
                   "var d = GL.json().data;",
-                  "if (!Array.isArray(d)) {",
-                  "  var lists = Object.keys(d).map(function (k) { return d[k]; })",
-                  "                  .filter(function (v) { return Array.isArray(v); });",
-                  "  d = lists[0] || [];",
+                  "var groups = Array.isArray(d) ? { '': d } : (d || {});",
+                  "var all = [];",
+                  "Object.keys(groups).forEach(function (k) {",
+                  "  if (!Array.isArray(groups[k])) return;",
+                  "  groups[k].forEach(function (p) {",
+                  "    if (p && p.name && p.isActive !== false) {",
+                  "      all.push({ name: p.name, purposeType: p.purposeType || k || 'Consumption Based' });",
+                  "    }",
+                  "  });",
+                  "});",
+                  "var types = { cb: 'consumption based', igl: 'income generating' };",
+                  "var wantName = String(GL.get('purpose_name', '')).trim().toLowerCase();",
+                  "var kind = String(GL.get('purpose_type', 'cb') || 'cb').trim().toLowerCase();",
+                  "var pool;",
+                  "if (wantName) {",
+                  "  pool = all.filter(function (p) { return p.name.trim().toLowerCase() === wantName; });",
+                  "  if (!pool.length) pool = all.filter(function (p) { return p.name.toLowerCase().indexOf(wantName) >= 0; });",
+                  "  pool = pool.slice(0, 1);",
+                  "} else if (kind === 'any') {",
+                  "  pool = all;",
+                  "} else {",
+                  "  pool = all.filter(function (p) { return p.purposeType.toLowerCase() === types[kind]; });",
                   "}",
-                  "GL.set('purpose', GL.pick(d).name);"
+                  "pm.test('loan purpose available (' + (wantName || kind) + ')', function () {",
+                  "  pm.expect(pool.length, 'purposes: ' + JSON.stringify(all)).to.be.above(0);",
+                  "});",
+                  "var chosen = GL.pick(pool);",
+                  "GL.set('purpose', chosen.name);",
+                  "GL.set('purpose_type_value', chosen.purposeType);",
+                  "GL.log('purpose', chosen.name, '[' + chosen.purposeType + ']');"
                 ]
               }
             }
@@ -2937,6 +2963,9 @@
                 "exec": [
                   "eval(pm.collectionVariables.get(\"GL_LIB\"));",
                   "GL.role('appraiser');",
+                  "var cld = GL.getJson('cld', {});",
+                  "var cldBranch = cld.internalBranch || {};",
+                  "var cldKyc = cld.customerKycPersonal || {};",
                   "if (!GL.get('age') || !GL.get('dob')) {",
                   "  var da = GL.dobAge(); GL.set('dob', da.dob); GL.set('age', da.age);",
                   "}",
@@ -2951,12 +2980,12 @@
                   "  panImg: GL.get('pan_image') || null, partReleaseId: null,",
                   "  requestId: GL.int(GL.get('appraiser_request_id')),",
                   "  customerName: GL.get('first_name') + ' ' + GL.get('last_name'),",
-                  "  form60Img: null, age: String(GL.get('age')), branchName: 'Augmont',",
+                  "  form60Img: null, age: String(GL.get('age')), branchName: cldBranch.name || 'Augmont',",
                   "  branchDistance: null, gender: GL.get('gender'),",
-                  "  appraiserName: GL.get('appraiser_name'), tillDateOutstanding: '3122296.67',",
-                  "  appraiserMobileNumber: GL.get('appraiser_mobile'), currentActiveLoans: 2,",
+                  "  appraiserName: GL.get('appraiser_name'), tillDateOutstanding: String(cld.tillDateOutstanding != null ? cld.tillDateOutstanding : '0.00'),",
+                  "  appraiserMobileNumber: GL.get('appraiser_mobile'), currentActiveLoans: cld.currentActiveLoans != null ? cld.currentActiveLoans : 0,",
                   "  cpvImageFullUrl: GL.fullUrl('assets/CPV.pdf'),",
-                  "  annualIncome: GL.get('annual_income'), motherName: GL.get('mother_name'),",
+                  "  annualIncome: cldKyc.annualIncome || GL.get('annual_income'), motherName: GL.get('mother_name'),",
                   "  religionId: GL.int(GL.get('religion_id')),",
                   "  physicalChallengeId: GL.int(GL.get('physical_challenge_id')),",
                   "  occupationId: GL.int(GL.get('occupation_id')),",
@@ -2966,7 +2995,8 @@
                   "  qualificationId: GL.int(GL.get('qualification_id')),",
                   "  politicalExposedId: GL.int(GL.get('political_exposed_id')),",
                   "  specialCategoryId: GL.int(GL.get('special_category_id')),",
-                  "  incomeGeneratingDocuments: null, purposeType: 'Consumption Based',",
+                  "  incomeGeneratingDocuments: null,",
+                  "  purposeType: GL.get('purpose_type_value') || 'Consumption Based',",
                   "  checkPointers: {}",
                   "});"
                 ]
@@ -3743,6 +3773,8 @@
                   "} else {",
                   "  var d = GL.json().data || {};",
                   "  var ss = d.securedScheme || {};",
+                  "  var cyc = String(ss.interestBillingCycleType || '').toLowerCase().replace(/days?/, '').trim();",
+                  "  GL.set('payment_frequency', /^\\d+$/.test(cyc) ? cyc + ' Days' : '30 Days');",
                   "  // Capture the scheme's real rate/gram + LTV, and the loan-calculator params the",
                   "  // server computed. final-loan-details must echo these or it 400s.",
                   "  if (ss.rpg) { GL.set('secured_rpg', GL.num(ss.rpg)); }",
@@ -3878,7 +3910,7 @@
                   "  schemeId: GL.int(GL.get('scheme_id')),",
                   "  finalLoanAmount: GL.num(GL.get('final_loan_amount')),",
                   "  tenure: tenure, loanStartDate: start, loanEndDate: end,",
-                  "  paymentFrequency: '30 Days', totalFinalInterestAmt: null,",
+                  "  paymentFrequency: GL.get('payment_frequency', '30 Days'), totalFinalInterestAmt: null,",
                   "  unsecuredInterestRate: null, interestRate: GL.num(GL.get('interest_rate')),",
                   "  processingCharge: GL.num(GL.get('secured_processing_charge')),",
                   "  unsecuredSchemeId: null,",
@@ -3886,11 +3918,13 @@
                   "  unsecuredLoanAmount: null, isUnsecuredSchemeApplied: false,",
                   "  unsecuredRebateInterest: null, securedRebateInterest: null,",
                   "  otherAmount: null, loanTransferExtraAmount: null,",
-                  "  upfrontInterestAmount: 0, topUpAmount: 0, securedTopUpAmount: 0,",
+                  "  upfrontInterestAmount: GL.num(GL.get('upfront_interest_amount')), topUpAmount: 0,",
+                  "  securedTopUpAmount: 0,",
                   "  unsecuredTopUpAmount: 0, manualCharges: [], unsecuredRpg: null,",
                   "  securedRpg: GL.num(GL.get('secured_rpg'), 4480), unsecuredPartnerId: null,",
-                  "  unsecuredprocessingCharge: 0, securedprocessingCharge: 0,",
-                  "  securedExposure: '0.13'",
+                  "  unsecuredprocessingCharge: 0,",
+                  "  securedprocessingCharge: GL.num(GL.get('secured_processing_charge')),",
+                  "  securedExposure: String(GL.get('secured_exposure', '0'))",
                   "});"
                 ]
               }
@@ -3985,7 +4019,7 @@
                   "    partnerId: GL.int(GL.get('partner_id')), coLenderBankId: co ? GL.int(co) : null,",
                   "    schemeId: GL.int(GL.get('scheme_id')), finalLoanAmount: finalAmt,",
                   "    tenure: tenure, loanStartDate: start, loanEndDate: end,",
-                  "    paymentFrequency: '30 Days',",
+                  "    paymentFrequency: GL.get('payment_frequency', '30 Days'),",
                   "    totalFinalInterestAmt: GL.num(GL.get('total_final_interest_amt')),",
                   "    unsecuredInterestRate: null, interestRate: GL.num(GL.get('interest_rate')),",
                   "    processingCharge: GL.num(GL.get('secured_processing_charge')),",
@@ -4014,6 +4048,9 @@
                 "type": "text/javascript",
                 "exec": [
                   "GL.ok('final-loan-details');",
+                  "// bank-details is filled from this response (balances, cash limits, charges,",
+                  "// stamp duty), as in the web app.",
+                  "if (pm.response.code < 400) { GL.setJson('fld', GL.json()); }",
                   "if (pm.response.code >= 400 &&",
                   "    pm.response.text().toLowerCase().indexOf('eligible amount') >= 0) {",
                   "  GL.log('ELIGIBILITY MISMATCH. Sent', GL.get('total_eligible_amount'),",
@@ -4246,12 +4283,20 @@
                 "exec": [
                   "eval(pm.collectionVariables.get(\"GL_LIB\"));",
                   "GL.role('appraiser');",
-                  "var proc = GL.num(GL.get('secured_processing_charge'));",
-                  "var upfront = GL.num(GL.get('upfront_interest_amount'));",
+                  "var fld = GL.getJson('fld', {});",
+                  "var bal = fld.getBalance || {};",
+                  "var cash = fld.getAdvanceCashParameters || {};",
+                  "function srv(v, fallback) { return (v === undefined || v === null || v === '') ? GL.num(fallback) : GL.num(v); }",
+                  "// The server's own figures from final-loan-details (fallback: check-loan-type's).",
+                  "var proc = srv(fld.actualProcessingCharge, GL.get('secured_processing_charge'));",
+                  "var upfront = srv(fld.upfrontInterestAmount, GL.get('upfront_interest_amount'));",
+                  "// Stamp duty: the server's figure always wins (0 included); 1500 only if none stated.",
+                  "var stamp = srv(fld.stampDutyCharges, GL.get('stamp_duty_fallback', '1500'));",
+                  "var apprPct = fld.appraiserChargesApplied ? (fld.appraiserCharges || 0) : 0;",
                   "var finalAmt = GL.num(GL.get('final_loan_amount'));",
-                  "// toBePaid MUST equal finalLoanAmount - processingCharge - upfrontInterest, or the",
-                  "// server rejects with 'To Be Paid amount is incorrect'.",
-                  "var toBePaid = GL.round2(finalAmt - proc - upfront);",
+                  "// toBePaid MUST equal finalLoanAmount - processingCharge - upfrontInterest - stampDuty,",
+                  "// or the server rejects with 'To Be Paid amount is incorrect'.",
+                  "var toBePaid = GL.round2(finalAmt - proc - upfront - stamp);",
                   "var verified = String(GL.get('bank_account_verified')) === 'true';",
                   "var p = GL.get('passbook_proof');",
                   "GL.body({",
@@ -4265,9 +4310,10 @@
                   "  passbookProof: [p, p],",
                   "  passbookProofImage: [GL.fullUrl(p), GL.fullUrl(p)],",
                   "  passbookProofImageName: [GL.baseName(p), GL.baseName(p)],",
-                  "  account: 1508, detailsFor: 'customer', customerTransferBalance: 0,",
-                  "  internalBranchTransferBalance: 17882793.96,",
-                  "  internalBranchBlockedBalance: 11916017.72,",
+                  "  account: null, detailsFor: 'customer',",
+                  "  customerTransferBalance: bal.customerTransferBalance || 0,",
+                  "  internalBranchTransferBalance: bal.branchTotalHolding,",
+                  "  internalBranchBlockedBalance: bal.branchTotalBlockedBalance,",
                   "  advanceBankTransfer: 0, advanceBankTransactionId: null, advanceCash: 0,",
                   "  advanceCashTransactionId: [], advanceCashTransactionImage: [],",
                   "  advanceCashTransactionImageName: '', advanceCashDeclarationId: [],",
@@ -4281,10 +4327,12 @@
                   "  signature: GL.get('signature_proof'), pendingAmount: '',",
                   "  totalPledgedGoldAmount: '', extraAmountDisbursed: '', advanceAmount: '',",
                   "  modeOfPayment: '', appraiserCharges: 0, actualAppraiserCharges: 0,",
-                  "  appraiserChargesPercentage: 0, actualCashGiven: 0,",
+                  "  appraiserChargesPercentage: apprPct, actualCashGiven: 0,",
                   "  availableLimitForDisbuserment: toBePaid, wavierAppraiserCharges: 0,",
-                  "  stampDutyCharges: 0, stampDutyDefinitionType: null, stampDutyRemarks: '',",
-                  "  totalLimitForCashDisbursal: 200000, multiModeDisbursement: true,",
+                  "  stampDutyCharges: stamp, stampDutyDefinitionType: fld.stampDutyDefinitionType || null,",
+                  "  stampDutyRemarks: '',",
+                  "  totalLimitForCashDisbursal: cash.totalLimitForCashDisbursal != null ? cash.totalLimitForCashDisbursal : 200000,",
+                  "  multiModeDisbursement: cash.multiModeDisbursement != null ? cash.multiModeDisbursement : true,",
                   "  checkPointers: {}, loanId: GL.int(GL.get('loan_id')),",
                   "  masterLoanId: GL.int(GL.get('master_loan_id')), loanType: 'Fresh Loan',",
                   "  createdBy: String(GL.get('logged_in_user_id')),",
@@ -4396,7 +4444,7 @@
                   "eval(pm.collectionVariables.get(\"GL_LIB\"));",
                   "// Packet create + assign require ADMIN; sealing runs as the appraiser.",
                   "GL.role('admin');",
-                  "var unique = 'pac-' + GL.ri(10000000, 99999999);",
+                  "var unique = 'pac' + GL.ri(10000000, 99999999);",
                   "GL.set('packet_unique_id', unique);",
                   "GL.body({",
                   "  id: null, packetUniqueId: unique,",
@@ -4547,6 +4595,8 @@
                   "// loanUniqueId (AUGM-...) is assigned at the assign-packet stage.",
                   "var d = GL.json().data || {};",
                   "if (d.loanUniqueId) { GL.set('loan_unique_id', d.loanUniqueId); }",
+                  "// partner-wise-disbursement's penalInterest comes from here (not the scheme's).",
+                  "if (d.penalInterest !== undefined && d.penalInterest !== null) { GL.set('penal_interest', d.penalInterest); }",
                   "GL.log('loanUniqueId', GL.get('loan_unique_id'));"
                 ]
               }
@@ -5690,11 +5740,12 @@
                   "  upfrontTransactionId: null, upfrontReceiptImage: null, upfrontReceipt: null,",
                   "  fullUnsecuredTopUpAmount: 0, fullSecuredTopUpAmount: 0, finalTopUpAmount: 0,",
                   "  securedTopUpAmount: 0, unsecuredTopUpAmount: 0,",
-                  "  advanceBankTransfer: 0, advanceCash: 0, bTMoney: 0, penalInterest: 2,",
+                  "  advanceBankTransfer: 0, advanceCash: 0, bTMoney: 0, penalInterest: pick('penalInterest', GL.num(GL.get('penal_interest', '2'))),",
                   "  advancedCashReceiptImage: null, advanceCashDeclarationImage: null,",
                   "  receiptNumber: null, appraiserCharges: 0,",
                   "  actualProcessingCharge: firstInterest, actualCashGiven: 0,",
-                  "  stampDutyCharges: '0.00', stampDutyRemarks: '', paymentGatewayId: 5,",
+                  "  stampDutyCharges: pick('stampDutyCharges', '0.00'), stampDutyRemarks: '',",
+                  "  paymentGatewayId: 5,",
                   "  partnerId: GL.int(GL.get('partner_id'), 152), loanType: 'Fresh Loan'",
                   "});"
                 ]
@@ -6255,6 +6306,24 @@
       "description": "Co-lender bank name or id; empty = no co-lending"
     },
     {
+      "key": "purpose_type",
+      "value": "cb",
+      "type": "string",
+      "description": "Loan purpose type: cb = Consumption Based, igl = Income Generating, any"
+    },
+    {
+      "key": "purpose_name",
+      "value": "",
+      "type": "string",
+      "description": "Pin one loan purpose by name (e.g. Agricultural Purposes); overrides purpose_type"
+    },
+    {
+      "key": "stamp_duty_fallback",
+      "value": "1500",
+      "type": "string",
+      "description": "Stamp duty used ONLY when final-loan-details states none"
+    },
+    {
       "key": "hmac_secret",
       "value": "3056301006072a8648ce3d020106052b8104000a0342000499c5f442c3264bcdfb093b0bc820e3f0f6546972856ebec2f8ccc03f49abdb47ffcfcaf4f37e0ec53050760e74014767e30a8a3e891f4db8c83fa27627898f15",
       "type": "string",
@@ -6619,6 +6688,21 @@
       "type": "string"
     },
     {
+      "key": "purpose_type_value",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "payment_frequency",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "penal_interest",
+      "value": "",
+      "type": "string"
+    },
+    {
       "key": "nominee_relation",
       "value": "",
       "type": "string"
@@ -6835,6 +6919,16 @@
     },
     {
       "key": "partner_branch_id_resolved",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "cld",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "fld",
       "value": "",
       "type": "string"
     },

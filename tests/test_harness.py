@@ -588,9 +588,9 @@ def packet_batch(count, assign=True, script=None):
             raise Exception(f"server rejected packet {i}")
         if s.auth_token != "admin-tok":
             raise Fail("create_packet ran without the admin token")
-        s._created_packet_unique = f"pac-1000000{i}"
+        s._created_packet_unique = f"pac1000000{i}"
         if outcome != "unresolved":
-            s.available_packet = {"id": 10390 + i, "packetUniqueId": f"pac-1000000{i}"}
+            s.available_packet = {"id": 10390 + i, "packetUniqueId": f"pac1000000{i}"}
         # On "unresolved" we deliberately LEAVE available_packet untouched, exactly as the real
         # create_packet does when its listing lookup fails -- so the previous packet is still
         # sitting there. Only create_one's own reset stops it being re-assigned.
@@ -2613,6 +2613,153 @@ def _():
     missing_attrs = [a for a in KycOnlyTest.PER_CUSTOMER_STATE if not hasattr(s, a)]
     close(s)
     eq(missing_attrs, [], "PER_CUSTOMER_STATE names that are not real attributes")
+
+
+# --------------------------------------------------------------------------------------------
+# loan purpose: CB / IGL selection across every /api/purpose group
+# --------------------------------------------------------------------------------------------
+
+PURPOSES = resp_body(find(E2E, "/api/purpose"))
+
+def purpose_suite(**env):
+    for k in ("GOLD_LOAN_PURPOSE", "GOLD_LOAN_PURPOSE_TYPE"):
+        os.environ.pop(k, None)
+    s = suite("manual", **env)
+    record_requests(s, lambda path: PURPOSES)
+    return s
+
+def pick_purpose(s):
+    quiet(lambda: asyncio.run(s._fetch_loan_purposes()))
+    return s.purpose_id, s.purpose_type
+
+@test("purpose: default (cb) only ever picks Consumption Based purposes")
+def _():
+    s = purpose_suite()
+    seen = {pick_purpose(s)[1] for _ in range(40)}
+    close(s)
+    eq(seen, {"Consumption Based"}, "purpose types picked")
+
+@test("purpose: igl only ever picks Income Generating purposes")
+def _():
+    s = purpose_suite(GOLD_LOAN_PURPOSE_TYPE="igl")
+    seen = {pick_purpose(s)[1] for _ in range(40)}
+    close(s)
+    eq(seen, {"Income Generating"}, "purpose types picked")
+
+@test("purpose: cb stays Consumption Based when Income Generating is listed FIRST (as on TEST)")
+def _():
+    reordered = {"data": {"Income Generating": PURPOSES["data"]["Income Generating"],
+                          "Consumption Based": PURPOSES["data"]["Consumption Based"]}}
+    s = purpose_suite()
+    record_requests(s, lambda path: reordered)
+    seen = {pick_purpose(s)[1] for _ in range(40)}
+    close(s)
+    eq(seen, {"Consumption Based"}, "default cb must not take the first group")
+
+@test("purpose: --purpose pins by name (case-insensitive) and carries its own type")
+def _():
+    s = purpose_suite(GOLD_LOAN_PURPOSE="agricultural purposes", GOLD_LOAN_PURPOSE_TYPE="cb")
+    got = pick_purpose(s)
+    close(s)
+    eq(got, ("Agricultural Purposes", "Income Generating"), "pinned purpose")
+
+@test("purpose: an unknown purpose name fails and lists what is available")
+def _():
+    s = purpose_suite(GOLD_LOAN_PURPOSE="No Such Purpose")
+    try:
+        pick_purpose(s)
+    except RuntimeError as e:
+        ok("Agricultural Purposes (Income Generating)" in str(e), f"error lists purposes: {e}")
+    else:
+        raise Fail("expected a RuntimeError for an unknown purpose")
+    finally:
+        close(s)
+
+@test("purpose: basic-details sends the chosen purpose's purposeType, not a hard-coded one")
+def _():
+    s = purpose_suite(GOLD_LOAN_PURPOSE="Agricultural Purposes")
+    calls = record_requests(s, lambda path: PURPOSES if "/api/purpose" in path
+                            else {"loanId": 1, "masterLoanId": 2})
+    s.age, s.dob, s.signature_proof = 30, "1990-01-01", "uploads/customer/sig.png"
+    quiet(lambda: asyncio.run(s.store_loan_basic_details()))
+    close(s)
+    body = next(b for m, p, b in calls if p == "/api/loan-process/basic-details")
+    eq((body["purpose"], body["purposeType"]), ("Agricultural Purposes", "Income Generating"),
+       "basic-details purpose fields")
+
+
+# --------------------------------------------------------------------------------------------
+# server-sourced values: request fields come from earlier responses, as in the web app
+# --------------------------------------------------------------------------------------------
+
+@test("server-values: basic-details takes branch / outstanding / active loans from customer-loan-details")
+def _():
+    cld = resp_body(find(E2E, "/api/loan-process/customer-loan-details"))
+    want = req_body(find(E2E, "/api/loan-process/basic-details", "POST"))
+    s = suite("manual")
+    calls = record_requests(s, lambda path: cld if "customer-loan-details" in path
+                            else PURPOSES if "/api/purpose" in path
+                            else {"loanId": 1, "masterLoanId": 2})
+    s.appraiser_request_id = "13501"
+    s.dob, s.signature_proof = "1990-01-01", "uploads/customer/sig.png"
+    quiet(lambda: asyncio.run(s.fetch_customer_loan_details()))
+    quiet(lambda: asyncio.run(s.store_loan_basic_details()))
+    close(s)
+    body = next(b for m, p, b in calls if p == "/api/loan-process/basic-details")
+    for key in ("branchName", "tillDateOutstanding", "currentActiveLoans", "annualIncome"):
+        eq(body[key], want[key], f"basic-details {key}")
+
+@test("server-values: bank-details balances, cash limit, charges and stamp duty come from final-loan-details")
+def _():
+    fld = resp_body(find(E2E, "/api/loan-process/final-loan-details"))
+    want = req_body(find(E2E, "/api/loan-process/bank-details", "POST"))
+    s = suite("manual")
+    calls = record_requests(s)
+    fake_uploads(s)
+    s.partner_id = "152"
+    s.final_loan_amount = fld["finalLoanAmount"]
+    s.secured_processing_charge = 999999       # must NOT be used: the server's figure wins
+    s.logged_in_user_id = fld["getBalance"]["userId"]
+    s.loan_id, s.master_loan_id = "1", "2"
+    class R:
+        def json(self_inner): return fld
+    quiet(lambda: s._capture_final_loan_details(R()))
+    quiet(lambda: asyncio.run(s.store_bank_details()))
+    close(s)
+    body = next(b for m, p, b in calls if p == "/api/loan-process/bank-details")
+    for key in ("toBePaid", "actualProcessingCharge", "internalBranchTransferBalance",
+                "internalBranchBlockedBalance", "customerTransferBalance",
+                "totalLimitForCashDisbursal", "multiModeDisbursement", "appraiserChargesPercentage",
+                "stampDutyCharges", "account", "createdBy"):
+        mine, theirs = body[key], want[key]
+        if isinstance(mine, (int, float)) and isinstance(theirs, (int, float)) and not isinstance(mine, bool):
+            mine, theirs = float(mine), float(theirs)   # 396000.0 is sent as 396000 (js-number normalize)
+        eq(str(mine), str(theirs), f"bank-details {key}")
+
+@test("server-values: a stated stamp duty of 0 wins over the 1500 default for every partner")
+def _():
+    for partner in ("152", "10"):
+        s = suite("manual")
+        s.partner_id = partner
+        class R:
+            def json(self_inner): return {"stampDutyCharges": 0, "stampDutyDefinitionType": None}
+        quiet(lambda: s._capture_stamp_duty(R()))
+        close(s)
+        eq((s.stamp_duty_charges, s.stamp_duty_from_server), (0.0, True), f"partner {partner} stamp duty")
+
+@test("server-values: interest table uses the scheme's exposure, processing charge and billing cycle")
+def _():
+    s = suite("manual")
+    table = resp_body(find(E2E, "/api/loan-process/generate-interest-table"))
+    calls = record_requests(s, lambda path: table)
+    s.secured_exposure, s.secured_processing_charge, s.upfront_interest_amount = "0.18", 4000, 0
+    s.secured_scheme = {"interestBillingCycleType": "30Days"}
+    s.final_loan_amount, s.scheme_id, s.partner_id = 400000, "853", "152"
+    quiet(lambda: asyncio.run(s.generate_interest_table()))
+    close(s)
+    body = next(b for m, p, b in calls if p.endswith("/generate-interest-table"))
+    eq((body["securedExposure"], body["securedprocessingCharge"], body["paymentFrequency"]),
+       ("0.18", 4000, "30 Days"), "interest-table scheme fields")
 
 
 # --------------------------------------------------------------------------------------------

@@ -43,7 +43,7 @@ The flow spans several roles; the harness logs into each one as needed (static O
 | Partner (Roshan) | 8767002003 | 8767002002  | Partner approval + disbursement — depends on `--partner` |
 | Partner (Arvog)  | 9375876473 | 8846651348  | Partner approval + disbursement — depends on `--partner` |
 | Partner branch user (Roshan) | 8652849318 | 8652849318 | Receives the packet at submit-packet |
-| Partner branch user (Arvog)  | 8899999999 | 8888888880 | Receives the packet at submit-packet |
+| Partner branch user (Arvog)  | 7777777788 | 8888888880 | Receives the packet at submit-packet |
 
 `GOLD_LOAN_PARTNER_USER_MOBILE` overrides the branch user if one of these ever changes. Everything
 else about the partner handover (packet location, partner branch id) is resolved from the API at
@@ -94,6 +94,8 @@ python src/maintest.py --env uat --customer MS35QNJP # existing customer, on UAT
 | `--scheme ID`       | *(auto)*    | Pin a specific scheme id (e.g. `853`).                        |
 | `--co-lender [NAME\|ID]` | off    | Co-lending: pass a bank, or pass it bare to pick from a menu. |
 | `--amount N`        | `400000`    | Requested loan amount in rupees (capped at eligibility).      |
+| `--purpose-type T`  | `cb`        | Loan purpose type: `cb` (Consumption Based), `igl` (Income Generating) or `any`. |
+| `--purpose NAME`    | *(random)*  | Pin one purpose by name, e.g. `"Agricultural Purposes"` (uses its own type). |
 | `--kyc MODE`        | `manual`    | Identity mode: `manual`, `auto` or `ovd` — see below.         |
 | `--kyc-profile PATH`| `config/kyc_identity.json` | Real identity data for `auto`/`ovd`.           |
 | `--login ROLE`      | `appraiser` | Login role for the main flow.                                 |
@@ -193,6 +195,17 @@ python src/maintest.py --amount 550000            # over ₹5L → BM approval s
 python src/maintest.py --customer MS35QNJP --amount 250000
 ```
 
+**`--purpose-type cb|igl|any` / `--purpose <NAME>`** — the loan purpose on the basic-details page.
+`/api/purpose` lists purposes grouped by type (**CB** = Consumption Based, **IGL** = Income
+Generating, e.g. Agricultural Purposes); the harness picks a random active purpose of the chosen type
+(default `cb`) and sends that purpose's own `purposeType`. `--purpose` pins one by name (case-insensitive)
+and fails with the available list if the environment has no such purpose — the lists differ between
+TEST and UAT.
+```bash
+python src/maintest.py --purpose-type igl                    # random Income Generating purpose
+python src/maintest.py --purpose "Agricultural Purposes"     # that exact purpose (IGL on TEST)
+```
+
 **`--login <ROLE>`** — which role logs in to drive the main flow (default `appraiser`). The harness
 still switches to admin / BM / ops / partner automatically for the steps that require them (packet
 assign, BM/ops ratings, partner approval + disbursement), so you rarely need to change this.
@@ -225,6 +238,9 @@ All optional; sensible defaults are baked in. Common ones:
 | `GOLD_LOAN_PARTNER_USER_MOBILE`       | Partner-branch user for submit-packet (overrides the environment's) |
 | `GOLD_LOAN_AUTH_TOKEN`                | Supply a JWT to skip login (must contain `internalBranchId`, `id`) |
 | `GOLD_LOAN_AMOUNT`                    | Requested loan amount (also settable via `--amount`)       |
+| `GOLD_LOAN_HTTP_TIMEOUT`              | Seconds to wait for a server reply (default `60`; httpx's own default of 5 s was too short) |
+| `GOLD_LOAN_PURPOSE_TYPE`              | `cb` / `igl` / `any` (also settable via `--purpose-type`)  |
+| `GOLD_LOAN_PURPOSE`                   | Pin one loan purpose by name (also settable via `--purpose`) |
 | `GOLD_LOAN_EXISTING_CUSTOMER_UNIQUE_ID` | Existing-customer unique id (also settable via `--customer`) |
 | `GOLD_LOAN_KYC_MODE`                  | `manual` / `auto` / `ovd` (also settable via `--kyc`)       |
 | `GOLD_LOAN_KYC_TYPE`                  | `kycType` on the v2 endpoints (default `RE_KYC`)           |
@@ -390,3 +406,85 @@ Generated at runtime, in the project root (git-ignored): `loan_calc_debug.json`,
   re-run `python tools/build_postman_collection.py` after any change to a request body or ordering.
 - For the deep "why", the hard-won domain rules, and per-endpoint gotchas, read
   `.claude/skills/gold-loan-api-test/SKILL.md`.
+
+## Flag reference (all runners)
+
+Every command-line flag in the project, in one place. Run any script with `--help` for the same list.
+
+### `src/maintest.py` — full end-to-end loan
+
+The same flags work unchanged on `src/test_stop_before_documents.py` (stops before upload documents)
+and `src/test_stop_before_disbursement.py` (stops after ops rating), which reuse this CLI.
+
+| Flag | Values | Default | What it does | Env var equivalent |
+|---|---|---|---|---|
+| `--env` | `test` \| `uat` | `test` | Target environment: `test` = gfat, `uat` = gfau. Picks the API host, `Origin`, and every role/partner login. | `GOLD_LOAN_ENV` |
+| `--customer` | customer unique id | *(none — create new)* | New loan for an EXISTING customer (KYC skipped if already approved). Omit to create a new customer and run KYC. | `GOLD_LOAN_EXISTING_CUSTOMER_UNIQUE_ID` |
+| `--partner` | `roshan` \| `arvog` | `roshan` | Lending partner (exactly one per loan): Roshan Partner (ROS-152) or Arvog (ARV-10). | `GOLD_LOAN_PARTNER_NAME` |
+| `--scheme` | scheme id | *(auto-pick)* | Pin one scheme id (e.g. `853`) instead of auto-picking within the partner. | `GOLD_LOAN_SCHEME_ID` |
+| `--co-lender` | bank name/id, or no value | off | Co-lending with a named bank (`DCB`, `4`); bare `--co-lender` shows a menu to pick from. | `GOLD_LOAN_CO_LENDER` |
+| `--kyc` | `manual` \| `auto` \| `ovd` | `manual` | Identity mode: generated dummy PAN/Aadhaar, real PAN + offline-Aadhaar XML, or real OVD (Voter ID / DL) + Form 97. | `GOLD_LOAN_KYC_MODE` |
+| `--kyc-profile` | path | `config/kyc_identity.json` | Real identity data for `--kyc auto` / `ovd`. | `GOLD_LOAN_KYC_PROFILE` |
+| `--login` | role | `appraiser` | Role that logs in to drive the main flow. | — |
+| `--amount` | rupees | `400000` | Requested loan amount, capped at eligibility. At or above ₹5,00,000 adds the BM-rating step (the server decides). | `GOLD_LOAN_AMOUNT` |
+| `--purpose-type` | `cb` \| `igl` \| `any` | `cb` | Loan purpose type: Consumption Based, Income Generating, or either. A random active purpose of that type is chosen. | `GOLD_LOAN_PURPOSE_TYPE` |
+| `--purpose` | purpose name | *(random)* | Pin one purpose by name (e.g. `"Agricultural Purposes"`); its own type is used. Fails with the available list if the environment has no such purpose. | `GOLD_LOAN_PURPOSE` |
+| `--fresh-request` | *(switch)* | off | If the customer already has an appraiser request, cancel its loan and create a new request (default: resume it). | `GOLD_LOAN_FRESH_APPRAISER_REQUEST=true` |
+| `--count` | N | `1` | Create N loans back to back in one logged-in session. A failed loan does not stop the batch. | — |
+| `-h`, `--help` | | | Show the help text and exit. | |
+
+**Runner-specific behaviour (no extra flags):**
+
+| Script | Stops | Appraiser request |
+|---|---|---|
+| `src/test_stop_before_documents.py` | before Upload Documents (after BM rating) | Always creates a NEW one; never cancels or resumes. If the customer already has one, tries another branch, else stops with a clear error. |
+| `src/test_stop_before_disbursement.py` | after Ops Rating (before partner approval / disbursement) | Same as `maintest.py` (resume by default; `--fresh-request` to recreate). |
+
+### `src/test_kyc.py` — KYC only
+
+| Flag | Values | Default | What it does |
+|---|---|---|---|
+| `--env` | `test` \| `uat` | `test` | Target environment. |
+| `--kyc` | `manual` \| `auto` \| `ovd` | `manual` | Identity mode (as in `maintest.py`). |
+| `--kyc-profile` | path | `config/kyc_identity.json` | Real identity data for `auto` / `ovd`. |
+| `--kyc-type` | string | `RE_KYC` | `kycType` sent on the v2 endpoints (the captured OVD flow used `NEW_KYC`). |
+| `--customer` | customer unique id | *(none — create new)* | Run KYC on an EXISTING customer (Re-KYC). |
+| `--count`, `-n` | N | `1` | How many new customers to create and KYC (manual mode only). |
+| `--skip-ops-approval` | *(switch)* | off | Submit the KYC but leave it pending (no ops approval). |
+| `--pan-type` | `pan` \| `form60` | `pan` | PAN document type for manual/auto mode. |
+| `--login` | role | `appraiser` | Role that runs the KYC. |
+
+### `src/test_create_packets.py` — packets only
+
+| Flag | Values | Default | What it does |
+|---|---|---|---|
+| `--env` | `test` \| `uat` | `test` | Target environment. |
+| `--count`, `-n` | N | `5` | How many packets to create. |
+| `--no-assign` | *(switch)* | off | Create the packets but leave them unassigned. |
+| `--appraiser-id` | user id | *(logged-in appraiser)* | Assign to this appraiser user id instead. |
+| `--login` | role | `appraiser` | Role logged in to source the user id and branch. |
+| `--branch` | branch id | *(from the login JWT)* | Override `internalUserBranch`. |
+| `--delay` | seconds | `0.0` | Wait between packets (useful for large batches). |
+| `--listing-size` | N | `50` | Rows fetched from `/api/packet` when resolving a new packet's id. |
+
+### `src/test_resume_loan.py` — finish an in-flight loan
+
+| Flag | Values | Default | What it does |
+|---|---|---|---|
+| `--loan` | `AUGM-XXXXX` | — | Loan unique id (as on the loan-details screen). One of `--loan` / `--customer` / `--loan-id` is required. |
+| `--customer` | customer unique id | — | Resume the loan on this customer's appraiser request. |
+| `--loan-id` | id | — | Numeric customer loan id; pair with `--master-loan-id`. |
+| `--master-loan-id` | id | — | Master loan id (only alongside `--loan-id`). |
+| `--from` | `ornaments`, `scheme`, `bank`, `appraiser-rating`, `packet`, `bm-rating`, `documents`, `ops-bank`, `ops-rating`, `disburse`, `submit-packet` | *(derived from the loan)* | Force the resume point. |
+| `--env` | `test` \| `uat` | `test` | Target environment. |
+| `--login` | role | `appraiser` | Login role for the main flow. |
+| `--partner` | `roshan` \| `arvog` | `roshan` | Partner whose login disburses the loan. |
+| `--dry-run` | *(switch)* | off | Resolve the loan and print the plan without changing anything. |
+| `--list-steps` | *(switch)* | off | List the resumable step keys and exit. |
+
+### Other scripts
+
+| Script | Arguments | What it does |
+|---|---|---|
+| `tests/test_harness.py` | optional group name prefix (e.g. `purpose`, `kyc-body`, `server-values`) | Offline regression tests; no argument runs every group. |
+| `tools/build_postman_collection.py` | none | Regenerates the Postman collection and environments in `postman/`. Purpose selection there uses the `purpose_type` / `purpose_name` collection variables. |
