@@ -1,7 +1,7 @@
-# src/test_create_packets.py
+# flows/create_packets.py
 """Bulk packet creation + appraiser assignment (admin-driven).
 
-Standalone companion to `maintest.py`. It exercises ONLY the packet half of the
+Standalone companion to `gold_loan/harness.py`. It exercises ONLY the packet half of the
 Gold Loan flow -- no customer, no KYC, no loan -- so you can seed a pool of empty
 packets bound to an appraiser ahead of time (or just regression-test the packet
 endpoints on their own).
@@ -19,12 +19,12 @@ Role tokens are cached per mobile by `_role_token`, so each role logs in once ev
 across many packets (the OTP endpoint rate-limits repeat sends to a number).
 
 Usage:
-    python src/test_create_packets.py                          # 5 packets on TEST, assigned to the appraiser
-    python src/test_create_packets.py --count 20               # 20 packets
-    python src/test_create_packets.py --env uat --count 10     # on UAT (gfau)
-    python src/test_create_packets.py --count 5 --no-assign    # create only, leave unassigned
-    python src/test_create_packets.py --appraiser-id 1473      # bind to a specific appraiser user id
-    python src/test_create_packets.py --count 50 --delay 0.3   # throttle between packets
+    python flows/create_packets.py                          # 5 packets on TEST, assigned to the appraiser
+    python flows/create_packets.py --count 20               # 20 packets
+    python flows/create_packets.py --env uat --count 10     # on UAT (gfau)
+    python flows/create_packets.py --count 5 --no-assign    # create only, leave unassigned
+    python flows/create_packets.py --appraiser-id 1473      # bind to a specific appraiser user id
+    python flows/create_packets.py --count 50 --delay 0.3   # throttle between packets
 
 Exit code is 0 only if every requested packet was created (and assigned, unless
 --no-assign). Failures are collected and listed at the end rather than aborting
@@ -36,13 +36,13 @@ import asyncio
 import os
 import sys
 
-# Allow `python src/test_create_packets.py` from any cwd: put this file's dir on the path
-# so `maintest` resolves whether or not the project root is the working directory.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Allow `python flows/create_packets.py` from any cwd: put this file's dir on the path
+# so `harness` resolves whether or not the project root is the working directory.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # project root
 
 import httpx  # noqa: E402  (after sys.path fix)
 
-from maintest import GoldLoanApiTest  # noqa: E402
+from gold_loan.harness import GoldLoanApiTest  # noqa: E402
 
 
 class PacketBatchTest:
@@ -219,15 +219,14 @@ class PacketBatchTest:
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="test_create_packets.py",
         description="Create multiple Gold Loan packets as ADMIN and assign each to an appraiser.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
-               "  python src/test_create_packets.py                       # 5 packets on TEST\n"
-               "  python src/test_create_packets.py --count 20            # 20 packets\n"
-               "  python src/test_create_packets.py --env uat --count 10  # on UAT (gfau)\n"
-               "  python src/test_create_packets.py --no-assign           # create only\n"
-               "  python src/test_create_packets.py --appraiser-id 1473   # bind to a given appraiser\n",
+               "  python flows/create_packets.py                       # 5 packets on TEST\n"
+               "  python flows/create_packets.py --count 20            # 20 packets\n"
+               "  python flows/create_packets.py --env uat --count 10  # on UAT (gfau)\n"
+               "  python flows/create_packets.py --no-assign           # create only\n"
+               "  python flows/create_packets.py --appraiser-id 1473   # bind to a given appraiser\n",
     )
     parser.add_argument("--env", choices=sorted(GoldLoanApiTest.ENVIRONMENTS),
                         default=os.getenv("GOLD_LOAN_ENV", GoldLoanApiTest.DEFAULT_ENV).strip().lower(),

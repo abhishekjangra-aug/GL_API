@@ -1,34 +1,51 @@
 ---
 name: gold-loan-api-test
-description: Project reference for the Augmont Gold Loan (GL) backend API test harness in src/maintest.py. Load this before analyzing, editing, or debugging the harness, the end-to-end GL flow, KYC, HMAC signing, CryptoJS encryption, scheme/eligibility math, or the env-var configuration — so the codebase does not need to be re-read from scratch.
+description: Project reference for the Augmont Gold Loan (GL) backend API test harness in gold_loan/harness.py. Load this before analyzing, editing, or debugging the harness, the end-to-end GL flow, KYC, HMAC signing, CryptoJS encryption, scheme/eligibility math, or the env-var configuration — so the codebase does not need to be re-read from scratch.
 ---
 
 # Gold Loan API Test Harness — Project Reference
 
 Single-file async Python harness that drives the **Augmont Gold Loan (GL) backend** end-to-end through its real REST API. Use it to validate the full GL journey: auth → customer/KYC → appraiser request → ornaments → scheme/eligibility → bank details → ratings → packet sealing → disbursement/documents.
 
-**Read this file first.** It captures the architecture, invariants, and hard-won domain rules so you don't re-analyze `src/maintest.py` (~4500 lines) each time. When a detail here conflicts with the code, the code wins — re-verify with Grep/Read and update this skill.
+**Read this file first.** It captures the architecture, invariants, and hard-won domain rules so you don't re-analyze `gold_loan/harness.py` (~4500 lines) each time. When a detail here conflicts with the code, the code wins — re-verify with Grep/Read and update this skill.
 
-## Standalone runners & tests (siblings of maintest.py)
+## Project layout & naming convention
 
-Four files wrap `GoldLoanApiTest` rather than subclassing it, so every request body, signature and
-domain rule stays defined once in `maintest.py` and cannot drift:
+- **`gold_loan/harness.py`** — the library: `GoldLoanApiTest` (every API step, signing, encryption) and the
+  full-loan CLI `main()`. It is imported, never copied. `gold_loan/__init__.py` marks the package.
+- **`flows/`** — runnable LIVE scenarios, one CLI per file. Naming: `e2e_<scenario>.py` for loan
+  journeys (`e2e_full_loan`, `e2e_stop_before_documents`, `e2e_stop_before_disbursement`) and
+  `<area>_<action>.py` / `<action>_<object>.py` for focused runs (`kyc_only`, `create_packets`,
+  `resume_loan`). No `test_` prefix: these hit the real backend and are not unit tests.
+  Each flow puts the project root on `sys.path` and imports `gold_loan.harness`.
+- **`tests/`** — OFFLINE regression tests only (`test_<what>.py`; currently `test_offline_harness.py`,
+  run as `python tests/test_offline_harness.py [group-prefix]`). Test names are `"<group>: <behaviour>"`.
+- **`assets/`** upload files,
+  **`config/`** real identity data (git-ignored), **`reference/`** captured HAR ground truth.
+- `e2e_full_loan.py` is a thin wrapper over `harness.main()`; the two `e2e_stop_before_*` flows
+  subclass `GoldLoanApiTest`, override `run_e2e_test` with a copy of the flow cut at their stop point,
+  and reuse `main()` by pointing `harness.GoldLoanApiTest` at the subclass for that process.
 
-- **`src/test_kyc.py`** — the complete KYC journey and nothing else, in any identity mode.
+## Standalone runners (flows/)
+
+The KYC, packet and resume flows wrap `GoldLoanApiTest` rather than subclassing it, so every
+request body, signature and domain rule stays defined once in `gold_loan/harness.py` and cannot drift:
+
+- **`flows/kyc_only.py`** — the complete KYC journey and nothing else, in any identity mode.
   `--kyc {manual,auto,ovd} --kyc-profile --kyc-type --customer --count --skip-ops-approval`.
   `_run_kyc` mirrors `_run_full_kyc` step for step (a test asserts step parity by AST, so adding a
-  step to one and not the other fails). Prints the `maintest.py --customer <uniqueId>` command to
+  step to one and not the other fails). Prints the `flows/e2e_full_loan.py --customer <uniqueId>` command to
   create a loan afterwards. `--count > 1` is refused for auto/ovd — one real person's documents can
   only be registered against one customer. Batch runs call `_reset_for_next_customer()`
   (`PER_CUSTOMER_STATE`) so a customer never inherits the previous PAN/`customerKycId`/verdicts,
   and a `KycDocumentAlreadyExistsError` stops the whole batch, not just one customer.
-- **`src/test_create_packets.py`** — bulk packet create + appraiser assign as admin
+- **`flows/create_packets.py`** — bulk packet create + appraiser assign as admin
   (`--count --no-assign --appraiser-id --delay --listing-size`). Logs in as the appraiser only to
   read its user id + branch, then swaps to a cached admin token for the batch. Two independent
   guards stop a stale re-assign: `create_one` clears `available_packet` before each create (the real
   `create_packet` leaves the PREVIOUS packet in place when its listing lookup fails), and it
   cross-checks the listed `packetUniqueId` against the one just generated.
-- **`src/test_resume_loan.py`** — picks up a loan that is parked at ANY stage and drives it to
+- **`flows/resume_loan.py`** — picks up a loan that is parked at ANY stage and drives it to
   completion (`--loan AUGM-… | --customer UID | --loan-id N [--master-loan-id N]`, plus
   `--from KEY`, `--dry-run`, `--list-steps`, `--env/--login/--partner`). `STEPS` mirrors the
   post-creation half of `run_e2e_test` as 11 keyed units (ornaments → scheme → bank →
@@ -45,7 +62,7 @@ domain rule stays defined once in `maintest.py` and cannot drift:
   `single-loan.data` + `masterLoan` (ids, amounts, tenure, charges, bank detail, appraiser request,
   branch) and the KYC artifacts come from `get_customer_by_id` + `_prepare_loan_fields_from_existing`.
   Stages `12/13/14/20` (or `isLoanCompleted`) mean nothing is left to run.
-- **Finding a loan by its AUGM id needs BOTH listings and the admin scope — `GoldLoanApiTest.find_loan_row(loan_unique_id, attempts)` is the one implementation** (`_scan_for_loan`, `_loan_rows`, `_loan_row_matches`, `LOAN_SEARCH_ENDPOINTS`); `test_resume_loan.py` delegates to it, and a test asserts it keeps no copy of its own.
+- **Finding a loan by its AUGM id needs BOTH listings and the admin scope — `GoldLoanApiTest.find_loan_row(loan_unique_id, attempts)` is the one implementation** (`_scan_for_loan`, `_loan_rows`, `_loan_row_matches`, `LOAN_SEARCH_ENDPOINTS`); `resume_loan.py` delegates to it, and a test asserts it keeps no copy of its own.
   `GET /api/loan-process/loan-details?…&loanUniqueId=…` answers `{"data": []}` for loans the portal
   happily shows — confirmed twice on live runs: a loan sitting at **ops rating**, AND a run's OWN
   loan **immediately after it completed at stage 13**. So "loan-details only lists finished loans"
@@ -68,8 +85,8 @@ domain rule stays defined once in `maintest.py` and cannot drift:
   searches by it, so the id from the command line must not be lost.
   `_row_ids` prefers the `customerLoan[]` entry whose `loanUniqueId` matches, because a master loan
   can hold several.
-- **`tests/test_harness.py`** — offline regression suite, **no network and no extra deps** (there is
-  no pytest here). `python tests/test_harness.py [group-prefix]`. Request bodies are byte-compared
+- **`tests/test_offline_harness.py`** — offline regression suite, **no network and no extra deps** (there is
+  no pytest here). `python tests/test_offline_harness.py [group-prefix]`. Request bodies are byte-compared
   against `reference/*.har`; control flow is mock-driven. 130 tests, groups: `kyc-body`, `kyc-verify`,
   `duplicate`, `profile`, `packets`, `appraiser`, `bank`, `resume`, `stage`, `batch`, `gateway`, `kyc-runner`. Node is required (CryptoJS tests).
   **This suite was mutation-tested** — the code was deliberately broken to confirm each test fails.
@@ -80,13 +97,13 @@ domain rule stays defined once in `maintest.py` and cannot drift:
 
 ## Layout & entrypoint
 
-- **`src/maintest.py`** — everything lives here. One class: `GoldLoanApiTest`, driven by an argparse CLI (`main()`). Mode is decided by presence of `--customer`:
+- **`gold_loan/harness.py`** — everything lives here. One class: `GoldLoanApiTest`, driven by an argparse CLI (`main()`). Mode is decided by presence of `--customer`:
   ```bash
-  python src/maintest.py                      # DEFAULT: NEW customer -> full create + KYC -> loan -> submit-packet
-  python src/maintest.py --customer MS35QNJP  # EXISTING customer by unique id -> new loan (reuses approved KYC)
-  python src/maintest.py --partner arvog --amount 550000 --login appraiser
-  python src/maintest.py --env uat            # same flow against UAT (gfau); --env test (default) = gfat
-  python src/maintest.py --count 5           # 5 loans back to back in ONE logged-in session
+  python flows/e2e_full_loan.py                      # DEFAULT: NEW customer -> full create + KYC -> loan -> submit-packet
+  python flows/e2e_full_loan.py --customer MS35QNJP  # EXISTING customer by unique id -> new loan (reuses approved KYC)
+  python flows/e2e_full_loan.py --partner arvog --amount 550000 --login appraiser
+  python flows/e2e_full_loan.py --env uat            # same flow against UAT (gfau); --env test (default) = gfat
+  python flows/e2e_full_loan.py --count 5           # 5 loans back to back in ONE logged-in session
   ```
 - **`--count N` (N > 1) runs a BATCH in one session.** `run_many(login_type, count)` calls
   `run_e2e_test(..., skip_login=index > 1)`: only loan 1 logs in, and `_role_token_cache` persists,
@@ -104,7 +121,7 @@ domain rule stays defined once in `maintest.py` and cannot drift:
   approval — a stale `bank_manually_verified` makes `ops_manual_bank_verification` self-skip),
   `bm_rating_submitted`, the resolved `scheme_id`, and the API-call metrics (cumulative counters
   would report loan 1's calls again). Two tests guard it: every `PER_LOAN_STATE` name must be a real
-  attribute, and it must be a superset of `test_kyc.py`'s `PER_CUSTOMER_STATE`.
+  attribute, and it must be a superset of `kyc_only.py`'s `PER_CUSTOMER_STATE`.
 - **`--count` works WITH `--customer`** — N loans for the same existing customer. Loans 2..N hit
   "This product Request already Exists" and land on the SAME appraiser request: `create_appraiser_request`
   now sees *ours + finished* and **keeps the request, clearing the loan ids so a fresh loan starts on
@@ -121,7 +138,7 @@ domain rule stays defined once in `maintest.py` and cannot drift:
   `--customer` batch into new-customer runs. A test pins this.
   No `--customer` → `main()` clears `existing_customer_unique_id` so `run_e2e_test` takes the create-customer + full-KYC path. With `--customer` → resolves that customer and skips KYC if already approved. `--amount` sets `GOLD_LOAN_AMOUNT`. Both modes run the identical end-to-end flow through disbursement → submit-packet → load-loan-details. (The constructor default for `GOLD_LOAN_EXISTING_CUSTOMER_UNIQUE_ID` is now `""` — the bare command creates a new customer, it no longer defaults to MS35QNJP.) **Every run logs in fresh — there is no session/token persistence.**
 - **Reference/ground-truth data (do NOT modify): `reference/gold-loan-e2e-flow.har` and `reference/ovd-kyc-flow.har`** (the latter captures KYC via an OVD instead of PAN: `verify-dl`/`verify-voter-id`, `panType:"ovd"`, Form 97; it ends at the consent OTP).
-  `gold-loan-e2e-flow.har` is one consolidated HAR of the complete journey (customer/KYC → appraiser → ornaments → scheme → final-loan → bank details → assign packet → ratings → loan documents → partner approval → disbursement → submit packet → load details), 244 API calls. Each entry's `comment` tags its stage (A = customer/KYC/loan/bank/packet/docs, B0 = partner approval, B = disbursement, C = submit-packet/load-details). Merged from four captures, so ids differ across stages — it's a step reference, not one live session. The older per-stage HARs / Postman collection / loan-flow JSON were consolidated into this file and removed.
+  `gold-loan-e2e-flow.har` is one consolidated HAR of the complete journey (customer/KYC → appraiser → ornaments → scheme → final-loan → bank details → assign packet → ratings → loan documents → partner approval → disbursement → submit packet → load details), 244 API calls. Each entry's `comment` tags its stage (A = customer/KYC/loan/bank/packet/docs, B0 = partner approval, B = disbursement, C = submit-packet/load-details). Merged from four captures, so ids differ across stages — it's a step reference, not one live session. The older per-stage HARs / loan-flow JSON were consolidated into this file and removed.
 - Assets (required at runtime, do NOT delete) live in **`assets/`**, resolved via a project-root anchor computed from `__file__` (so CWD-independent): `assets/AADHAR.png` (REAL aadhaar image, 1150x337 — required for KYC upload), `assets/PAN.png`, `assets/scale.jpg` (ornament), `assets/cancelled-cheque-1.png` (bank cheque), `assets/CPV.pdf` (PDF uploads), `assets/dummy_image.png`.
 - Generated at runtime (project root): `loan_calc_debug.json` (eligibility diagnostics dump — read this when debugging final-loan-details). **No session/token files are written — session persistence was removed (it caused stale-state bugs, e.g. a restored `random_pan` → "PAN already exists"; every run logs in fresh).**
 
@@ -158,17 +175,6 @@ domain rule stays defined once in `maintest.py` and cannot drift:
 | `GOLD_LOAN_HTTP_LOG` | `false` → quiet |
 | `GOLD_LOAN_COLOR` | `auto`/on/off ANSI color |
 | `GOLD_LOAN_INTERNAL_BRANCH_ID`, `GOLD_LOAN_PAN_TYPE` | Overrides for branch / PAN type |
-
-## Postman collection (generated — never hand-edit `postman/*.json`)
-
-The same E2E flow also ships as a Postman collection. **`tools/build_postman_collection.py` is the source of truth**; it emits `postman/Augmont-GoldLoan-E2E.postman_collection.json` + one environment per `ENVIRONMENTS` entry. Shared JS lives in **`tools/postman_lib.js`** and is embedded as the `GL_LIB` collection variable. Regenerate with `python tools/build_postman_collection.py` after ANY harness change that alters a request body, order, or the env profiles.
-
-- **Embed as a JSON string literal, never a template literal.** A template literal eats the backslashes and silently destroys every regex in the lib (this bit once: `/\/+$/` became `//+$/`, a line comment). The generator uses `json.dumps(lib_source)`.
-- Each request's pre-request script is `eval(pm.collectionVariables.get("GL_LIB"));` + body build + `GL.body(obj)` (JSON) or `GL.sign()` (GET/multipart). `GL.body` stringifies into `{{__body}}` AND signs that same object, so sent bytes == signed bytes. JS renders integral floats natively, so no `_js_number_normalize` equivalent is needed. **Verified: signatures match `_generate_signature` byte-for-byte** for empty-body, JSON-body and integral-float cases.
-- `GL.enc()` reproduces the Node/CryptoJS call (verified round-trip, `U2FsdGVkX1` prefix). `GL.aadhaar()` is a digit-for-digit port (verified 200/200) of the harness's generator — note **the harness's Verhoeff `multiplication` table is non-standard (rows 5 and 7 are wrong), so ~78% of generated aadhaar numbers fail a standard checksum**. The backend evidently doesn't validate it (manual-fallback path), so this is inert — but don't "fix" one side without the other.
-- Branching uses `setNextRequest` (runner-only): new-vs-existing customer, the `SCH: check loan type` retry loop over scheme candidates, and the >5L BM skip. Request names are therefore load-bearing and must stay unique.
-- Uploads are multipart with relative `src` paths (`assets/…`) → Postman's **working directory must be the repo root**; packet images instead go through `/api/upload-file/base` with a base64 `dummy_image.png` embedded in the collection.
-- Validation harness used when changing this: syntax-check every script with `new Function`, eval `GL_LIB` under a mock `pm`, compare signatures against `_generate_signature`, and statically check `setNextRequest` targets / declared variables / upload paths.
 
 ## Environments (TEST / UAT)
 
@@ -212,8 +218,8 @@ Don't add per-endpoint auth or retry logic — change it here.
 ## KYC identity modes (manual / auto / ovd) — `--kyc`, `GOLD_LOAN_KYC_MODE`
 
 `GoldLoanApiTest.KYC_MODES = (manual, auto, ovd)`. Default **manual** — the long-standing behaviour,
-byte-identical to the original capture (17/17 fields on submit-basic-info), so the Postman collection
-and every prior run are unaffected.
+byte-identical to the original capture (17/17 fields on submit-basic-info), so every prior run is
+unaffected.
 
 | Mode | Identity | Verification | submit-basic-info |
 |---|---|---|---|
@@ -231,7 +237,7 @@ and every prior run are unaffected.
   `verify-voter-id {epicNo, customerId}`; `verify-dl {dlNo, dob, customerId}`. A success returns
   `isVerified`, `isDocumentValid`, a `nameComparison` block (customerName / ovdName /
   nameMatchScore / isNameMatch) and a `data` block (name, gender, dob, address…).
-  **Only Voter ID (`"VoterID"`) is capture-confirmed**; `"DrivingLicense"` is inferred from the
+  **Only Voter ID (`"VoterID"`) is capture-confirmed**; `"DL"` comes from the live portal's `_ovdTypeMap` (dl->DL, voter->VoterID, passport->Passport, nrega->NREGA), not from the
   identity-type name — override with `GOLD_LOAN_KYC_OVD_TYPE_STRING`. Passport/NREGA have no
   captured endpoint and are rejected rather than guessed.
 - **The two e-KYC endpoints disagree on DOB format** — `verify-pan` takes ISO
@@ -241,6 +247,10 @@ and every prior run are unaffected.
   aadhaarNumber: <CryptoJS-encrypted>, maskedAadhaarNumber: "XXXXXXXX"+last4}`. The XML and the
   number must be the same person or it 400s "Aadhaar number does not match with the XML data".
   UIDAI's `referenceId` starts with the Aadhaar's last 4 digits — a cheap way to check a profile.
+- **Auto-mode Aadhaar = 8 random digits + the REAL last 4** (`_aadhaar_with_last4`, re-drawn until
+  Verhoeff-valid), with the person's real name. The XML can only be matched on the last 4 + name, so
+  every customer gets a unique Aadhaar from one XML. PAN has NO such workaround (stays real), so
+  `--count > 1` stays refused for auto. The profile's `aadhaarNumber` may be 12 digits or the last 4.
 - **`switchToManual` is the server's, not ours.** It counts consecutive failures and flips the flag
   on the third. `KYC_VERIFY_MAX_ATTEMPTS = 3` mirrors that; the harness honours the signal the
   moment it appears (it does NOT just exhaust retries), degrades to the manual data path, and
@@ -289,7 +299,7 @@ Set `GOLD_LOAN_EXISTING_CUSTOMER_UNIQUE_ID` or `..._ID`. In `run_e2e_test`:
   - **approved** → skip KYC, call `_prepare_loan_fields_from_existing()` (loads master data, fills gender/dob/age/mother_name/signature), go straight to loan process.
   - **not approved** → `_run_full_kyc()`.
 - New customers → `add_customer()` + `_run_full_kyc()`. **`add_customer` runs under the ADMIN token** (swap in `run_e2e_test`, restore appraiser in `finally`) — creating the customer as the appraiser hits a *"request already exists"* error that the admin credential avoids. KYC and the appraiser-request run as the appraiser; the admin swap only touches `self.auth_token`, so `logged_in_user_id` stays the appraiser's (set at login, untouched by `_role_token`) and the appraiser-request binds correctly.
-- **`viewAllCustomer` scoping — the cause of "Customer XXXX was not found."** `GET /api/customer?viewAllCustomer=false` lists only the logged-in user's/branch's customers. Since `add_customer` runs as ADMIN, a customer from an earlier run is frequently NOT in the appraiser's own list, so a scoped lookup returns `{"data": []}` even though the record exists (confirmed on TEST: `MS5XAQ16`/id 8500 → 0 hits with `false`, 1 hit with `true`). `_search_customers(filters)` is the single lookup helper: it queries `viewAllCustomer=false` first, then retries `true` when `data` is empty, and both `_use_existing_customer` and `_fetch_customer_unique_id` go through it. The not-found assertion now names the environment and suggests `--env <other>`, because the same symptom appears when the customer only exists on the other env. The Postman collection's two customer lookups use `viewAllCustomer=true` outright (they match on an exact id, so widening is safe and needs no retry request).
+- **`viewAllCustomer` scoping — the cause of "Customer XXXX was not found."** `GET /api/customer?viewAllCustomer=false` lists only the logged-in user's/branch's customers. Since `add_customer` runs as ADMIN, a customer from an earlier run is frequently NOT in the appraiser's own list, so a scoped lookup returns `{"data": []}` even though the record exists (confirmed on TEST: `MS5XAQ16`/id 8500 → 0 hits with `false`, 1 hit with `true`). `_search_customers(filters)` is the single lookup helper: it queries `viewAllCustomer=false` first, then retries `true` when `data` is empty, and both `_use_existing_customer` and `_fetch_customer_unique_id` go through it. The not-found assertion now names the environment and suggests `--env <other>`, because the same symptom appears when the customer only exists on the other env.
 - **Already-filled info is pulled from the real record, not regenerated.** `get_customer_by_id` (`/api/customer/{id}` → `singleCustomer`) and `get_kyc_customer_detail` (`/api/kyc/get-customer-detail` → `customerInfo`) extract `gender`, `dateOfBirth` (ISO → `dob` via `[:10]`), `age`, `motherName`, and the nested **`customerKycPersonal`** (`profileImage`, `signatureProof`, `martialStatus`, `spouseName`, `identityProofNumber`). `_prepare_loan_fields_from_existing` only generates a value when the record didn't supply it. **Watch for downstream clobbers:** `store_loan_basic_details` used to regenerate `dob`/`age` unconditionally — it must guard `if not self.age or not self.dob` so real values survive. (The nominee name is correctly generated — it's a separate person.)
 
 ## Appraiser-request lookup & reuse ("already Exists")
@@ -303,14 +313,14 @@ Set `GOLD_LOAN_EXISTING_CUSTOMER_UNIQUE_ID` or `..._ID`. In `run_e2e_test`:
 - If nothing works, `create_appraiser_request` raises with the owning `appraiserId`, the 403 cancel fact, and the branch attempts named. It no longer reuses a foreign request — the old fall-through only pushed the "not assign to you" failure downstream.
 - `required=False` makes a miss return **False** instead of raising, so the already-exists branch fails with a **diagnosis** (`RuntimeError`: invisible even to admin → cancel it from the owning login, or use a different `--customer`) rather than a chained `AssertionError` traceback. A blind POST retry would just 400 again.
 - `_find_and_set_existing_loan_ids` goes through the same helpers, so it shares no blind spot.
-- Regression tests: group **`appraiser`** in `tests/test_harness.py` (13 tests, mutation-verified one-by-one — disabling the admin fallback, the unfiltered scan, pagination, the reuse branch, the completion check, the ownership check, the unassigned rule, the branch ladder, its appraiserId preservation, its cap, its branch-id carry-over, the never-cancel-a-foreign-loan rule, the env-var override, and the invisible-request guard each trip exactly the right tests). `_appraiser_suite` must scrub `GOLD_LOAN_FRESH_APPRAISER_REQUEST` — `suite()` only clears the KYC vars, and the leak silently made later tests take the no-reuse path.
+- Regression tests: group **`appraiser`** in `tests/test_offline_harness.py` (13 tests, mutation-verified one-by-one — disabling the admin fallback, the unfiltered scan, pagination, the reuse branch, the completion check, the ownership check, the unassigned rule, the branch ladder, its appraiserId preservation, its cap, its branch-id carry-over, the never-cancel-a-foreign-loan rule, the env-var override, and the invisible-request guard each trip exactly the right tests). `_appraiser_suite` must scrub `GOLD_LOAN_FRESH_APPRAISER_REQUEST` — `suite()` only clears the KYC vars, and the leak silently made later tests take the no-reuse path.
 
 ## Scheme selection & eligibility math (final-loan-details)
 
 This is the most fragile area. Rules verified empirically against captured requests + `loan_calc_debug.json`:
 
 - **Ornaments** (`store_ornament_details`): `net_wt_after_purity = round(net_weight * purity%/100, 2)` — **2 decimals, NOT integer** (integer rounding was a bug). `currentLtvAmount = netWtAfterPurity × goldRate` (real rate via `_fetch_gold_rate`).
-- **netWtAfterPurity must round HALF-UP, not with Python's `round()`.** The server recomputes `nwap` and rounds **half-up** (JS-style); Python's `round()` is half-to-even and is also skewed by float artifacts. On a half-cent tie the two disagree by 0.01 — e.g. `31.65 × 0.90 = 28.485` → Python `round()` gives **28.48**, the server gives **28.49** — and since eligibility = `Σ(nwap × rpg)`, that 0.01 × rpg makes final-loan-details 400 with the eligibility-mismatch message (real case: scheme 849 rpg 3733, sent 454903.38 vs server 454940.71, short by exactly 37.33 = 0.01 × 3733; the other 3 ornaments matched because none landed on `.xx5`). Insidious because it only bites when a `netWeight × purity/100` lands exactly on a half-cent. Fix: `_round_half_up(value, places=2)` (Decimal `quantize`, `ROUND_HALF_UP`) — used for `purity_percentage` and `net_wt_after_purity` in `store_ornament_details`. The value we SEND is what the server echoes in ornaments-details AND equals its own recompute, so the whole chain matches (verified 4/4 against the captured server nwap). The Postman collection was already correct here: `round2 = Math.round((v + Number.EPSILON) * 100) / 100` rounds the tie up.
+- **netWtAfterPurity must round HALF-UP, not with Python's `round()`.** The server recomputes `nwap` and rounds **half-up** (JS-style); Python's `round()` is half-to-even and is also skewed by float artifacts. On a half-cent tie the two disagree by 0.01 — e.g. `31.65 × 0.90 = 28.485` → Python `round()` gives **28.48**, the server gives **28.49** — and since eligibility = `Σ(nwap × rpg)`, that 0.01 × rpg makes final-loan-details 400 with the eligibility-mismatch message (real case: scheme 849 rpg 3733, sent 454903.38 vs server 454940.71, short by exactly 37.33 = 0.01 × 3733; the other 3 ornaments matched because none landed on `.xx5`). Insidious because it only bites when a `netWeight × purity/100` lands exactly on a half-cent. Fix: `_round_half_up(value, places=2)` (Decimal `quantize`, `ROUND_HALF_UP`) — used for `purity_percentage` and `net_wt_after_purity` in `store_ornament_details`. The value we SEND is what the server echoes in ornaments-details AND equals its own recompute, so the whole chain matches (verified 4/4 against the captured server nwap).
 - **netWtAfterPurity MUST mirror the server's purity CAP at ltvPercent — this was THE root cause of the persistent final-loan-details eligibility 400.** CONFIRMED from the server's own stored ornaments (`single-loan` on a mismatch): the server recomputes **`nwap = netWeight × min(purityReading, ltvPercent) / 100`** and eligibility = `Σ(nwap × rpg)`. It caps the assessed purity at the ornament's LTV%. Two runs pinned it exactly: run A purity 81.46 < ltv 90 → server kept 81.46; run B purity 91.67 (karat 22/24) > ltv 90 → server capped to 90. Key subtlety: the **ornaments-details response ECHOES our sent `nwap` uncapped** (looks fine), but `single-loan`/final-loan-details use the **capped** value — so you can't detect this from ornaments-details alone. Fix in `store_ornament_details`: `karat_purity = karat/24*100`; `purity% = round(min(karat_purity, float(ltvPercent)), 2)`; `nwap = round(netWeight × purity%/100, 2)`; store that same value as `purityReading` so no further server capping applies. Then our sent `nwap` == the server's recomputed `nwap` to the paisa (verified: 4/4 ornaments, total 549490.26 == server). Prior bugs in this same spot: random `purity` (`uniform(80.1,99.9)`) and karat-only `purity` (91.67, which overshoots the 90 LTV cap) — both 400'd.
 - **Partner preference:** only **Roshan Partner** (id 152, schemes 853/861/882, rpg 4533) has a confirmed-accepted `final-loan-details` (200) capture. **ARVOG (partner 10) schemes consistently 400 on final-loan-details** despite structurally-identical, fully-derived requests (tried schemes 792/747/831/727/776 across exposures 0.18–1.02, all rejected) — an undiagnosed partner-level server issue. So `_fetch_partner_scheme_amount` orders candidates by `GOLD_LOAN_PARTNER_NAME` priority (Roshan first) and shuffles only *within* a partner; ARVOG is fallback. If you must use ARVOG, you need an accepted ARVOG capture to find what differs.
 - **Partner / scheme / co-lender are CLI-selectable.** A loan has **exactly one partner** — `--partner {roshan|arvog}` → `GOLD_LOAN_PARTNER_NAME` (no "both"). **Roshan Partner** = `ROS-152` (id 152), **Arvog** = `ARV-10` (id 10). `--scheme ID` → `GOLD_LOAN_SCHEME_ID` pins one id (searched in the full candidate list, so it wins even over the catalog pre-check; warns + falls back if not under the partner). **Co-lending** via `--co-lender`: (a) a concrete `NAME|ID` → `GOLD_LOAN_CO_LENDER`; (b) **bare `--co-lender` (argparse `nargs='?'`, `const='__ASK__'`)** sets `co_lender_interactive`, and `run_e2e_test` calls `choose_co_lender_interactive()` right after auth — it fetches `GET /api/co-lender-bank`, prints a numbered menu, reads the pick, and sets `self.co_lender_choice` (so the user needn't remember ids). Either way, `fetch_co_lender_banks` then resolves the choice by exact id or case-insensitive name substring (banks: 4 "DCB bank", 6 "DCB Co lender", 2 "Godrej Bank", 5 "colender added by ops", …), sets `self._forced_co_lender_id`/`self.co_lender_bank_id`, and `_apply_scheme` PRESERVES that forced id (user co-lender wins over the scheme's own `coLenderBankId`). It flows into `check-loan-type` / `final-loan-details` / `generate-interest-table`. Only Roshan-no-co-lending is capture-verified; Arvog & co-lending combos are wired but may 400 at final-loan-details.
@@ -333,16 +343,25 @@ This is the most fragile area. Rules verified empirically against captured reque
 - `/api/purpose` is GROUPED by type: `{"Consumption Based": [...], "Income Generating": [...]}`. **Group order differs per env** (TEST lists Income Generating first). The old code took the first group and hard-coded `purposeType: 'Consumption Based'` — on TEST that sent IGL purposes labelled CB. Now every group is flattened, each entry keeps its type, and basic-details sends `self.purpose_type`.
 - Purpose lists differ per env: TEST has IGL `Agricultural Purposes`/`Agro`/`Test Demo`; UAT has no `Agricultural Purposes` (it has CB `Agriculture`). IGL purposes carry `incomeGeneratingDocumentTypes` (TEST: categories `Agri Loan`/`Proof of Income`/`Business Proof Documents` with `documents` + `hiddenDocuments`).
 - Confirmed live: basic-details ACCEPTS an IGL purpose with `incomeGeneratingDocuments: null` (TEST `Agricultural Purposes`, UAT `TESTING`). Whether IGL documents are demanded later (upload documents) is not yet verified.
-- Postman mirrors this: collection vars `purpose_type` / `purpose_name`.
 
 ## Server-sourced request values (no hard-coded examples)
 Request fields are filled from earlier responses, mapped from the HAR (same key + value in a prior response):
 - **basic-details** <- `customer-loan-details` `customerData`: `branchName` (`internalBranch.name`), `tillDateOutstanding`, `currentActiveLoans`, `annualIncome` (`customerKycPersonal.annualIncome`), `age`. Stored as `self.customer_loan_data`.
 - **bank-details** <- `final-loan-details` response (`self.final_loan_details_data`): `getBalance.branchTotalHolding/branchTotalBlockedBalance/customerTransferBalance`, `getAdvanceCashParameters.totalLimitForCashDisbursal/multiModeDisbursement`, `actualProcessingCharge`, `upfrontInterestAmount`, `appraiserCharges` (-> `appraiserChargesPercentage` when `appraiserChargesApplied`), `stampDutyCharges`. `createdBy` = logged-in user id; `account` = null (as the UI).
-- **stamp duty**: the server's figure ALWAYS wins, 0 included (final-loan-details, else single-loan); 1500 / `GOLD_LOAN_STAMP_DUTY` only when the server states none (ARVOG then errors instead). Live TEST proof: final-loan-details said 0 on an Augmont-branch Roshan loan and bank-details rejected 1500 with "To Be Paid amount is incorrect".
+- **stamp duty**: the server's figure ALWAYS wins, 0 included (final-loan-details, else single-loan); `GOLD_LOAN_STAMP_DUTY` (default 0, as the portal) only when the server states none (ARVOG then errors instead). Live TEST proof: final-loan-details said 0 on an Augmont-branch Roshan loan and bank-details rejected 1500 with "To Be Paid amount is incorrect".
 - **generate-interest-table** <- check-loan-type: `securedExposure` (`posExposureAgainstScheme`), `securedprocessingCharge`, `upfrontInterestAmount`; `paymentFrequency` from `securedScheme.interestBillingCycleType` ("30Days" -> "30 Days").
 - **partner-wise-disbursement** `penalInterest` <- `single-loan` `data.penalInterest` (NOT the scheme's penalInterest, which differs).
 - Still constant (no response carries them in the HAR): interest-table `paymentFrequency` fallback, disbursement `paymentGatewayId` 5, `loanType` 'Fresh Loan'.
+
+## Portal-parity rules added after the live-portal audit (all live-verified unless noted)
+- **Customer OTP:** `customer-otp/send-otp` `{mobileNumber, firstName, lastName, type:'lead'}` + `verify-otp-admin` `{otp:'1234', referenceCode, type:'lead'}` (old `send-register-otp` = 403 on TEST). Create body = AddLeadComponent form + `leadSourceId` (`GET /api/lead/lead-user`), state/city from the login's verify-login `userDetails`, `statusId` 1.
+- **Ornaments:** `currentLtvAmount` = goldRate × global `ltvGoldValue`% (per gram); `netWtAfterPurity` = net × ltv%; LTV options from karat `range`; `purityReading` null; `totalEligibleAmt` 0; lat/long sent. Eligibility for final-loan-details = round(response `netWtAfterPurity` × rpg, 2).
+- **Ratings:** ops/partner copy appraiser/BM fields from `single-loan.masterLoan` (`_rating_base`); loan lock uses the CURRENT `masterLoan.loanStage.id`; `checkPointers` = `masterLoan.loanIncompleteReasonsLogs.checkPointers` (warning when non-empty — the portal blocks approval on open defects).
+- **Disbursement:** `actualProcessingCharge` = processing charge; `finalAmount` net / `fullAmount` gross (`_apply_portal_disbursement_amounts`); `--transfer-mode neft|imps|rtgs` (portal OFFLINE options, UTR); `paymentGatewayId` = partner's ICICI config id when toBePaid>0 (portal keeps it when NEFT/IMPS/RTGS is picked), never a real ICICI/RazorpayX payout.
+- **Co-lending ONLY with `--co-lender`:** neither the scheme's nor the server's default co-lender is applied; declining a server default sends `coLenderOverrideFlag` true + reason (`GOLD_LOAN_CO_LENDER_OVERRIDE_REASON`), `systemAssignedBankId` = the default. (Not yet live-verified.)
+- **Occupation:** any low-risk occupation; if `isIndustryRequired`, a random `industryCategoryId`/`industryId` from `api/industry/categories` → `api/industry/by-category-list/<id>`. (Not yet live-verified.)
+- **KYC:** CCE rating is automatic on TEST (ratingStage 2 → ops); the harness stops clearly if ratingStage ≠ 2. Aadhaar-type (2) address proof is sent ENCRYPTED (else 'Invalid Adhaar card format!').
+- **Releasing real documents (TEST/UAT):** `POST /api/e-kyc/remove` `{identityProofNumber, panCardNumber}` — only `Origin` needed; answer has `panCardUpdated` / `identityProofNumberUpdated`. `flows/kyc_release_documents.py`, or `--release-kyc-docs` on the loan/KYC flows (allows `--kyc auto --count N`).
 
 ## Bank details & verification
 
@@ -354,7 +373,7 @@ Request fields are filled from earlier responses, mapped from the HAR (same key 
 - **The chosen account is tried FIRST on any re-run** (`_bank_account_candidates` reorders by `self.bank_account_number`), so the disbursement stage's second `validate-account` settles immediately instead of re-walking. `store_bank_details` sends whatever was chosen, with `bankName`/`bankBranchName` from that account's `account-details-karza` IFSC lookup rather than the old hard-coded SBI strings. One fixture entry (HSBC `006-089866-001`) carries separators — keep the source values verbatim.
 - **`validate-account` (penny-drop) MUST run BEFORE `bank-details`** — otherwise bank-details 400s with "bank details is not verified". HAR order: GET bank-details → GET account-details-karza (IFSC lookup only, not verification) → POST validate-account → POST bank-details. `validate_account` runs in the Bank-Details step (not the later disbursement step).
 - **The SBI test account penny-drop REACHES THE BANK but does NOT verify the account.** CONFIRMED from a real validate-account call with `00000036150491589`/`SBIN0011777`/`LIC MUTUAL FUND` (`ops complete.har` entry 35): `data.bankTxnStatus: true` — **but** `isVerified: false`, `isManuallyVerified: false`, **`forOpsApproval: true`**, `nameAsPerSystem: "Michael Davis"`. The server compares the bank's account name against the CUSTOMER's name; our fixed test account never matches a randomly-named customer, so the bank detail is stored as **`bankVerificationStatus: "pending"`** (see `single-loan.data.loanBankDetail`) and the loan cannot disburse. **`bankTxnStatus: true` ≠ verified** — reading only that flag is what made the run believe the bank was fine and then fail downstream. `validate_account` now captures all four flags into `self.bank_account_verified` / `bank_system_verified` / `bank_manually_verified` / `bank_for_ops_approval`.
-- **MANUAL bank verification by OPS — `POST /api/loan-process/bank-verification-manual`** (`force`/`strict` params; see the fallback below) (`ops_manual_bank_verification`, from `ops complete.har` entry 41) clears the pending state. Runs under the **ops role token** (swap + restore like every other role call), body: `{accountNumber, accountHolderName, ifscCode, detailsFor:"customer", customerId, masterLoanId, loanId, status:"approved", requestFrom:"loan", incompleteReason:"", approvalReason:"test"}`. Response `{"message":"success","data":{… isManuallyVerified:true, isVerified:false, forOpsApproval:false}}` — **the verdict is one level down, under `data`**. It runs as its own E2E step right BEFORE the ops rating, matching the real ops session order (validate-account → bank-verification-manual → update-processing-charge → ops-rating). It self-skips when the account is already verified, asserts the account ended verified with `forOpsApproval` cleared, and tolerates a 400 containing "already". Mirrored in the Postman collection as `OPS: manual bank verification` in folder 11.
+- **MANUAL bank verification by OPS — `POST /api/loan-process/bank-verification-manual`** (`force`/`strict` params; see the fallback below) (`ops_manual_bank_verification`, from `ops complete.har` entry 41) clears the pending state. Runs under the **ops role token** (swap + restore like every other role call), body: `{accountNumber, accountHolderName, ifscCode, detailsFor:"customer", customerId, masterLoanId, loanId, status:"approved", requestFrom:"loan", incompleteReason:"", approvalReason:"test"}`. Response `{"message":"success","data":{… isManuallyVerified:true, isVerified:false, forOpsApproval:false}}` — **the verdict is one level down, under `data`**. It runs as its own E2E step right BEFORE the ops rating, matching the real ops session order (validate-account → bank-verification-manual → update-processing-charge → ops-rating). It self-skips when the account is already verified, asserts the account ended verified with `forOpsApproval` cleared, and tolerates a 400 containing "already".
 - **When the penny-drop fails outright, `store_bank_details` runs the OPS manual verification ITSELF and retries.** On UAT `validate-account` answers **400 "Something went wrong"** (not the documented 200-with-a-bad-message), so `bank-details` 400s **"bank details is not verified"** and the run dies before ever reaching the Ops stage that would have fixed it. `store_bank_details` now catches that specific 400 (status 400 + "not verified" in the body — anything else is re-raised untouched, e.g. the toBePaid error), calls `ops_manual_bank_verification(force=True, strict=False)`, re-sends with `isManuallyVerified:true` / `manualVerifiedStatus:"verified"`, and continues. The later Ops-stage call then self-skips. `strict=False` turns the post-conditions into warnings, because at this point the bank-detail record does not exist yet and the retried `bank-details` call is the real check. **Whether `bank-verification-manual` is accepted BEFORE a bank-detail record exists is UNVERIFIED** — it carries the account fields itself, so it should be, and a failure there now reports the ops error instead of the misleading "not verified".
 - The server **overrides the verification flags** `store_bank_details` sends — the stored record comes back `isVerified: false` / `forOpsApproval: true` regardless — so don't try to fix this from the bank-details body; only the ops manual approval clears it.
 - **`toBePaid` MUST equal `finalLoanAmount − processingCharge − upfrontInterestAmount`** — else bank-details 400s with **"To Be Paid amount is incorrect"**. Do NOT hardcode it. `processingCharge`/`upfrontInterestAmount` are scheme-specific and captured from **check-loan-type** (`data.securedprocessingCharge` = `max(processingChargeFixed, processingChargePercent% × amount)`; `data.upfrontInterestAmount`), stored in `self.secured_processing_charge`/`self.upfront_interest_amount`. `store_bank_details` computes `to_be_paid` and sets `toBePaid`, `availableLimitForDisbuserment` (= toBePaid), `processingCharge`, and `actualProcessingCharge` from these. Confirmed against a 200 capture: final 400000, procCharge 4000 → toBePaid 396000. A scheme with 0 processing charge → toBePaid = finalLoanAmount.
@@ -362,7 +381,7 @@ Request fields are filled from earlier responses, mapped from the HAR (same key 
 - **Manual fallback inside `store_bank_details`:** if `bankTxnStatus` is false/absent it sends `isManuallyVerified: true` + `manualVerifiedStatus: "verified"`. This is cosmetic — the server overrides it (see above); the real manual verification is the ops `bank-verification-manual` call. Passbook proof is a cheque PNG image (`CHEQUE_IMAGE_PATH`), not a PDF; `passbookProofImageName` is `[]`.
 
 ## Packet creation, assignment & sealing
-- **Every run generates its own packet first**: `prepare_packet()` (admin create + assign to the logged-in appraiser) runs right after login in `run_e2e_test` and both stop-before runners, and in `test_resume_loan` when the plan includes the `packet` step. `add_packet_images` seals into that packet and only creates one itself if `packet_prepared` is False. `_reset_for_next_loan` clears it, so each loan in a `--count` batch gets a fresh packet.
+- **Every run generates its own packet first**: `prepare_packet()` (admin create + assign to the logged-in appraiser) runs right after login in `run_e2e_test` and both stop-before runners, and in `flows/resume_loan.py` when the plan includes the `packet` step. `add_packet_images` seals into that packet and only creates one itself if `packet_prepared` is False. `_reset_for_next_loan` clears it, so each loan in a `--count` batch gets a fresh packet.
 - **HTTP timeout**: the client waits `GOLD_LOAN_HTTP_TIMEOUT` (default 60 s; connect 15 s) -- httpx's 5 s default lost a live loan to a ReadTimeout on `upload-file/base`. File uploads (`/api/upload-file*`) are retried after a lost reply like GETs; other writes still are not.
 
 - **There is no "assign-packet" endpoint** — assignment is embedded in `add-packet-images` via `packetOrnamentArray: [{packetId, ornamentsId, packetsName, ornamentsName}]`.
@@ -383,6 +402,11 @@ The GL flow hands the loan between roles. Static OTP **1234** for all; each role
 - **Ops rating** (`submit_ops_rating` → `add_ops_rating`, `/api/loan-process/ops-rating`) — final approval, always runs under the **ops** token. `loanAmountDigi` uses the real `final_loan_amount`.
 
 ## Upload documents (`store_loan_documents`)
+- **Driven by `single-loan` (read first)**, exactly like the web app's UploadDocumentsComponent (source: portal bundle chunk `11.js`, `LipFormComponent` in `main.js`). Failure is now FATAL (it used to be swallowed, which hid LIP rejections).
+- **LIP (Liquid Income Program) assessment** -> `lipForm` in the loan-documents body, only when `single-loan` `isLIPFormRequired` is true. The SERVER applies the thresholds from `/api/global-setting`: `IGLLIPApplicability` (TEST 1 -> every IGL loan) and `consumptionLipApplicability` (TEST 2000000 for CB). `lipForm` = the form's `getRawValue()`: borrower profile (loanUniqueId, customer name, `occupation.category`, occupationTypeOther (required for 'Others'), yearsInCurrentOccupation, purpose, assessmentDate), incomes (`salary`/`primaryBusinessIncome`/`agriculturalIncome`/`rentalAssetIncome`/`otherBusinessIncome`; the category's field is mandatory: Salary->salary, Self Employed->primaryBusinessIncome (+businessOperatingExpenses), Farmer / Agricultural Labourer->agriculturalIncome; fields the category disables are ''), expenses (householdLivingExpenses required), remarks 'Self-Declared', newLoanRequested=`loanAmount`, presentInterest (2dp), totalExistingOutstanding=`customer.tillDateOutstanding`, isOtherIncome, maker from the JWT, checker = `masterLoan.bm` when commentByBM != 'auto approved'. Computed totals are NOT sent.
+- **LIP eligibility** (when `LIPEligibilityValidation`): net monthly income > `currentLoanPresentInterest + presentInterest`. `_build_lip_form` declares income = obligation + expenses + 25000.
+- **IGL documents**: at least one, under a VISIBLE document name of the purpose (each head's `documents` minus `hiddenDocuments`) -> `incomeGeneratingDocuments: {docName: {name:[filename], path:[path]}}`; PDF only, upload reason `customerIncomeGeneratingDocument`. `consumptionSupportingDocs` is no longer sent (LIP replaced it).
+- **Arvog** (`isArvog` and `masterLoan.bankId != 4` DCB): `loanApplicationCopy` / `goldReceipt` / `kfsCopy` (+ name/URL fields) are mandatory. **`stampDutyDefinitionType == 'stampPaper'`** -> `stampPaperCopy` (+ name/URL).
 
 `POST /api/upload-file?reason=loan&loanId={masterLoanId}` × 3 (loan agreement, pawn copy, scheme confirmation PDFs, multipart `avatar`) + `POST /api/upload-file?reason=customerIncomeGeneratingDocument&customerId={customerId}` × 1 → then `GET /api/lead/lead-converter` → `POST /api/loan-process/loan-documents`. The loan-documents body reuses earlier KYC artifacts (`signature`, `panImage`, encrypted `identityProof`/`unMaskedIdentityProof`, `panCardNumber`) plus `consumptionSupportingDocs:[{path:<income doc>}]`, `loanAmountDigi`, `loanType:"Fresh Loan"`. Response `{"message":"Success", masterLoanId, loanId}`.
 
@@ -405,7 +429,7 @@ Authentication → (Create Customer **or** Load Existing Customer) → KYC Proce
 ## Working conventions (user feedback — honor these)
 
 - **Don't leave dangling references after a rename.** When you rename a var/method, Grep the whole file and fix every use — the user was burned twice by `NameError: scheme_rpg not defined` from half-applied fixes. Either apply the complete fix (all impacted areas) or don't apply it.
-- Numbers are load-bearing (HMAC + eligibility). Prefer verifying against real captured requests / HAR / Postman collections over guessing.
+- Numbers are load-bearing (HMAC + eligibility). Prefer verifying against real captured requests / HAR / the live portal code over guessing.
 - This environment usually has **no live network/valid session** — verify changes with `python -m py_compile`, AST/scope checks, and mock/math unit tests rather than assuming a live run. Say so plainly instead of claiming a live pass.
 - Windows console: cp1252 vs UTF-8 handled by `_init_unicode()` + ASCII glyph fallback (`self._G`). Keep new console output going through the existing logging helpers.
 

@@ -1,10 +1,10 @@
-# tests/test_harness.py
+# tests/test_offline_harness.py
 """Offline regression tests for the KYC modes, the packet batch runner and the KYC runner.
 
 Runs with NO network and NO extra dependencies (there is no pytest in this project):
 
-    python tests/test_harness.py            # all groups
-    python tests/test_harness.py kyc-body   # one group, by name prefix
+    python tests/test_offline_harness.py            # all groups
+    python tests/test_offline_harness.py kyc-body   # one group, by name prefix
 
 Every assertion is either a byte-comparison against captured ground truth in reference/*.har or
 a mock-driven behaviour check. Nothing here talks to the API, so a pass means "the requests we
@@ -23,18 +23,19 @@ import traceback
 from contextlib import redirect_stdout
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(ROOT, "src"))
+sys.path.insert(0, ROOT)
 os.environ["GOLD_LOAN_COLOR"] = "off"
 os.environ.setdefault("GOLD_LOAN_LOG_LEVEL", "quiet")
 
 import httpx  # noqa: E402
+import jwt  # noqa: E402
 
-import maintest  # noqa: E402
-from maintest import GoldLoanApiTest as G, KycDocumentAlreadyExistsError  # noqa: E402
-from maintest import validate_cli  # noqa: E402
-from test_create_packets import PacketBatchTest  # noqa: E402
-from test_kyc import KycOnlyTest  # noqa: E402
-from test_resume_loan import (  # noqa: E402
+from gold_loan import harness  # noqa: E402
+from gold_loan.harness import GoldLoanApiTest as G, KycDocumentAlreadyExistsError  # noqa: E402
+from gold_loan.harness import validate_cli  # noqa: E402
+from flows.create_packets import PacketBatchTest  # noqa: E402
+from flows.kyc_only import KycOnlyTest  # noqa: E402
+from flows.resume_loan import (  # noqa: E402
     ResumeLoanTest, STAGE_NAMES, STEPS as RESUME_STEPS, STEP_KEYS as RESUME_KEYS)
 
 # --------------------------------------------------------------------------------------------
@@ -514,7 +515,7 @@ def _():
         s = suite("ovd", GOLD_LOAN_KYC_OVD_TYPE=alias, GOLD_LOAN_KYC_OVD_NUMBER="X1",
                   GOLD_LOAN_KYC_DOB="1996-11-25")
         eq(s.kyc_profile["ovdType"], "drivingLicense", f"alias {alias!r}")
-        eq(s.ovd_type, "DrivingLicense", "submitted ovdType string")
+        eq(s.ovd_type, "DL", "submitted ovdType string (portal _ovdTypeMap)")
         close(s)
     for alias in ("voter", "Voter ID", "voterid", "epic"):
         s = suite("ovd", GOLD_LOAN_KYC_OVD_TYPE=alias, GOLD_LOAN_KYC_OVD_NUMBER="X1")
@@ -1620,7 +1621,7 @@ def _planned(record, **over):
 
 @test("resume: every step maps to methods that exist on the harness")
 def _():
-    # The steps are named as strings, so a rename in maintest.py would otherwise only surface
+    # The steps are named as strings, so a rename in gold_loan/harness.py would otherwise only surface
     # mid-run, after the loan has already been mutated.
     for step in RESUME_STEPS:
         for name in step.methods:
@@ -2177,7 +2178,7 @@ def _():
        "it delegates to the harness's search")
 
 # --------------------------------------------------------------------------------------------
-# GROUP: batch -- maintest.py --count N, many loans in one session
+# GROUP: batch -- gold_loan/harness.py --count N, many loans in one session
 # --------------------------------------------------------------------------------------------
 
 def _batch_suite():
@@ -2304,7 +2305,7 @@ def _():
 
 @test("batch: the reset covers everything the KYC runner resets")
 def _():
-    # test_kyc.py resets per-customer state for its own batches; a field it clears but the loan
+    # kyc_only.py resets per-customer state for its own batches; a field it clears but the loan
     # batch does not would leak one customer's identity into the next loan.
     missing = sorted(set(KycOnlyTest.PER_CUSTOMER_STATE) - set(G.PER_LOAN_STATE))
     eq(missing, [], "fields the KYC runner clears that PER_LOAN_STATE does not")
@@ -2523,8 +2524,8 @@ def _():
     calls = lambda text: set(re.findall(r"await s(?:elf)?\.(\w+)\(", text))
     mine = calls(inspect.getsource(KycOnlyTest._run_kyc))
     theirs = calls(inspect.getsource(G._run_full_kyc))
-    eq(sorted(theirs - mine), [], "steps in _run_full_kyc missing from test_kyc")
-    eq(sorted(mine - theirs), [], "extra steps in test_kyc not in _run_full_kyc")
+    eq(sorted(theirs - mine), [], "steps in _run_full_kyc missing from kyc_only")
+    eq(sorted(mine - theirs), [], "extra steps in kyc_only not in _run_full_kyc")
 
 @test("kyc-runner: per-customer state does not leak across a batch")
 def _():
@@ -2586,7 +2587,7 @@ def _():
 @test("kyc-runner: CLI refuses --count > 1 for auto/ovd and other bad combinations")
 def _():
     import subprocess
-    script = os.path.join(ROOT, "src", "test_kyc.py")
+    script = os.path.join(ROOT, "flows", "kyc_only.py")
     cases = [(["--count", "3", "--kyc", "ovd"], "is not possible with --kyc ovd"),
              (["--count", "2", "--kyc", "auto"], "is not possible with --kyc auto"),
              (["--customer", "MS35QNJP", "--count", "2"], "drop --count"),
@@ -2638,6 +2639,13 @@ def _():
     seen = {pick_purpose(s)[1] for _ in range(40)}
     close(s)
     eq(seen, {"Consumption Based"}, "purpose types picked")
+
+@test("purpose: igl uses the preferred IGL purpose 'Agro' when the environment has it")
+def _():
+    s = purpose_suite(GOLD_LOAN_PURPOSE_TYPE="igl")
+    picked = {pick_purpose(s) for _ in range(10)}
+    close(s)
+    eq(picked, {("Agro", "Income Generating")}, "IGL purpose")
 
 @test("purpose: igl only ever picks Income Generating purposes")
 def _():
@@ -2736,7 +2744,194 @@ def _():
             mine, theirs = float(mine), float(theirs)   # 396000.0 is sent as 396000 (js-number normalize)
         eq(str(mine), str(theirs), f"bank-details {key}")
 
-@test("server-values: a stated stamp duty of 0 wins over the 1500 default for every partner")
+@test("server-values: loanType follows the loan (basic-details response, then single-loan)")
+def _():
+    s = suite("manual")
+    record_requests(s, lambda path: {"data": {"masterLoan": {"loanType": "Renewal"}}})
+    s.loan_id = "1"
+    quiet(lambda: asyncio.run(s.fetch_single_loan()))
+    close(s)
+    eq(s.loan_type, "Renewal", "loanType from single-loan masterLoan")
+
+@test("server-values: kycStatus and the customer's userType come from the server, not literals")
+def _():
+    s = suite("manual")
+    s.customer_user_type = "Non Individual"
+    s.customer_loan_data = {"kycStatus": "approved"}
+    calls = record_requests(s, lambda path: {})
+    quiet(lambda: asyncio.run(s.kyc_ops_approval()))
+    close(s)
+    body = next(b for m, p, b in calls if p == "/api/classification/ops-team")
+    eq(body["userType"], "Non Individual", "ops-team userType from the customer record")
+
+@test("auto-aadhaar: random 8 digits + the real last 4, always Verhoeff-valid and unique")
+def _():
+    s = suite("manual")
+    numbers = {s._aadhaar_with_last4("4321") for _ in range(300)}
+    close(s)
+    ok(all(len(n) == 12 and n.endswith("4321") and n[0] in "23456789" for n in numbers), "shape")
+    ok(all(G._verhoeff_valid(n) for n in numbers), "every number passes the Verhoeff check")
+    ok(len(numbers) > 250, f"numbers are random per customer ({len(numbers)} unique of 300)")
+
+@test("auto-aadhaar: the XML verification sends the per-customer number, masked to the real last 4")
+def _():
+    s = suite("manual")
+    s.kyc_profile = {"aadhaarNumber": "4321", "aadhaarXmlPath": os.path.join(ROOT, "README.md")}
+    s.customer_id = "1"
+    s.identity_proof_number = s._aadhaar_with_last4("4321")
+    calls = record_requests(s, lambda path: {"data": {"isAahaarVerified": True, "aahaarName": "Real Name"}})
+    quiet(lambda: asyncio.run(s._verify_aadhaar_xml_auto()))
+    close(s)
+    body = next(b for m, p, b in calls if p == "/api/e-kyc/offline-aadhaar-xml")
+    eq(body["maskedAadhaarNumber"], "XXXXXXXX4321", "masked number keeps the real last 4")
+    eq((s.aadhaar_verified, s.name_as_per_aadhaar), (True, "Real Name"), "verified via data.isAahaarVerified")
+
+@test("release-docs: POST /api/e-kyc/remove carries the PAN (upper-cased) and optional Aadhaar")
+def _():
+    s = suite("manual")
+    sent = {}
+    class R:
+        content = b"{}"
+        def raise_for_status(self_inner): pass
+        def json(self_inner): return {"panCardUpdated": True, "identityProofNumberUpdated": False}
+    async def post(path, json=None, **k):
+        sent.update(path=path, body=json); return R()
+    s.client.post = post
+    result = quiet(lambda: asyncio.run(s.release_kyc_documents(pan="abcde1234f")))[0]
+    eq((sent["path"], sent["body"]), ("/api/e-kyc/remove",
+                                      {"identityProofNumber": None, "panCardNumber": "ABCDE1234F"}), "request")
+    eq(result["panCardUpdated"], True, "server answer returned")
+
+@test("release-docs: refused outside TEST/UAT; --count with --kyc auto allowed only with --release-kyc-docs")
+def _():
+    s = suite("manual")
+    s.env_name = "prod"
+    try:
+        asyncio.run(s.release_kyc_documents(pan="ABCDE1234F"))
+    except RuntimeError:
+        pass
+    else:
+        raise Fail("must refuse a non TEST/UAT environment")
+    finally:
+        close(s)
+    class Args:
+        count, kyc, customer, release_kyc_docs = 3, "auto", None, True
+    errors = []
+    validate_cli(Args, errors.append)
+    eq(errors, [], "auto batch allowed when the PAN is released before each customer")
+    Args.release_kyc_docs = False
+    validate_cli(Args, errors.append)
+    ok(errors and "release-kyc-docs" in errors[0], f"hint mentions the flag: {errors}")
+
+@test("portal-parity: an occupation that needs an industry gets a random category + industry")
+def _():
+    s = suite("manual")
+    def responder(path):
+        if path.endswith("/api/occupation/list"):
+            return {"data": [{"id": 24, "riskCategory": "low", "isIndustryRequired": True}]}
+        if path.endswith("/api/industry/categories"):
+            return {"data": [{"id": 3, "name": "Manufacturing"}]}
+        if "/api/industry/by-category-list/3" in path:
+            return {"data": [{"id": 31, "name": "Textiles"}]}
+        return {}
+    record_requests(s, responder)
+    quiet(lambda: asyncio.run(s._fetch_occupations()))
+    close(s)
+    eq((s.occupation_id, s.industry_category_id, s.industry_id), ("24", 3, 31), "industry picked")
+
+@test("portal-parity: no co-lender unless --co-lender; declining the server default is an override")
+def _():
+    s = suite("manual")
+    s._apply_scheme({"id": 853, "_partnerId": "152", "coLenderBankId": 2})
+    eq(s.co_lender_bank_id, None, "the scheme's own co-lender is not applied")
+    s.auto_assigned_co_lender_id = 2
+    flag, reason = s._co_lender_override()
+    close(s)
+    ok(flag and reason, "server default declined -> override flag + reason, as the portal requires")
+
+@test("portal-parity: co-lender override flag/reason follow the server's default co-lender")
+def _():
+    s = suite("manual")
+    eq(s._co_lender_override(), (False, None), "no default co-lender -> no override")
+    s.auto_assigned_co_lender_id, s.co_lender_bank_id = 4, "4"
+    eq(s._co_lender_override(), (False, None), "kept the default")
+    s.co_lender_bank_id = "6"
+    flag, reason = s._co_lender_override()
+    close(s)
+    ok(flag and reason, "a different co-lender is an override with a reason")
+
+@test("portal-parity: KYC ops approval stops clearly when the server wants a CCE rating first")
+def _():
+    s = suite("manual")
+    s.submit_all_kyc_response = {"ratingStage": 1}
+    record_requests(s)
+    try:
+        quiet(lambda: asyncio.run(s.kyc_ops_approval()))
+    except RuntimeError as e:
+        ok("ratingStage=1" in str(e), f"names the stage: {e}")
+    else:
+        raise Fail("ratingStage 1 must not be sent to the ops endpoint")
+    finally:
+        close(s)
+
+@test("portal-parity: disbursement finalAmount is net, fullAmount gross (calcfinalLoanAmount)")
+def _():
+    body = {"fullSecuredAmount": 400000, "fullUnsecuredAmount": 0, "processingCharge": 400,
+            "totalManualCharges": 0, "upfrontInterestAmount": 0, "advanceBankTransfer": 0,
+            "actualCashGiven": 0, "appraiserCharges": 0, "stampDutyCharges": "0.00", "bTMoney": 0}
+    G._apply_portal_disbursement_amounts(body)
+    eq((body["finalAmount"], body["fullAmount"]), (399600.0, 400400.0), "net / gross")
+
+@test("portal-parity: ops rating copies the appraiser/BM decisions from the loan record")
+def _():
+    s = suite("manual")
+    loan = {"data": {"id": 7, "masterLoanId": 8, "loanAmount": "400000.00",
+                     "customer": {"cKycNumber": "00470549020638"},
+                     "masterLoan": {"loanType": "Fresh Loan", "loanStatusForAppraiser": "approved",
+                                    "commentByAppraiser": "auto approved", "loanStatusForBM": "pending",
+                                    "applicationFormForBM": False, "goldValuationForBM": False}}}
+    calls = record_requests(s, lambda path: loan)
+    s.loan_id = "7"
+    quiet(lambda: asyncio.run(s.add_ops_rating()))
+    close(s)
+    body = next(b for m, p, b in calls if p == "/api/loan-process/ops-rating")
+    eq((body["loanStatusForBM"], body["applicationFormForBM"], body["cKycNumber"], body["loanAmountDigi"]),
+       ("pending", False, "00470549020638", "400000.00"), "copied from the loan record")
+    eq(body["loanStatusForOperatinalTeam"], "approved", "ops' own decision")
+    ok("commentByBM" not in body and "commentByPartner" not in body, "no fields the ops form does not have")
+
+@test("portal-parity: update-loan-lock uses the loan's CURRENT stage")
+def _():
+    s = suite("manual")
+    calls = record_requests(s, lambda path: {"data": {"masterLoan": {"loanStage": {"id": 5}}}})
+    s.loan_id, s.master_loan_id = "7", "8"
+    quiet(lambda: asyncio.run(s.update_loan_lock()))
+    close(s)
+    body = next(b for m, p, b in calls if p == "/api/loan-process/update-loan-lock")
+    eq(body["loanStageId"], 5, "current stage")
+
+@test("portal-parity: ornaments use the karat range, a per-gram currentLtvAmount and totalEligibleAmt 0")
+def _():
+    s = suite("manual")
+    karats = {"data": [{"karat": "22", "range": [0, 95]}, {"karat": "0 K HM", "range": [0]}]}
+    def responder(path):
+        if "gold-rate" in path: return {"goldRate": 12340}
+        if "global-setting" in path: return {"ltvGoldValue": "75"}
+        if "karat-details" in path: return karats
+        if "ornament-type" in path: return {"data": [{"id": 3, "name": "Ring"}]}
+        return {"ornaments": [], "netWtAfterPurity": 100.0}
+    calls = record_requests(s, responder)
+    fake_uploads(s)
+    quiet(lambda: asyncio.run(s.store_ornament_details()))
+    close(s)
+    body = next(b for m, p, b in calls if p == "/api/loan-process/ornaments-details")
+    o = body["loanOrnaments"][0]
+    eq((body["totalEligibleAmt"], o["currentLtvAmount"], o["ltvPercent"], o["purityReading"]),
+       (0, 9255.0, "95", None), "portal ornament values")
+    eq(float(o["netWtAfterPurity"]), round(float(o["netWeight"]) * 95 / 100, 2), "netWtAfterPurity = net * ltv%")
+    eq(s.ornaments_total_nwap, 100.0, "total net weight kept from the response")
+
+@test("server-values: a stated stamp duty of 0 is used as stated for every partner")
 def _():
     for partner in ("152", "10"):
         s = suite("manual")
@@ -2760,6 +2955,158 @@ def _():
     body = next(b for m, p, b in calls if p.endswith("/generate-interest-table"))
     eq((body["securedExposure"], body["securedprocessingCharge"], body["paymentFrequency"]),
        ("0.18", 4000, "30 Days"), "interest-table scheme fields")
+
+
+# --------------------------------------------------------------------------------------------
+# upload documents: LIP assessment, IGL income documents, Arvog / stamp-paper copies
+# --------------------------------------------------------------------------------------------
+
+IGL_PURPOSE = {"name": "Agricultural Purposes", "purposeType": "Income Generating", "isActive": True,
+               "incomeGeneratingDocumentTypes": [
+                   {"name": "Business Proof Documents", "documents": ["GST Certificate", "Trade License"],
+                    "hiddenDocuments": ["GST Certificate", "Trade License"]},
+                   {"name": "Agri Loan", "documents": ["7/12", "Land records"], "hiddenDocuments": []}]}
+
+def single_loan(**over):
+    data = {"loanUniqueId": "AUGM-1", "loanAmount": "400000.00", "presentInterest": 108166.5,
+            "currentLoanPresentInterest": 4440.0, "interestRate": "1.11", "isLIPFormRequired": True,
+            "isArvog": False, "stampDutyDefinitionType": None,
+            "customer": {"firstName": "A", "lastName": "B", "tillDateOutstanding": "5415000.00",
+                         "customerKycPersonal": {"occupation": {"name": "Services", "category": "Others"}}},
+            "loanPersonalDetail": {"purpose": "Agricultural Purposes", "purposeType": "Income Generating"},
+            "masterLoan": {"commentByBM": "auto approved", "bankId": None}}
+    data.update(over)
+    return {"data": data}
+
+def run_loan_documents(loan, lip_validation=True, stored_lip=None):
+    """Drive store_loan_documents against a mocked server. After loan-documents is posted the
+    mock's single-loan carries the LIP assessment the server would store (eligible, with
+    existingLoanEmis = the sent presentInterest) unless `stored_lip` overrides it."""
+    s = suite("manual")
+    s.auth_token = jwt.encode({"firstName": "Abhi", "lastName": "testAppraiser", "userUniqueId": "appraiser-8888",
+                               "roleName": ["Appraiser"], "id": 1473}, "offline-test-key-0123456789abcdef", algorithm="HS256")
+    s.customer_id, s.loan_id, s.master_loan_id, s.final_loan_amount = "1", "2", "3", 400000
+    s.purpose_record = IGL_PURPOSE
+    def responder(path):
+        if "single-loan" in path: return loan
+        if "global-setting" in path: return {"LIPEligibilityValidation": lip_validation}
+        if "upload-file" in path: return {"uploadFile": {"path": "uploads/x/doc.pdf", "filename": "doc.pdf"}}
+        return {}
+    calls = []
+    def responder_with_readback(path):
+        # Once loan-documents carried a LIP form, single-loan returns what the server stores.
+        posted = next((b for m, p, b in calls if p == "/api/loan-process/loan-documents"), None)
+        if "single-loan" in path and posted is not None and posted.get("lipForm"):
+            stored = {"isEligible": True, "existingLoanEmis": posted["lipForm"]["presentInterest"]}
+            stored.update(stored_lip or {})
+            return {"data": {**loan["data"], "customerLoanDocument": {"lipFormInfo": stored}}}
+        return responder(path)
+    async def recorder(method, path, json_data=None, params=None, files=None, headers=None):
+        calls.append((method, path, json_data))
+        payload = responder_with_readback(path)
+        class R:
+            content = b"{}"
+            def json(self_inner): return payload
+        return R()
+    s._make_authenticated_request = recorder
+    fake_uploads(s, pdf="uploads/loan/doc.pdf")
+    async def lead(): pass
+    s.fetch_lead_converter = lead
+    quiet(lambda: asyncio.run(s.store_loan_documents()))
+    close(s)
+    return next(b for m, p, b in calls if p == "/api/loan-process/loan-documents")
+
+@test("upload-docs: an IGL loan sends a LIP form whose net income clears the interest obligation")
+def _():
+    body = run_loan_documents(single_loan())
+    lip = body["lipForm"]
+    ok(lip is not None, "lipForm sent")
+    eq((lip["loanAccountNumber"], lip["occupationType"], lip["endUseOfLoan"], lip["presentInterest"]),
+       ("AUGM-1", "Others", "Agricultural Purposes", "108166.50"), "LIP fields from single-loan")
+    eq((lip["assessedByName"], lip["assessedByEmployeeId"], lip["assessedByDesignation"]),
+       ("Abhi testAppraiser", "appraiser-8888", "Appraiser"), "maker from the JWT")
+    income = sum(float(lip[f] or 0) for f in G.LIP_INCOME_FIELDS)
+    expenses = sum(float(lip[f] or 0) for f in ("householdLivingExpenses", "businessOperatingExpenses",
+                                                 "otherEmis", "informalChitFundOutflow"))
+    ok(income - expenses > 108166.5 + 4440.0, f"net {income - expenses} must exceed the obligation")
+    ok(lip["occupationTypeOther"], "occupationTypeOther is required for 'Others'")
+    ok("consumptionSupportingDocs" not in body, "consumptionSupportingDocs is no longer sent")
+
+@test("upload-docs: an IGL loan sends exactly one VISIBLE income document (hidden ones skipped)")
+def _():
+    docs = run_loan_documents(single_loan())["incomeGeneratingDocuments"]
+    eq(len(docs), 1, "one income document")
+    name, doc = next(iter(docs.items()))
+    ok(name in ("7/12", "Land records"), f"visible document chosen, got {name!r}")
+    eq(doc, {"name": ["doc.pdf"], "path": ["uploads/x/doc.pdf"]}, "document entry shape")
+
+@test("upload-docs: the income field follows the occupation category (Self Employed -> business + expense)")
+def _():
+    loan = single_loan()
+    loan["data"]["customer"]["customerKycPersonal"]["occupation"] = {"name": "Shop", "category": "Self Employed"}
+    lip = run_loan_documents(loan)["lipForm"]
+    ok(lip["primaryBusinessIncome"], "primaryBusinessIncome filled")
+    eq((lip["salary"], lip["agriculturalIncome"]), ('', ''), "fields the category disables")
+    ok(lip["businessOperatingExpenses"], "business expense is mandatory for Self Employed")
+
+@test("upload-docs: no LIP form / income documents when the server does not require them (CB loan)")
+def _():
+    loan = single_loan(isLIPFormRequired=False,
+                       loanPersonalDetail={"purpose": "Marriage", "purposeType": "Consumption Based"})
+    body = run_loan_documents(loan)
+    eq((body["lipForm"], body["incomeGeneratingDocuments"]), (None, None), "CB loan below the limit")
+
+@test("upload-docs: a CB loan above the consumption threshold sends the LIP form but no income documents")
+def _():
+    loan = single_loan(isLIPFormRequired=True, loanAmount="2500000.00",
+                       loanPersonalDetail={"purpose": "Marriage", "purposeType": "Consumption Based"})
+    body = run_loan_documents(loan)
+    ok(body["lipForm"] is not None, "LIP form sent when the server requires it for a CB loan")
+    eq((body["lipForm"]["endUseOfLoan"], body["lipForm"]["newLoanRequested"]), ("Marriage", "2500000.00"),
+       "LIP fields from the CB loan record")
+    eq(body["incomeGeneratingDocuments"], None, "no IGL income documents for a CB loan")
+    ok("consumptionSupportingDocs" not in body, "no consumption supporting documents (LIP replaced them)")
+
+@test("upload-docs: consumption supporting documents only when the server flags them (UAT-style)")
+def _():
+    cb = {"purpose": "Marriage", "purposeType": "Consumption Based"}
+    flagged = run_loan_documents(single_loan(isLIPFormRequired=False, loanPersonalDetail=cb,
+                                             showConsumptionSupportingDocs=True))
+    eq(flagged.get("consumptionSupportingDocs"), [{"path": "uploads/x/doc.pdf"}], "sent when flagged")
+    plain = run_loan_documents(single_loan(isLIPFormRequired=False, loanPersonalDetail=cb))
+    ok("consumptionSupportingDocs" not in plain, "not sent without the server flag (TEST)")
+
+@test("upload-docs: Arvog needs application / gold receipt / KFS copies, except with DCB (bank 4)")
+def _():
+    arvog = run_loan_documents(single_loan(isArvog=True, masterLoan={"bankId": None}))
+    ok(arvog["loanApplicationCopy"] and arvog["goldReceipt"] and arvog["kfsCopy"], "Arvog copies sent")
+    dcb = run_loan_documents(single_loan(isArvog=True, masterLoan={"bankId": 4}))
+    eq((dcb["loanApplicationCopy"], dcb["kfsCopy"]), (None, None), "not required with DCB co-lending")
+
+@test("upload-docs: the server-stored LIP assessment is read back and must be eligible")
+def _():
+    try:
+        run_loan_documents(single_loan(), stored_lip={"isEligible": False})
+    except RuntimeError as e:
+        ok("isEligible" in str(e), f"error names the problem: {e}")
+    else:
+        raise Fail("an ineligible stored LIP assessment must fail the step")
+
+@test("upload-docs: a saved LIP form is reused, and re-declared if it is no longer eligible")
+def _():
+    loan = single_loan()
+    loan["data"]["customerLoanDocument"] = {"lipFormInfo": {
+        "yearsInCurrentOccupation": "7", "salary": 1000, "householdLivingExpenses": "500",
+        "grossMonthlyIncome": 1000, "isEligible": False, "pdfUrl": "x.pdf"}}
+    lip = run_loan_documents(loan)["lipForm"]
+    eq(lip["yearsInCurrentOccupation"], "7", "saved value reused")
+    ok("grossMonthlyIncome" not in lip and "pdfUrl" not in lip, "server-computed fields not sent back")
+    ok(G._lip_net_income(lip) > 108166.5 + 4440.0, "income re-declared to pass eligibility")
+
+@test("upload-docs: a stamp-paper stamp duty sends the stamp paper copy")
+def _():
+    body = run_loan_documents(single_loan(stampDutyDefinitionType="stampPaper"))
+    ok(body["stampPaperCopy"] and body["stampPaperCopyFullUrl"], "stamp paper copy sent")
 
 
 # --------------------------------------------------------------------------------------------

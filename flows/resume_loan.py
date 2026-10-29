@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """Resume an in-flight gold loan from whatever stage it is at and drive it to completion.
 
-The end-to-end harness (`maintest.py`) always starts a loan from scratch. When a run dies
+The end-to-end harness (`gold_loan/harness.py`) always starts a loan from scratch. When a run dies
 half-way -- a flaky penny-drop, a 400 at final-loan-details, an interrupted session -- the
 loan is left parked at some stage and the only way forward was to start a brand new one.
 This runner picks such a loan up and finishes it.
 
-    python src/test_resume_loan.py --loan AUGM-67273
-    python src/test_resume_loan.py --master-loan-id 10947 --loan-id 12952
-    python src/test_resume_loan.py --customer MS35QNJP
-    python src/test_resume_loan.py --loan AUGM-67273 --from documents
-    python src/test_resume_loan.py --loan AUGM-67273 --dry-run     # print the plan, change nothing
-    python src/test_resume_loan.py --list-steps
+    python flows/resume_loan.py --loan AUGM-67273
+    python flows/resume_loan.py --master-loan-id 10947 --loan-id 12952
+    python flows/resume_loan.py --customer MS35QNJP
+    python flows/resume_loan.py --loan AUGM-67273 --from documents
+    python flows/resume_loan.py --loan AUGM-67273 --dry-run     # print the plan, change nothing
+    python flows/resume_loan.py --list-steps
 
-Like `test_kyc.py` and `test_create_packets.py`, this WRAPS `GoldLoanApiTest` rather than
+Like `kyc_only.py` and `create_packets.py`, this WRAPS `GoldLoanApiTest` rather than
 subclassing it: every request body, signature and domain rule stays defined once in
-`maintest.py` and cannot drift.
+`gold_loan/harness.py` and cannot drift.
 
 How the resume point is chosen
 ------------------------------
@@ -36,11 +36,11 @@ import os
 import sys
 import urllib.parse
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # project root
 
 import httpx  # noqa: E402
 
-from maintest import GoldLoanApiTest  # noqa: E402
+from gold_loan.harness import GoldLoanApiTest  # noqa: E402
 
 
 class Step:
@@ -194,7 +194,7 @@ class ResumeLoanTest:
         if not found or not self.suite.master_loan_id:
             raise RuntimeError(
                 f"Customer {customer_unique_id} has no appraiser request with a loan on env "
-                f"'{self.suite.env_name}'. Start a new loan with maintest.py instead.")
+                f"'{self.suite.env_name}'. Start a new loan with gold_loan/harness.py instead.")
         return str(self.suite.master_loan_id), str(self.suite.loan_id)
 
     async def resolve_loan(self):
@@ -279,7 +279,7 @@ class ResumeLoanTest:
 
         # Customer identity + the KYC artifacts loan-documents reuses (signature, identity
         # proof, PAN image). These come from the customer record, exactly as the
-        # existing-customer path in maintest.py does it.
+        # existing-customer path in gold_loan/harness.py does it.
         if suite.customer_id:
             await self.suite.get_customer_by_id()
         await self.suite._prepare_loan_fields_from_existing()
@@ -388,7 +388,7 @@ class ResumeLoanTest:
                 await suite.fetch_loan_details()
                 return True
 
-            # Generate this run's packet up front, as maintest does -- but only when the loan still
+            # Generate this run's packet up front, as harness does -- but only when the loan still
             # has to be sealed into one (the packet step is in the plan).
             if any(step.key == "packet" for step in steps):
                 suite._log_step("Generate Packet (admin)")

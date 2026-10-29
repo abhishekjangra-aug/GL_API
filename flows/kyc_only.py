@@ -1,9 +1,9 @@
-# src/test_kyc.py
+# flows/kyc_only.py
 """Standalone KYC harness -- the complete KYC journey, and nothing else.
 
 Runs the customer + KYC half of the Gold Loan flow on its own, in any of the three identity
 modes, and stops before the loan process. When a loan is wanted afterwards, hand the customer
-this script prints to `maintest.py --customer <uniqueId>`; that path reuses an approved KYC and
+this script prints to `flows/e2e_full_loan.py --customer <uniqueId>`; that path reuses an approved KYC and
 goes straight to the loan.
 
 Covered here (the full KYC feature set):
@@ -22,14 +22,14 @@ Covered here (the full KYC feature set):
     ops approval                         POST /api/classification/ops-team
 
 Usage:
-    python src/test_kyc.py                              # manual KYC, one new customer
-    python src/test_kyc.py --kyc auto                   # real PAN + real Aadhaar XML
-    python src/test_kyc.py --kyc ovd                    # real OVD + Form 97, no PAN
-    python src/test_kyc.py --count 5                    # seed 5 KYC'd customers (manual only)
-    python src/test_kyc.py --customer MS35QNJP          # Re-KYC an existing customer
-    python src/test_kyc.py --kyc-type NEW_KYC           # NEW_KYC instead of the RE_KYC default
-    python src/test_kyc.py --skip-ops-approval          # leave the KYC pending for a manual review
-    python src/test_kyc.py --env uat --kyc ovd
+    python flows/kyc_only.py                              # manual KYC, one new customer
+    python flows/kyc_only.py --kyc auto                   # real PAN + real Aadhaar XML
+    python flows/kyc_only.py --kyc ovd                    # real OVD + Form 97, no PAN
+    python flows/kyc_only.py --count 5                    # seed 5 KYC'd customers (manual only)
+    python flows/kyc_only.py --customer MS35QNJP          # Re-KYC an existing customer
+    python flows/kyc_only.py --kyc-type NEW_KYC           # NEW_KYC instead of the RE_KYC default
+    python flows/kyc_only.py --skip-ops-approval          # leave the KYC pending for a manual review
+    python flows/kyc_only.py --env uat --kyc ovd
 
 Real identity data for --kyc auto/ovd comes from config/kyc_identity.json (or GOLD_LOAN_KYC_*
 env vars) -- see config/kyc_identity.example.json. Real numbers cannot be generated.
@@ -43,20 +43,20 @@ import asyncio
 import os
 import sys
 
-# Allow `python src/test_kyc.py` from any cwd.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Allow `python flows/kyc_only.py` from any cwd.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # project root
 
 import httpx  # noqa: E402
 
-from maintest import GoldLoanApiTest, KycDocumentAlreadyExistsError  # noqa: E402
+from gold_loan.harness import GoldLoanApiTest, KycDocumentAlreadyExistsError  # noqa: E402
 
 
 class KycOnlyTest:
     """Drives GoldLoanApiTest through customer creation + KYC, then stops.
 
     Wraps the harness rather than subclassing it, so every request body, HMAC signature and
-    verification rule stays defined in exactly one place (maintest.py) and this file cannot
-    drift away from the flow maintest actually runs.
+    verification rule stays defined in exactly one place (gold_loan/harness.py) and this file cannot
+    drift away from the flow harness actually runs.
     """
 
     # Per-customer state that must NOT leak from one customer to the next in a --count batch.
@@ -161,6 +161,7 @@ class KycOnlyTest:
         """
         s = self.suite
         s._print_kyc_mode_header()
+        await s.release_kyc_documents_if_enabled()   # --release-kyc-docs (TEST/UAT)
         await s.get_customer_by_id()
         try:
             await s.get_kyc_customer_detail()
@@ -266,7 +267,7 @@ class KycOnlyTest:
             print("\n" + s._c(f"{s._G['square']} NEXT: create a loan against these customers",
                               "bold", "cyan"))
             for r in ready:
-                print(f"  python src/maintest.py --customer {r['unique_id']} --env {s.env_name}")
+                print(f"  python flows/e2e_full_loan.py --customer {r['unique_id']} --env {s.env_name}")
 
         passed = bool(self.results) and not failed and not aborted
         s._banner("RESULT - PASSED" if passed else "RESULT - FAILED",
@@ -277,18 +278,17 @@ class KycOnlyTest:
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="test_kyc.py",
         description="Run the complete Gold Loan KYC flow on its own (no loan process).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
-               "  python src/test_kyc.py                        # manual KYC, one new customer\n"
-               "  python src/test_kyc.py --kyc auto             # real PAN + real Aadhaar XML\n"
-               "  python src/test_kyc.py --kyc ovd              # real OVD + Form 97, no PAN\n"
-               "  python src/test_kyc.py --count 5              # seed 5 KYC'd customers\n"
-               "  python src/test_kyc.py --customer MS35QNJP    # Re-KYC an existing customer\n"
-               "  python src/test_kyc.py --skip-ops-approval    # leave KYC pending\n"
+               "  python flows/kyc_only.py                        # manual KYC, one new customer\n"
+               "  python flows/kyc_only.py --kyc auto             # real PAN + real Aadhaar XML\n"
+               "  python flows/kyc_only.py --kyc ovd              # real OVD + Form 97, no PAN\n"
+               "  python flows/kyc_only.py --count 5              # seed 5 KYC'd customers\n"
+               "  python flows/kyc_only.py --customer MS35QNJP    # Re-KYC an existing customer\n"
+               "  python flows/kyc_only.py --skip-ops-approval    # leave KYC pending\n"
                "\nA loan against the resulting customer is created with:\n"
-               "  python src/maintest.py --customer <uniqueId>\n",
+               "  python flows/e2e_full_loan.py --customer <uniqueId>\n",
     )
     parser.add_argument("--env", choices=sorted(GoldLoanApiTest.ENVIRONMENTS),
                         default=os.getenv("GOLD_LOAN_ENV", GoldLoanApiTest.DEFAULT_ENV).strip().lower(),
@@ -313,6 +313,9 @@ def main():
                         help="Submit the KYC but do not approve it, leaving the record pending.")
     parser.add_argument("--pan-type", choices=["pan", "form60"],
                         help="PAN document type for manual/auto mode (default: pan).")
+    parser.add_argument("--release-kyc-docs", action="store_true",
+                        help="TEST/UAT only: free the identity profile's REAL PAN (and full Aadhaar) "
+                             "before each KYC, so --kyc auto can run again / with --count > 1.")
     parser.add_argument("--login", default="appraiser",
                         help="Role that runs the KYC (default: %(default)s).")
     args = parser.parse_args()
@@ -324,15 +327,19 @@ def main():
     # A real document can only ever be registered to ONE customer. Creating a second customer with
     # the same profile would hit "already registered" and abort by design, so refuse it up front
     # rather than burning a customer record to discover that.
-    if args.count > 1 and args.kyc != GoldLoanApiTest.KYC_MODE_MANUAL:
+    if args.count > 1 and args.kyc != GoldLoanApiTest.KYC_MODE_MANUAL and not (
+            args.kyc == GoldLoanApiTest.KYC_MODE_AUTO and args.release_kyc_docs):
         parser.error(
             f"--count {args.count} is not possible with --kyc {args.kyc}: the identity profile "
             f"holds ONE real person's documents, and a document can only be registered against "
-            f"one customer. Use --kyc manual to seed several customers, or --count 1.")
+            f"one customer (auto: the real PAN -- the Aadhaar is already unique per customer; "
+            f"ovd: the real OVD). Use --kyc manual to seed several customers, or --count 1.")
 
     # These are read by the constructor, so set them before it runs.
     os.environ["GOLD_LOAN_ENV"] = args.env
     os.environ["GOLD_LOAN_KYC_MODE"] = args.kyc
+    if args.release_kyc_docs:
+        os.environ["GOLD_LOAN_RELEASE_KYC_DOCS"] = "true"
     os.environ["GOLD_LOAN_KYC_TYPE"] = args.kyc_type
     if args.kyc_profile:
         os.environ["GOLD_LOAN_KYC_PROFILE"] = args.kyc_profile

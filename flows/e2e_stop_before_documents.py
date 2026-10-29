@@ -1,45 +1,45 @@
 #!/usr/bin/env python3
 """Run the gold loan journey up to the upload-documents page, then STOP.
 
-Same flow and same flags as `maintest.py` -- customer/KYC -> appraiser request -> ornaments ->
+Same flow and same flags as `gold_loan/harness.py` -- customer/KYC -> appraiser request -> ornaments ->
 scheme -> bank details -> appraiser rating -> assign packet -> BM rating (>= 5L) -- but the
 loan documents are never uploaded, and nothing after that runs (ops bank verification, ops
 rating, disbursement, submit-packet). The loan is left parked at "upload documents".
 
-    python src/test_stop_before_documents.py
-    python src/test_stop_before_documents.py --env uat
-    python src/test_stop_before_documents.py --customer MS35QNJP --amount 550000
-    python src/test_stop_before_documents.py --count 5
+    python flows/e2e_stop_before_documents.py
+    python flows/e2e_stop_before_documents.py --env uat
+    python flows/e2e_stop_before_documents.py --customer MS35QNJP --amount 550000
+    python flows/e2e_stop_before_documents.py --count 5
 
 Every run creates a NEW appraiser request. An existing request is never cancelled and never
 resumed: with --customer, if that customer already has one, a new request is tried in another
 branch, and if none accepts it the run stops with a clear error. The run ends by printing the
 customer / loan ids.
 
-`maintest.py` is NOT modified. This file subclasses GoldLoanApiTest and overrides only
-create_appraiser_request (create-only, see above) and run_e2e_test (a copy of maintest's flow,
+`gold_loan/harness.py` is NOT modified. This file subclasses GoldLoanApiTest and overrides only
+create_appraiser_request (create-only, see above) and run_e2e_test (a copy of the harness's flow,
 cut off before Upload Documents); every request body,
-signature and step method is still the one defined in maintest.py. maintest's own CLI is reused
+signature and step method is still the one defined in gold_loan/harness.py. the harness's own CLI is reused
 by pointing its GoldLoanApiTest name at the subclass for this process only.
 """
 
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # project root
 
 import httpx  # noqa: E402
 import jwt  # noqa: E402
 
-import maintest  # noqa: E402
+from gold_loan import harness  # noqa: E402
 
 
-class StopBeforeDocumentsTest(maintest.GoldLoanApiTest):
+class StopBeforeDocumentsTest(harness.GoldLoanApiTest):
 
     async def create_appraiser_request(self):
         """Always CREATE a new appraiser request -- never cancel, never resume an existing one.
 
-        Replaces maintest's version, which on "already Exists" resumes the existing request or
+        Replaces the harness's version, which on "already Exists" resumes the existing request or
         cancels its loan. Here: POST a new request; if the server refuses because the customer
         already has one, try a new request in another branch this login can use (non-destructive);
         if none accepts it, stop with a clear error. Nothing existing is ever cancelled or reused.
@@ -53,7 +53,7 @@ class StopBeforeDocumentsTest(maintest.GoldLoanApiTest):
             "customerUniqueId": self.customer_unique_id,
             "mobileNumber": self.mobile_number,
             "moduleId": int(self.module_id) if self.module_id else None,
-            "internalBranchId": int(self.internal_branch_id) if self.internal_branch_id else None,
+            "internalBranchId": await self.appraiser_request_branch_id(),  # the customer's branch
             "appraiserId": int(self.appraiser_id) if self.appraiser_id else None,
             "loanType": "Fresh Loan",
             "trackProccesingTime": True,
@@ -81,12 +81,12 @@ class StopBeforeDocumentsTest(maintest.GoldLoanApiTest):
         # The new request has no loan yet; never carry over ids from anything looked up before.
         self.loan_id = ''
         self.master_loan_id = ''
-        # The create response can echo the CUSTOMER id instead of the request id (see maintest).
+        # The create response can echo the CUSTOMER id instead of the request id (see harness).
         if parsed_id == str(self.customer_id):
             parsed_id = ''
         self.appraiser_request_id = parsed_id
         if not self.appraiser_request_id:
-            # Create response did not carry the id: resolve it from view-all, as maintest does.
+            # Create response did not carry the id: resolve it from view-all, as harness does.
             await self._fetch_existing_appraiser_request(required=False)
             self.loan_id = ''
             self.master_loan_id = ''
@@ -94,7 +94,7 @@ class StopBeforeDocumentsTest(maintest.GoldLoanApiTest):
         print(f'New appraiser request created. Appraiser Request ID: {self.appraiser_request_id}')
 
     async def run_e2e_test(self, login_type: str, skip_login: bool = False):
-        """maintest's run_e2e_test, ending right before Upload Documents. Returns True when it got there.
+        """the harness's run_e2e_test, ending right before Upload Documents. Returns True when it got there.
 
         `skip_login=True` reuses the session already on this instance -- used by run_many for
         loans 2..N so a batch logs in once instead of once per loan.
@@ -140,7 +140,7 @@ class StopBeforeDocumentsTest(maintest.GoldLoanApiTest):
                     self._log_step(f"KYC Process (existing customer, status={self.kyc_status or 'unknown'})")
                     await self._run_full_kyc()
             else:
-                # Customer creation runs under ADMIN (see maintest.run_e2e_test); KYC and the
+                # Customer creation runs under ADMIN (see harness.run_e2e_test); KYC and the
                 # appraiser-request then run as the appraiser.
                 self._log_step("Create Customer / Lead (admin)")
                 saved_token = self.auth_token
@@ -216,9 +216,9 @@ class StopBeforeDocumentsTest(maintest.GoldLoanApiTest):
 
 
 if __name__ == "__main__":
-    # maintest.main() builds its suite from the module-level GoldLoanApiTest name; point that at
+    # harness.main() builds its suite from the module-level GoldLoanApiTest name; point that at
     # the subclass so the full CLI (--env, --customer, --count, ...) is reused unchanged.
-    maintest.GoldLoanApiTest = StopBeforeDocumentsTest
+    harness.GoldLoanApiTest = StopBeforeDocumentsTest
     print(">> Stop point: before upload documents (no documents / ops / disbursement / submit-packet).")
     print(">> Appraiser request: always NEW (an existing request is never cancelled or resumed).")
-    maintest.main()
+    harness.main()

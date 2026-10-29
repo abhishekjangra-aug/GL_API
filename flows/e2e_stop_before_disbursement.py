@@ -1,40 +1,40 @@
 #!/usr/bin/env python3
 """Run the gold loan journey up to and including the ops rating, then STOP before disbursement.
 
-Same flow and same flags as `maintest.py` -- customer/KYC -> appraiser request -> ornaments ->
+Same flow and same flags as `gold_loan/harness.py` -- customer/KYC -> appraiser request -> ornaments ->
 scheme -> bank details -> assign packet -> BM rating (> 5L) -> documents -> ops bank
 verification -> ops rating -- but the partner approval, disbursement and submit-packet steps are
 never run. The loan is left parked at disbursement so it can be inspected or disbursed by hand.
 
-    python src/test_stop_before_disbursement.py
-    python src/test_stop_before_disbursement.py --env uat
-    python src/test_stop_before_disbursement.py --customer MS35QNJP --amount 550000
-    python src/test_stop_before_disbursement.py --count 5
+    python flows/e2e_stop_before_disbursement.py
+    python flows/e2e_stop_before_disbursement.py --env uat
+    python flows/e2e_stop_before_disbursement.py --customer MS35QNJP --amount 550000
+    python flows/e2e_stop_before_disbursement.py --count 5
 
-The run ends by printing the customer / loan ids and the `test_resume_loan.py` command that
+The run ends by printing the customer / loan ids and the `resume_loan.py` command that
 finishes the loan later.
 
-`maintest.py` is NOT modified. This file subclasses GoldLoanApiTest and overrides only
-run_e2e_test (a copy of maintest's flow, cut off after the ops rating); every request body,
-signature and step method is still the one defined in maintest.py. maintest's own CLI is reused
+`gold_loan/harness.py` is NOT modified. This file subclasses GoldLoanApiTest and overrides only
+run_e2e_test (a copy of the harness's flow, cut off after the ops rating); every request body,
+signature and step method is still the one defined in gold_loan/harness.py. the harness's own CLI is reused
 by pointing its GoldLoanApiTest name at the subclass for this process only.
 """
 
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # project root
 
 import httpx  # noqa: E402
 import jwt  # noqa: E402
 
-import maintest  # noqa: E402
+from gold_loan import harness  # noqa: E402
 
 
-class StopBeforeDisbursementTest(maintest.GoldLoanApiTest):
+class StopBeforeDisbursementTest(harness.GoldLoanApiTest):
 
     async def run_e2e_test(self, login_type: str, skip_login: bool = False):
-        """maintest's run_e2e_test, ending right after the ops rating. Returns True when it got there.
+        """the harness's run_e2e_test, ending right after the ops rating. Returns True when it got there.
 
         `skip_login=True` reuses the session already on this instance -- used by run_many for
         loans 2..N so a batch logs in once instead of once per loan.
@@ -80,7 +80,7 @@ class StopBeforeDisbursementTest(maintest.GoldLoanApiTest):
                     self._log_step(f"KYC Process (existing customer, status={self.kyc_status or 'unknown'})")
                     await self._run_full_kyc()
             else:
-                # Customer creation runs under ADMIN (see maintest.run_e2e_test); KYC and the
+                # Customer creation runs under ADMIN (see harness.run_e2e_test); KYC and the
                 # appraiser-request then run as the appraiser.
                 self._log_step("Create Customer / Lead (admin)")
                 saved_token = self.auth_token
@@ -143,7 +143,7 @@ class StopBeforeDisbursementTest(maintest.GoldLoanApiTest):
                 "Master Loan ID": self.master_loan_id,
                 "Loan ID": self.loan_id,
                 "Final Loan Amount": self.final_loan_amount,
-                "Resume with": (f"python src/test_resume_loan.py --env {self.env_name} "
+                "Resume with": (f"python flows/resume_loan.py --env {self.env_name} "
                                 f"--master-loan-id {self.master_loan_id} --loan-id {self.loan_id}"),
             })
             self._banner(
@@ -168,8 +168,8 @@ class StopBeforeDisbursementTest(maintest.GoldLoanApiTest):
 
 
 if __name__ == "__main__":
-    # maintest.main() builds its suite from the module-level GoldLoanApiTest name; point that at
+    # harness.main() builds its suite from the module-level GoldLoanApiTest name; point that at
     # the subclass so the full CLI (--env, --customer, --count, ...) is reused unchanged.
-    maintest.GoldLoanApiTest = StopBeforeDisbursementTest
+    harness.GoldLoanApiTest = StopBeforeDisbursementTest
     print(">> Stop point: after ops rating (no partner approval / disbursement / submit-packet).")
-    maintest.main()
+    harness.main()

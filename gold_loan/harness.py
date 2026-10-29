@@ -1,4 +1,4 @@
-# src/main.py
+# gold_loan/harness.py -- the Gold Loan API harness (GoldLoanApiTest) and the full-loan CLI.
 
 import httpx
 import hmac
@@ -99,7 +99,7 @@ class GoldLoanApiTest:
         "voterId": {"ovdType": "VoterID", "identityTypeId": 2,
                     "path": "/api/e-kyc/v2/verify-voter-id", "number_field": "epicNo",
                     "needs_dob": False, "confirmed": True},
-        "drivingLicense": {"ovdType": "DrivingLicense", "identityTypeId": 3,
+        "drivingLicense": {"ovdType": "DL", "identityTypeId": 3,   # portal _ovdTypeMap: dl -> 'DL'
                            "path": "/api/e-kyc/v2/verify-dl", "number_field": "dlNo",
                            "needs_dob": True, "confirmed": False},
     }
@@ -114,7 +114,7 @@ class GoldLoanApiTest:
         "dateOfBirth": "GOLD_LOAN_KYC_DOB",              # YYYY-MM-DD
         "gender": "GOLD_LOAN_KYC_GENDER",                # m | f | o
         "panCardNumber": "GOLD_LOAN_KYC_PAN",
-        "aadhaarNumber": "GOLD_LOAN_KYC_AADHAAR",        # 12 digits, must match the XML
+        "aadhaarNumber": "GOLD_LOAN_KYC_AADHAAR",        # 12 digits or just the last 4: only the last 4 must match the XML
         "aadhaarXmlPath": "GOLD_LOAN_KYC_AADHAAR_XML",   # UIDAI offline e-KYC XML on disk
         "ovdType": "GOLD_LOAN_KYC_OVD_TYPE",
         "ovdNumber": "GOLD_LOAN_KYC_OVD_NUMBER",
@@ -213,6 +213,8 @@ class GoldLoanApiTest:
         self.pan_type = ''
         self.special_category_id = ''
         self.occupation_id = ''
+        self.industry_category_id = None  # set when the occupation isIndustryRequired (random pick)
+        self.industry_id = None
         self.religion_id = ''
         self.physical_challenge_id = ''
         self.political_exposed_id = ''
@@ -245,6 +247,36 @@ class GoldLoanApiTest:
         self.customer_loan_data = {}
         self.final_loan_details_data = {}
         self.secured_scheme = {}
+        self.global_setting = {}   # GET /api/global-setting (LIP thresholds, LIP eligibility check, ...)
+        self.customer_user_type = ''   # the customer record's userType (e.g. 'Individual'), from /api/customer
+        self._user_details_by_token = {}  # verify-login userDetails per bearer token (state/city/branch of that user)
+        self.ornaments_total_nwap = None  # ornaments-details response netWtAfterPurity (total), for eligibility
+        self.basic_details_response = {}  # basic-details response: createdBy / internalBranchId / loanNomineeDetail
+        # check-loan-type outputs the portal patches into the interest calculator
+        self.secured_loan_amount = None
+        self.secured_top_up_amount = 0
+        self.unsecured_top_up_amount = 0
+        self.manual_charges = []
+        self.auto_assigned_co_lender_id = None  # check-loan-type's default co-lender (portal autoAssignedCoLenderBank)
+        self.validated_customer_name = ''  # validate-account response customerName (penny-drop)
+        self._aadhaar_identity_type_id = None  # GET /api/identity-type -> 'Aadhaar Card' id
+        self.customer_branch_id = ''           # the customer record's internalBranch.id
+        # Disbursement transfer mode: the portal's OFFLINE payout options IMPS / NEFT / RTGS (no direct
+        # ICICI / RazorpayX access). --transfer-mode / GOLD_LOAN_TRANSFER_MODE, default NEFT.
+        self.transfer_mode = (os.getenv("GOLD_LOAN_TRANSFER_MODE") or "neft").strip().lower()
+        # --release-kyc-docs / GOLD_LOAN_RELEASE_KYC_DOCS: free the identity profile's REAL PAN (and full
+        # Aadhaar) on TEST/UAT before KYC, so --kyc auto can register them on a new customer again.
+        self.release_kyc_docs = os.getenv("GOLD_LOAN_RELEASE_KYC_DOCS", "").lower() in ("1", "true", "yes")
+        # --record-har PATH / GOLD_LOAN_HAR_PATH: write every request/response of the run as a HAR 1.2
+        # file (entry comment = the run step), e.g. to refresh reference/gold-loan-e2e-flow.har.
+        self.har_path = os.getenv("GOLD_LOAN_HAR_PATH", "").strip()
+        self._har_entries = []
+        self._current_step = ""
+        if self.transfer_mode not in self.TRANSFER_MODES:
+            raise ValueError(f"Unknown transfer mode {self.transfer_mode!r}; use one of {self.TRANSFER_MODES}.")
+        self.submit_all_kyc_response = {}      # submit-all-kyc-info response (feeds the ops approval)
+        self.loan_type = ''            # the loan's loanType (basic-details response / single-loan masterLoan)
+        self.lip_form = None       # the LIP assessment sent with loan-documents, when the loan needs one
         self.appraiser_id = ''
         self.appraiser_request_id = ''
         # An already-existing appraiser request is RESUMED by default; --fresh-request /
@@ -324,9 +356,9 @@ class GoldLoanApiTest:
         self.secured_processing_charge = 0
         self.upfront_interest_amount = 0
         # Stamp duty deducted from bank-details' toBePaid. The SERVER's figure (final-loan-details,
-        # else single-loan) always wins, 0 included; 1500 / GOLD_LOAN_STAMP_DUTY is only the fallback
+        # else single-loan) always wins, 0 included; GOLD_LOAN_STAMP_DUTY (default 0, as the portal) is only the fallback
         # when the server states none.
-        self.stamp_duty_charges = float(os.getenv("GOLD_LOAN_STAMP_DUTY", "1500"))
+        self.stamp_duty_charges = float(os.getenv("GOLD_LOAN_STAMP_DUTY", "0"))
         self.stamp_duty_definition_type = None
         self.stamp_duty_from_server = False  # True once a server payload stated it (ARVOG needs this)
         self.secured_exposure = "0"
@@ -540,8 +572,89 @@ class GoldLoanApiTest:
             print(self._c(f" {subtitle}", "blue"))
         print(self._c(line, "bold", "blue"))
 
+    # --- HAR recording ------------------------------------------------------------------------
+    HAR_REDACTED_HEADERS = ("authorization", "cookie", "set-cookie")
+
+    def _record_har_entry(self, response: httpx.Response) -> None:
+        """One HAR 1.2 entry for this exchange. Bearer tokens / cookies are redacted; multipart
+        uploads are summarised (file name + size) instead of embedding the binary."""
+        request = response.request
+        elapsed_ms = round(response.elapsed.total_seconds() * 1000, 1) if response.elapsed is not None else 0
+        started = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(milliseconds=elapsed_ms)
+
+        def headers(items):
+            return [{"name": k, "value": "<redacted>" if k.lower() in self.HAR_REDACTED_HEADERS else v}
+                    for k, v in items]
+
+        entry = {
+            "startedDateTime": started.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "time": elapsed_ms,
+            "comment": self._current_step or "",
+            "request": {
+                "method": request.method,
+                "url": str(request.url),
+                "httpVersion": "HTTP/1.1",
+                "headers": headers(request.headers.items()),
+                "queryString": [{"name": k, "value": v} for k, v in request.url.params.multi_items()],
+                "cookies": [],
+                "headersSize": -1,
+                "bodySize": len(request.content or b""),
+            },
+            "response": {
+                "status": response.status_code,
+                "statusText": response.reason_phrase,
+                "httpVersion": "HTTP/1.1",
+                "headers": headers(response.headers.items()),
+                "cookies": [],
+                "content": {
+                    "size": len(response.content or b""),
+                    "mimeType": response.headers.get("content-type", ""),
+                    "text": response.content.decode("utf-8", "replace") if response.content else "",
+                },
+                "redirectURL": "",
+                "headersSize": -1,
+                "bodySize": len(response.content or b""),
+            },
+            "cache": {},
+            "timings": {"send": 0, "wait": elapsed_ms, "receive": 0},
+        }
+        content_type = request.headers.get("content-type", "")
+        if request.content:
+            if content_type.startswith("multipart/"):
+                names = re.findall(rb'filename="([^"]+)"', request.content)
+                files = ", ".join(n.decode("utf-8", "replace") for n in names) or "file"
+                entry["request"]["postData"] = {
+                    "mimeType": content_type.split(";")[0],
+                    "text": f"<multipart upload: {files} ({len(request.content)} bytes)>",
+                }
+            else:
+                entry["request"]["postData"] = {
+                    "mimeType": content_type or "application/json",
+                    "text": request.content.decode("utf-8", "replace"),
+                }
+        self._har_entries.append(entry)
+
+    def write_har(self) -> None:
+        """Write the recorded entries to self.har_path (no-op when recording is off)."""
+        if not self.har_path or not self._har_entries:
+            return
+        har = {"log": {
+            "version": "1.2",
+            "creator": {"name": "gold_loan harness (flows/e2e_full_loan.py --record-har)", "version": "1.0"},
+            "comment": (f"Recorded from a live {self.env_name.upper()} run of the harness "
+                        f"({self.BASE_URL}). Entry comments name the run step. Authorization / cookies "
+                        "redacted; multipart uploads summarised."),
+            "pages": [],
+            "entries": self._har_entries,
+        }}
+        os.makedirs(os.path.dirname(os.path.abspath(self.har_path)), exist_ok=True)
+        with open(self.har_path, "w", encoding="utf-8") as fh:
+            json.dump(har, fh, indent=1, ensure_ascii=False)
+        print(f"HAR written: {self.har_path} ({len(self._har_entries)} entries)")
+
     def _log_step(self, title: str) -> None:
         self._step_no += 1
+        self._current_step = title
         label = f" STEP {self._step_no:>2} {self._G['dot']} {title} "
         pad = max(0, self._WIDTH - len(label))
         print("\n" + self._c(f"{self._G['corner']}{label}" + self._G["rule"] * pad, "bold", "magenta"))
@@ -565,6 +678,8 @@ class GoldLoanApiTest:
     async def _log_http_exchange(self, response: httpx.Response) -> None:
         await response.aread()
         self._api_calls += 1
+        if self.har_path:
+            self._record_har_entry(response)
         status = response.status_code
         request = response.request
         method = request.method
@@ -726,6 +841,38 @@ class GoldLoanApiTest:
         born = datetime.date.fromisoformat(str(dob)[:10])
         today = datetime.date.today()
         return today.year - born.year - ((today.month, today.day) < (born.month, born.day))
+
+    # Standard Verhoeff tables (also used by _generate_random_aadhaar_number).
+    _VERHOEFF_D = ((0, 1, 2, 3, 4, 5, 6, 7, 8, 9), (1, 2, 3, 4, 0, 6, 7, 8, 9, 5),
+                   (2, 3, 4, 0, 1, 7, 8, 9, 5, 6), (3, 4, 0, 1, 2, 8, 9, 5, 6, 7),
+                   (4, 0, 1, 2, 3, 9, 5, 6, 7, 8), (5, 9, 8, 7, 6, 0, 4, 3, 2, 1),
+                   (6, 5, 9, 8, 7, 1, 0, 4, 3, 2), (7, 6, 5, 9, 8, 2, 1, 0, 4, 3),
+                   (8, 7, 6, 5, 9, 3, 2, 1, 0, 4), (9, 8, 7, 6, 5, 4, 3, 2, 1, 0))
+    _VERHOEFF_P = ((0, 1, 2, 3, 4, 5, 6, 7, 8, 9), (1, 5, 7, 6, 2, 8, 3, 0, 9, 4),
+                   (5, 8, 0, 3, 7, 9, 6, 1, 4, 2), (8, 9, 1, 6, 0, 4, 3, 5, 2, 7),
+                   (9, 4, 5, 3, 1, 2, 6, 8, 7, 0), (4, 2, 8, 6, 5, 7, 3, 9, 0, 1),
+                   (2, 7, 9, 3, 8, 0, 6, 4, 1, 5), (7, 0, 4, 6, 1, 3, 5, 8, 2, 9))
+
+    @classmethod
+    def _verhoeff_valid(cls, number: str) -> bool:
+        check = 0
+        for index, digit in enumerate(reversed(number)):
+            check = cls._VERHOEFF_D[check][cls._VERHOEFF_P[index % 8][int(digit)]]
+        return check == 0
+
+    def _aadhaar_with_last4(self, last4: str) -> str:
+        """An Aadhaar for --kyc auto: 8 RANDOM digits + the person's REAL last 4.
+
+        The offline e-KYC XML only carries the last 4 digits, so that (with the real name) is all
+        the server can match; the random head makes every customer's number unique, so the same
+        person's XML can KYC more than one customer without "Aadhaar already exists". The head is
+        re-drawn until the full number passes the Verhoeff check (the last digit is the checksum)."""
+        assert len(last4) == 4 and last4.isdigit(), f"need the 4 real last digits, got {last4!r}"
+        for _ in range(10000):
+            head = self.random.choice('23456789') + ''.join(self.random.choice('0123456789') for _ in range(7))
+            if self._verhoeff_valid(head + last4):
+                return head + last4
+        raise RuntimeError(f"Could not build a Verhoeff-valid Aadhaar ending in {last4}.")
 
     def _generate_random_aadhaar_number(self) -> str:
         # Aadhaar uses the Verhoeff checksum; generate eleven random digits and
@@ -1100,6 +1247,7 @@ class GoldLoanApiTest:
 
         response_data_verify_login = response_verify_login.json()
         self.auth_token = response_data_verify_login.get('Token')
+        self._user_details_by_token[self.auth_token] = response_data_verify_login.get('userDetails') or {}
         print(f"Login successful. New auth_token obtained: {self.auth_token[:10]}...") # Added debug print
         assert self.auth_token, f"Auth Token not found in verify-login response: {response_data_verify_login}"
         print("Login successful. Auth token obtained.")
@@ -1117,9 +1265,11 @@ class GoldLoanApiTest:
             print(f"Error decoding JWT: {e}")
 
     async def _send_otp_verification(self, ref_code: str):
-        api_path = "/api/customer/verify-otp"
+        # The portal's LeadService.verifyOtp: customer-otp/verify-otp-admin (the old
+        # customer/verify-otp is commented out in the portal). Static test OTP.
+        api_path = "/api/customer-otp/verify-otp-admin"
         request_body = {
-            "otp": "1234",  # Assuming a static OTP for testing
+            "otp": self.CUSTOMER_OTP,
             "referenceCode": ref_code,
             "type": "lead",
         }
@@ -1132,10 +1282,16 @@ class GoldLoanApiTest:
         self._print_json_block('OTP Verified Successfully', response.json())
 
 
+    CUSTOMER_OTP = "1234"  # static OTP on TEST/UAT; the portal's lead OTP field takes 4 digits
+
     async def _send_register_otp(self):
-        self.mobile_number = self._generate_random_mobile_number()
-        api_path = "/api/customer/send-register-otp"
-        request_body = {"mobileNumber": self.mobile_number}
+        """Send the new-customer OTP the way the portal's AddLeadComponent does: customer-otp/send-otp
+        with the customer's name and type 'lead'. The old customer/send-register-otp endpoint is
+        commented out in the portal and answers 403 "This request is not permitted." on TEST."""
+        self.mobile_number = self.mobile_number or self._generate_random_mobile_number()
+        api_path = "/api/customer-otp/send-otp"
+        request_body = {"mobileNumber": self.mobile_number, "firstName": self.first_name,
+                        "lastName": self.last_name, "type": "lead"}
         response = await self._make_authenticated_request(
             'POST',
             api_path,
@@ -1143,7 +1299,7 @@ class GoldLoanApiTest:
         )
         response_body = response.json()
         self.reference_code = response_body.get('referenceCode')
-        assert self.reference_code, f"Reference code not found in send-register-otp response: {response_body}"
+        assert self.reference_code, f"Reference code not found in customer-otp/send-otp response: {response_body}"
         print(f'OTP Sent. Reference Code: {self.reference_code}')
         await self._send_otp_verification(self.reference_code)
 
@@ -1316,18 +1472,10 @@ class GoldLoanApiTest:
             or customer.get("uniqueId")
             or customer.get("unique_id")
         )
+        # The web app sends the customer record's userType with submit-all-kyc-info / ops approval.
+        self.customer_user_type = customer.get("userType") or self.customer_user_type
 
         print(f"Resolved customerUniqueId for customer {self.customer_id}.")
-
-    async def initiate_kyc(self) -> dict:
-        api_path = f"/api/kyc/initiate/{self.customer_id}"
-        response = await self._make_authenticated_request(
-            'PUT',
-            api_path,
-            json_data={}
-        )
-        print(f"KYC initiated for customer {self.customer_id}.")
-        return response.json()
 
     async def get_customer_by_id(self) -> dict:
         api_path = f"/api/customer/{self.customer_id}"
@@ -1363,7 +1511,21 @@ class GoldLoanApiTest:
                     pass
             if customer.get("motherName"):
                 self.mother_name = str(customer.get("motherName"))
+            branch = customer.get("internalBranch") if isinstance(customer.get("internalBranch"), dict) else {}
+            if branch.get("id"):
+                self.customer_branch_id = str(branch["id"])
         print(f"Fetched customer {self.customer_id} (kycStatus={self.kyc_status or 'unknown'}).")
+
+    async def appraiser_request_branch_id(self):
+        """The portal posts the appraiser request with the CUSTOMER's branch
+        (leadData.internalBranch.id), falling back to the login's branch."""
+        if not self.customer_branch_id and self.customer_id:
+            try:
+                await self.get_customer_by_id()
+            except httpx.HTTPStatusError as e:
+                print(f"Customer lookup for the branch failed ({e.response.status_code}); using the login branch.")
+        branch = self.customer_branch_id or self.internal_branch_id
+        return int(branch) if str(branch).isdigit() else None
         return data
 
     async def get_kyc_customer_detail(self) -> dict:
@@ -1488,18 +1650,33 @@ class GoldLoanApiTest:
             await self._fetch_customer_unique_id()
         print(f"Using existing customer {self.customer_id} for loan processing.")
 
-    async def _safe_initiate_kyc(self) -> None:
-        """initiate_kyc, tolerating an already-submitted/initiated KYC for existing customers."""
-        try:
-            await self.initiate_kyc()
-        except httpx.HTTPStatusError as e:
-            text = (e.response.text or "").lower()
-            if e.response.status_code in (400, 404) and (
-                "already submitted" in text or "already initiated" in text
-            ):
-                print(f"KYC for customer {self.customer_id} is already submitted/initiated. Continuing.")
-            else:
-                raise
+    async def release_kyc_documents(self, pan: str = None, aadhaar: str = None) -> dict:
+        """TEST/UAT only: free a PAN and/or Aadhaar from the KYC records (POST /api/e-kyc/remove),
+        so a document already registered on some customer can be registered again. Only the Origin
+        header is needed (the shared client always sends it). Returns the server's answer, which
+        says what was actually freed (panCardUpdated / identityProofNumberUpdated)."""
+        if self.env_name not in ("test", "uat"):
+            raise RuntimeError(f"Refusing to release KYC documents on environment {self.env_name!r}.")
+        body = {"identityProofNumber": aadhaar or None, "panCardNumber": (pan or "").upper() or None}
+        response = await self.client.post("/api/e-kyc/remove", json=body)
+        response.raise_for_status()
+        result = response.json() if response.content else {}
+        masked_pan = f"{body['panCardNumber'][:2]}******{body['panCardNumber'][-2:]}" if body['panCardNumber'] else "-"
+        masked_aadhaar = f"XXXXXXXX{aadhaar[-4:]}" if aadhaar else "-"
+        print(f"Released KYC documents on {self.env_name.upper()}: PAN {masked_pan} "
+              f"(freed: {result.get('panCardUpdated')}), Aadhaar {masked_aadhaar} "
+              f"(freed: {result.get('identityProofNumberUpdated')}).")
+        return result
+
+    async def release_kyc_documents_if_enabled(self) -> None:
+        """With --release-kyc-docs, free the identity profile's real PAN (and the full Aadhaar when the
+        profile has all 12 digits) before a real-identity KYC. The auto-mode Aadhaar is already unique
+        per customer (random 8 + real last 4), so the PAN is what normally blocks a re-run."""
+        if not self.release_kyc_docs or not self.kyc_uses_real_identity:
+            return
+        pan = self.kyc_profile.get("panCardNumber")
+        digits = re.sub(r"\D", "", str(self.kyc_profile.get("aadhaarNumber", "")))
+        await self.release_kyc_documents(pan=pan, aadhaar=digits if len(digits) == 12 else None)
 
     async def _run_full_kyc(self) -> None:
         """The complete KYC submission flow (KYC v2), used for new customers and not-yet-approved
@@ -1507,6 +1684,7 @@ class GoldLoanApiTest:
         consent OTP -> customer-kyc-address -> customer-kyc-personal -> submit-all-kyc-info ->
         ops-team approval. (No PUT /kyc/initiate and no PAN/Aadhaar auto-verification in v2.)"""
         self._print_kyc_mode_header()
+        await self.release_kyc_documents_if_enabled()   # --release-kyc-docs (TEST/UAT)
         await self.get_customer_by_id()
         try:
             await self.get_kyc_customer_detail()  # v2: also captures an existing customerKycId
@@ -1639,30 +1817,42 @@ class GoldLoanApiTest:
         await self._fetch_cities(self.state_id)
         await self._fetch_modules()
         await self._fetch_status()
+        # The portal's form defaults state/city to the LOGGED-IN user's (verify-login userDetails)
+        # and fixes the status to 1; this step runs under the admin token.
+        user = self._user_details_by_token.get(self.auth_token) or {}
+        if user.get('stateId') and user.get('cityId'):
+            self.state_id, self.city_id = str(user['stateId']), str(user['cityId'])
+        lead_source, lead_source_id = await self._pick_lead_source()
 
-        # The _send_register_otp method already handles sending OTP and verifying it
-        # for customer registration.
         await self._send_register_otp()
-        await asyncio.sleep(3)  # Wait for OTP verification to complete
 
         request_body = {
             "firstName": self.first_name,
             "lastName": self.last_name,
-            "mobileNumber": self.mobile_number, # Added mobileNumber to request body
+            "mobileNumber": self.mobile_number,
+            "otp": self.CUSTOMER_OTP,
             "referenceCode": self.reference_code,
-            "panCardNumber": None,
-            "stateId": self.state_id,
-            "cityId": self.city_id,
-            "statusId": self.status_id,
-            "comment": None,
+            "panCardNumber": "",
+            "stateId": int(self.state_id) if str(self.state_id).isdigit() else self.state_id,
+            "cityId": int(self.city_id) if str(self.city_id).isdigit() else self.city_id,
             "pinCode": self.random_pincode,
-            "source": None,
-            "panType": None,
+            "dateTime": datetime.datetime.now(datetime.timezone.utc)
+                .isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
+            "statusId": 1,              # the portal patches statusId to 1
+            "dateOfBirth": None,
+            "panType": None,            # '' is sent as null by the portal
+            "form60": "",
             "panImage": None,
-            "leadSource": self.lead_source,
+            "panImg": None,
+            "comment": "",
+            "leadSource": lead_source,
+            "source": "",
             "moduleId": self.module_id,
             "form60Image": None,
-            "email": f'{self.first_name.lower()}.{self.last_name.lower()}@example.com',
+            "form60Img": None,
+            "sourceFrom": None,
+            "createBtRequest": False,
+            "leadSourceId": lead_source_id,
         }
         response = await self._make_authenticated_request(
             'POST',
@@ -1689,6 +1879,19 @@ class GoldLoanApiTest:
             await self._fetch_customer_unique_id()
         print(f'Customer created successfully. Customer ID: {self.customer_id}')
 
+
+    async def _pick_lead_source(self):
+        """The portal's lead-source dropdown: GET /api/lead/lead-user; the chosen entry's
+        user.leadName is sent as leadSource and its userId as leadSourceId. Prefer the configured
+        name (self.lead_source) when the server lists it, else the first entry."""
+        response = await self._make_authenticated_request('GET', "/api/lead/lead-user")
+        rows = [r for r in (response.json().get('data') or []) if isinstance(r, dict)]
+        named = [r for r in rows if (r.get('user') or {}).get('leadName')]
+        chosen = next((r for r in named if r['user']['leadName'] == self.lead_source), None) or (named[0] if named else None)
+        if not chosen:
+            return self.lead_source, ''
+        print(f"Lead source: {chosen['user']['leadName']!r} (userId {chosen.get('userId')}).")
+        return chosen['user']['leadName'], chosen.get('userId') or ''
 
     # --- KYC identity profile + auto-verification -------------------------------------------------
 
@@ -1775,9 +1978,9 @@ class GoldLoanApiTest:
                 raise ValueError(f"Aadhaar offline e-KYC XML not found: {xml_path} "
                                  f"(GOLD_LOAN_KYC_AADHAAR_XML).")
             digits = re.sub(r"\D", "", str(self.kyc_profile.get("aadhaarNumber", "")))
-            if len(digits) != 12:
-                raise ValueError(f"aadhaarNumber must be 12 digits, got {len(digits)} "
-                                 f"(GOLD_LOAN_KYC_AADHAAR).")
+            if len(digits) not in (4, 12):
+                raise ValueError(f"aadhaarNumber must be the 12-digit Aadhaar or its last 4 digits, "
+                                 f"got {len(digits)} digits (GOLD_LOAN_KYC_AADHAAR).")
             self.kyc_profile["aadhaarNumber"] = digits
         if self.kyc_mode == self.KYC_MODE_OVD:
             ovd_type = self.kyc_profile.get("ovdType")
@@ -1823,7 +2026,21 @@ class GoldLoanApiTest:
         override = os.getenv("GOLD_LOAN_KYC_IDENTITY_TYPE_ID", "").strip()
         if override.isdigit():
             return int(override)
-        return 5  # Aadhaar Card
+        return self._aadhaar_identity_type_id or 5  # looked up from /api/identity-type; 5 = Aadhaar Card
+
+    async def _lookup_identity_types(self) -> None:
+        """The portal fills identityTypeId from GET /api/identity-type (name 'Aadhaar Card')."""
+        if self._aadhaar_identity_type_id:
+            return
+        try:
+            response = await self._make_authenticated_request('GET', "/api/identity-type")
+            rows = response.json().get('data') if isinstance(response.json(), dict) else response.json()
+            match = next((r for r in (rows or []) if isinstance(r, dict)
+                          and str(r.get('name', '')).strip().lower() == 'aadhaar card'), None)
+            if match and str(match.get('id', '')).isdigit():
+                self._aadhaar_identity_type_id = int(match['id'])
+        except httpx.HTTPStatusError as e:
+            print(f"identity-type lookup failed ({e.response.status_code}); using the default Aadhaar id 5.")
 
     @property
     def kyc_uses_real_identity(self) -> bool:
@@ -1879,12 +2096,25 @@ class GoldLoanApiTest:
                 response = await self._make_authenticated_request(
                     'POST', "/api/e-kyc/verify-pan", json_data=body)
                 payload = response.json() if response.content else {}
-                if payload.get("switchToManual"):
-                    self._kyc_note("PAN", False, payload.get("switchToManualReason") or "")
-                    self._kyc_degrade_to_manual(
-                        payload.get("switchToManualReason") or "PAN verification switched to manual")
+                data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+                if data.get("switchToManual") or payload.get("switchToManual"):
+                    reason = data.get("switchToManualReason") or payload.get("switchToManualReason") or ""
+                    self._kyc_note("PAN", False, reason)
+                    self._kyc_degrade_to_manual(reason or "PAN verification switched to manual")
                     return False
+                # The portal treats PAN as verified ONLY when data.isPanVerified is true.
+                if "isPanVerified" in data and not data.get("isPanVerified"):
+                    print(f"  verify-pan attempt {attempt}/{self.KYC_VERIFY_MAX_ATTEMPTS} -> 200 but "
+                          "isPanVerified is false.")
+                    continue
                 self.pan_verified = True
+                # The portal replaces the customer's name with the PAN record's (last word = last name).
+                pan_name = str(data.get("name") or "").strip()
+                if pan_name and pan_name.lower() != self.full_name.lower():
+                    parts = pan_name.split()
+                    self.first_name = " ".join(parts[:-1]) or parts[0]
+                    self.last_name = parts[-1] if len(parts) > 1 else ""
+                    print(f"  PAN name {pan_name!r} replaces the customer name, as the portal does.")
                 self._kyc_note("PAN", True, f"{pan} (attempt {attempt})")
                 return True
             except httpx.HTTPStatusError as e:
@@ -1913,7 +2143,9 @@ class GoldLoanApiTest:
         mismatched) session shows. Same 3-attempt switchToManual contract as verify-pan.
         """
         import base64
-        aadhaar = re.sub(r"\D", "", str(self.kyc_profile.get("aadhaarNumber", "")))
+        # The per-customer number built in save_customer_address (random 8 + real last 4).
+        aadhaar = self.identity_proof_number or self._aadhaar_with_last4(
+            re.sub(r"\D", "", str(self.kyc_profile.get("aadhaarNumber", "")))[-4:])
         xml_path = self.kyc_profile.get("aadhaarXmlPath")
         with open(xml_path, "rb") as fh:
             encoded = base64.b64encode(fh.read()).decode("ascii")
@@ -1929,15 +2161,22 @@ class GoldLoanApiTest:
                 response = await self._make_authenticated_request(
                     'POST', "/api/e-kyc/offline-aadhaar-xml", json_data=body)
                 payload = response.json() if response.content else {}
-                if payload.get("switchToManual"):
-                    self._kyc_note("Aadhaar XML", False, payload.get("reason") or "")
-                    self._kyc_degrade_to_manual(payload.get("reason") or "Aadhaar switched to manual")
+                data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+                if data.get("switchToManual") or payload.get("switchToManual"):
+                    reason = data.get("reason") or payload.get("reason") or ""
+                    self._kyc_note("Aadhaar XML", False, reason)
+                    self._kyc_degrade_to_manual(reason or "Aadhaar switched to manual")
                     return False
+                # The portal treats Aadhaar as verified ONLY when data.isAahaarVerified is true.
+                if "isAahaarVerified" in data and not data.get("isAahaarVerified"):
+                    print(f"  offline-aadhaar-xml attempt {attempt}/{self.KYC_VERIFY_MAX_ATTEMPTS} -> 200 "
+                          "but isAahaarVerified is false.")
+                    continue
                 self.aadhaar_verified = True
                 # A verified XML is authoritative for the name (CR-1: Aadhaar name overrides LOS).
-                data = payload.get("data") if isinstance(payload, dict) else None
-                if isinstance(data, dict) and data.get("name"):
-                    self.name_as_per_aadhaar = str(data["name"])
+                aadhaar_name = data.get("aahaarName") or data.get("name")
+                if aadhaar_name:
+                    self.name_as_per_aadhaar = str(aadhaar_name)
                 self._kyc_note("Aadhaar XML", True, f"XXXXXXXX{aadhaar[-4:]} (attempt {attempt})")
                 return True
             except httpx.HTTPStatusError as e:
@@ -2206,11 +2445,41 @@ class GoldLoanApiTest:
             if occupation.get("riskCategory", "").lower() == "low"
         ]
         assert low_risk_occupations, "No low-risk occupations found."
-        self.occupation_id = str(
-            self.random.choice(low_risk_occupations)["id"]
-        )
+        occupation = self.random.choice(low_risk_occupations)
+        self.occupation_id = str(occupation["id"])
+        # The portal makes industryCategoryId / industryId MANDATORY for an occupation flagged
+        # isIndustryRequired: pick both at random from its lookups.
+        self.industry_category_id = self.industry_id = None
+        if occupation.get("isIndustryRequired"):
+            await self._pick_random_industry()
         print(f"Fetched random low-risk occupation_id: {self.occupation_id}")
 
+
+    @staticmethod
+    def _rows(payload):
+        data = payload.get('data') if isinstance(payload, dict) else payload
+        if isinstance(data, dict):   # some list endpoints nest the rows one level down
+            data = next((v for v in data.values() if isinstance(v, list)), [])
+        return [r for r in (data or []) if isinstance(r, dict) and r.get('id') is not None]
+
+    async def _pick_random_industry(self) -> None:
+        """Random industry category, then a random industry inside it (the portal's
+        getIndustriesCategory -> getIndustriesByCategory dropdowns)."""
+        response = await self._make_authenticated_request('GET', "/api/industry/categories")
+        categories = self._rows(response.json())
+        self.random.shuffle(categories)
+        for category in categories:
+            response = await self._make_authenticated_request(
+                'GET', f"/api/industry/by-category-list/{category['id']}")
+            industries = self._rows(response.json())
+            if industries:
+                industry = self.random.choice(industries)
+                self.industry_category_id, self.industry_id = category['id'], industry['id']
+                print(f"Occupation {self.occupation_id} needs an industry: picked category "
+                      f"{category['id']} / industry {industry['id']} at random.")
+                return
+        raise RuntimeError(f"Occupation {self.occupation_id} requires an industry, but no industry "
+                           "category with industries was found.")
 
     async def _fetch_religions(self):
         api_path = "/api/religion"
@@ -2350,10 +2619,12 @@ class GoldLoanApiTest:
             "signatureProofImg": f"{self.BASE_URL}/{self.signature_proof}" if self.signature_proof else None,
             "signatureProofFileName": signature_file_name,
             "occupationId": int(self.occupation_id) if self.occupation_id else None, # Convert to int
+            "industryCategoryId": self.industry_category_id,   # required when the occupation isIndustryRequired
+            "industryId": self.industry_id,
             "dateOfBirth": self.dob,
-            "age": str(self.age),
+            "age": int(self.age) if str(self.age).isdigit() else self.age,   # the portal computes a number
             "moduleId": self.module_id,
-            "userType": None,
+            "userType": self.customer_user_type or None,   # customerDetails.userType
             "email": None,
             "alternateEmail": None,
             "landLineNumber": None,
@@ -2422,13 +2693,19 @@ class GoldLoanApiTest:
         # the address + identity data here and submit it via submit-all-kyc-info, exactly like the
         # captured working KYC flow (which never calls customer-kyc-address).
         await self._fetch_address_proof_types()
+        await self._lookup_identity_types()   # identityTypeId for Aadhaar, as the portal looks it up
 
         # The identity proof depends on the KYC mode:
         #   auto   -- the REAL Aadhaar from the profile, verified against its offline e-KYC XML.
         #   ovd    -- the verified OVD number stands in for Aadhaar (CR-2 'PAN not available').
         #   manual -- a generated Aadhaar, accepted by the server's manual-validation fallback.
         if self.kyc_mode == self.KYC_MODE_AUTO:
-            self.identity_proof_number = self.kyc_profile["aadhaarNumber"]
+            # 8 random digits + the REAL last 4 (the only part the XML can be matched on), so each
+            # customer gets a unique Aadhaar while the real XML still verifies. PAN has no such
+            # workaround -- it stays the real one.
+            self.identity_proof_number = self._aadhaar_with_last4(self.kyc_profile["aadhaarNumber"][-4:])
+            print(f"Auto KYC Aadhaar: XXXXXXXX{self.identity_proof_number[-4:]} "
+                  "(random 8 digits + the real last 4).")
             await self._verify_aadhaar_xml_auto()
         else:
             # Both manual AND ovd generate an Aadhaar here. The identity/address section validates
@@ -2563,7 +2840,7 @@ class GoldLoanApiTest:
         if isinstance(kyc_address, dict):
             kyc_address = kyc_address.get("address", [])
         kyc_address = [
-            {
+            self._address_proof_fields(address, {
                 **({"id": address["id"]} if isinstance(address, dict) and address.get("id") else {}),
                 "customerKycId": int(address.get("customerKycId") or self.customer_kyc_id) if (address.get("customerKycId") or self.customer_kyc_id) else None, # Convert to int
                 "customerId": int(address.get("customerId") or self.customer_id) if (address.get("customerId") or self.customer_id) else None, # Convert to int
@@ -2578,7 +2855,7 @@ class GoldLoanApiTest:
                 "addressProofTypeId": int(address.get("addressProofTypeId") or self.address_proof_type_id) if (address.get("addressProofTypeId") or self.address_proof_type_id) else None, # Convert to int
                 "addressProofNumber": self.identity_proof_number,
                 "landmark": address.get("landmark"),
-            }
+            })
             for address in kyc_address
             if isinstance(address, dict)
         ]
@@ -2596,7 +2873,7 @@ class GoldLoanApiTest:
             "identityProofNumber": self.encrypted_identity_proof_number,
             "panCardNumber": self.random_pan,
             "nameAsPerAadhaar": self.name_as_per_aadhaar,
-            "riskCategory": "low",
+            "riskCategory": self._kyc_risk_category(),
         })
         if self.cis_id:
             kyc_personal["cisId"] = int(self.cis_id) if str(self.cis_id).isdigit() else self.cis_id
@@ -2626,10 +2903,11 @@ class GoldLoanApiTest:
             "dateOfIncorporation": None,
             "form60Image": self.form60_image,
             "form60Img": f"{self.BASE_URL}/{self.form60_image}" if self.form60_image else None,
-            "isCityEdit": None,
-            "geoAddress": "",
+            "isCityEdit": (self.customer_details or {}).get("isCityEdit"),
+            # The portal: "Lat: <residential latitude>, Lng: <residential longitude>".
+            "geoAddress": f"Lat: {self.latitude}, Lng: {self.longitude}" if self.latitude else "",
             "nameAsPerAadhaar": self.name_as_per_aadhaar,
-            "riskCategory": "low",
+            "riskCategory": self._kyc_risk_category(),
         }
 
         request_body = {
@@ -2639,9 +2917,9 @@ class GoldLoanApiTest:
             "customerKycAddress": kyc_address,
             "customerKycBasicDetails": kyc_basic_details,
             "moduleId": int(self.module_id) if self.module_id else None, # Convert to int
-            "userType": None,
+            "userType": self.customer_user_type or "Individual",  # the customer record's userType
             "customerOrganizationDetail": None,
-            "isCityEdit": None,
+            "isCityEdit": (self.customer_details or {}).get("isCityEdit"),
             "latitude": self.latitude,
             "longitude": self.longitude,
         }
@@ -2651,19 +2929,57 @@ class GoldLoanApiTest:
             api_path,
             json_data=request_body
         )
+        payload = response.json() if response.content else {}
+        self.submit_all_kyc_response = payload if isinstance(payload, dict) else {}
         print('Submit all KYC info successful.')
+
+    AADHAAR_ADDRESS_PROOF_TYPE_ID = 2
+    TRANSFER_MODES = ("neft", "imps", "rtgs")   # the portal's OFFLINE options, sent lowercased
+
+    def _address_proof_fields(self, address: dict, item: dict) -> dict:
+        """The portal's address-proof rule: when the proof type is AADHAAR (2) the proof re-uses the
+        Aadhaar identity images, and the proof paths AND number are sent CryptoJS-encrypted, like
+        the identity proof. Sent in plain text the server answers "Invalid Adhaar card format!"
+        (seen whenever the random proof type landed on 2). Other types keep the stored proof and
+        the entered number as they are."""
+        if item.get("addressProofTypeId") == self.AADHAAR_ADDRESS_PROOF_TYPE_ID:
+            enc = self._encrypt_identity_proof_number
+            item["addressProof"] = [enc(self.masked_identity_proof)] if self.masked_identity_proof else []
+            item["unMaskedAddressProof"] = [enc(self.unmasked_identity_proof)] if self.unmasked_identity_proof else []
+            item["addressProofNumber"] = self.encrypted_identity_proof_number
+        return item
+
+    def _kyc_risk_category(self) -> str:
+        """riskCategory as the server's KYC record holds it (the portal sends data.riskCategory)."""
+        details = self.customer_details or {}
+        personal = details.get('customerKycPersonal') if isinstance(details.get('customerKycPersonal'), dict) else {}
+        return details.get('riskCategory') or personal.get('riskCategory') or "low"
 
 
     async def kyc_ops_approval(self):
         api_path = "/api/classification/ops-team"
+        # The portal builds this from the submit-all-kyc-info response (kycDetails): its
+        # KycClassification ids, moduleId and userType, plus the customer's kycType.
+        submitted = self.submit_all_kyc_response or {}
+        classification = submitted.get("KycClassification") if isinstance(submitted.get("KycClassification"), dict) else {}
+        # The portal posts the KYC rating to ops-team only at ratingStage 2; at stage 1 it is the CCE's
+        # turn (POST /api/classification/cce, a separate behaviour-rating form this harness does not
+        # model). Every observed run comes back at stage 2 (CCE auto-approved) -- stop clearly if not.
+        stage = submitted.get("ratingStage")
+        if stage is not None and str(stage) != "2":
+            raise RuntimeError(
+                f"submit-all-kyc-info returned ratingStage={stage}: the portal would now ask the CCE for a "
+                "KYC rating (POST /api/classification/cce) before ops can approve. That step is not "
+                "automated here; rate the KYC as CCE in the portal, then re-run with --customer.")
         request_body = {
-            "customerId": int(self.customer_id) if self.customer_id else None, # Convert to int
-            "customerKycId": int(self.customer_kyc_id) if self.customer_kyc_id else None, # Convert to int
+            "customerId": classification.get("customerId") or (int(self.customer_id) if self.customer_id else None),
+            "customerKycId": classification.get("customerKycId") or (int(self.customer_kyc_id) if self.customer_kyc_id else None),
             "kycRatingFromBM": False,
             "kycStatusFromOperationalTeam": "approved",
             "reasonFromOperationalTeam": "",
-            "moduleId": int(self.module_id) if self.module_id else None, # Convert to int
-            "userType": "Individual",  # per captured ops-team approval
+            "moduleId": submitted.get("moduleId") or (int(self.module_id) if self.module_id else None),
+            "userType": submitted.get("userType") or self.customer_user_type or "Individual",
+            "kycType": self.kyc_type,
         }
         response = await self._make_authenticated_request(
             'POST',
@@ -2672,6 +2988,11 @@ class GoldLoanApiTest:
         )
         print('KYC ops approval successful.')
 
+
+    def _login_user_type_id(self):
+        """userTypeId of the session's login (7 = appraiser), from its verify-login userDetails."""
+        details = self._user_details_by_token.get(self.auth_token) or {}
+        return details.get('userTypeId')
 
     async def _fetch_appraisers(self):
         api_path = f"/api/user/appraiser-list?internalBranchId={self.internal_branch_id}"
@@ -2700,8 +3021,14 @@ class GoldLoanApiTest:
             self.logged_in_appraiser_name = f"{first_name} {last_name}".strip() or found_appraiser.get('name')
             self.logged_in_appraiser_mobile_number = found_appraiser.get('mobileNumber') or found_appraiser.get('mobile') or self.logged_in_mobile_number
             print(f'Fetched appraiser_id: {self.appraiser_id}, name: {self.logged_in_appraiser_name}, mobile: {self.logged_in_appraiser_mobile_number} for logged-in mobile number {self.logged_in_mobile_number}')
+        elif self._login_user_type_id() == 7 and self.logged_in_user_id:
+            # An APPRAISER login: the portal locks appraiserId to the login's own id (disabled
+            # control, still sent). Never hand the loan to a random appraiser.
+            self.appraiser_id = str(self.logged_in_user_id)
+            print(f"Appraiser {self.appraiser_id} (the login) is not in this branch's appraiser list; "
+                  "using the login's own id, as the portal does.")
         else:
-            # Fallback to random if not found or not logged in as specific appraiser
+            # Another role picks from the list in the portal; the harness picks one at random.
             random_appraiser = self.random.choice(appraisers)
             self.appraiser_id = str(random_appraiser.get('id'))
             first_name = random_appraiser.get('firstName') or ''
@@ -2944,7 +3271,7 @@ class GoldLoanApiTest:
             "customerUniqueId": self.customer_unique_id,
             "mobileNumber": self.mobile_number,
             "moduleId": int(self.module_id) if self.module_id else None, # Convert to int
-            "internalBranchId": int(self.internal_branch_id) if self.internal_branch_id else None, # Convert to int
+            "internalBranchId": await self.appraiser_request_branch_id(),  # the customer's branch
             "appraiserId": int(self.appraiser_id) if self.appraiser_id else None, # Convert to int
             "loanType": "Fresh Loan",  # From collection example
             "trackProccesingTime": True,
@@ -3090,6 +3417,9 @@ class GoldLoanApiTest:
         print(f'Track loan history (action {action}) successful.')
 
 
+    # Purpose used for IGL loans when the environment has it (--purpose overrides).
+    IGL_PURPOSE = os.getenv("GOLD_LOAN_IGL_PURPOSE", "Agro")
+
     # --purpose-type keys -> the purposeType the server groups /api/purpose by.
     PURPOSE_TYPES = {"cb": "Consumption Based", "igl": "Income Generating"}
 
@@ -3137,8 +3467,12 @@ class GoldLoanApiTest:
                                    f"{sorted(self.PURPOSE_TYPES) + ['any']}.")
             if not pool:
                 raise RuntimeError(f"No active loan purpose of type {kind!r}. Available: {describe(purposes)}")
-            chosen = self.random.choice(pool)
-            how = f"random, type={kind}"
+            # IGL loans use the preferred IGL purpose ('Agro' by default, GOLD_LOAN_IGL_PURPOSE) when the
+            # environment offers it; otherwise a random Income Generating purpose.
+            preferred = next((p for p in pool if kind == "igl"
+                              and p['name'].strip().lower() == self.IGL_PURPOSE.strip().lower()), None)
+            chosen = preferred or self.random.choice(pool)
+            how = f"preferred IGL purpose" if preferred else f"random, type={kind}"
 
         self.purpose_record = chosen
         self.purpose_id = chosen['name']
@@ -3285,8 +3619,22 @@ class GoldLoanApiTest:
         if not self.customer_loan_data:
             await self.fetch_customer_loan_details()
         cld = self.customer_loan_data or {}
-        branch = cld.get('internalBranch') if isinstance(cld.get('internalBranch'), dict) else {}
+        # The portal: basicForm.patchValue(customerData) then getRawValue(), so every matching key
+        # comes from customer-loan-details; branchName is the appraiser request's branch.
+        requests = cld.get('appraiserRequest') if isinstance(cld.get('appraiserRequest'), list) else []
+        branch = (requests[0].get('internalBranch') or {}) if requests and isinstance(requests[0], dict) else {}
+        appraiser = cld.get('appraiserDetail') if isinstance(cld.get('appraiserDetail'), dict) else {}
         kyc_personal = cld.get('customerKycPersonal') if isinstance(cld.get('customerKycPersonal'), dict) else {}
+
+        def kyc_or(key, fallback):
+            value = kyc_personal.get(key)
+            return value if value not in (None, "") else fallback
+
+        def as_int(value):
+            return int(value) if str(value).isdigit() else (value or None)
+
+        signature = kyc_personal.get('signatureProof')
+        signature_img = kyc_personal.get('signatureProofImg') or ''
         if not self.age and cld.get('age'):
             self.age = cld.get('age')
         if not self.age or not self.dob:
@@ -3296,42 +3644,45 @@ class GoldLoanApiTest:
 
         request_body = {
             "customerUniqueId": self.customer_unique_id,
-            "mobileNumber": self.mobile_number,
-            "panCardNumber": self.random_pan,
+            "mobileNumber": cld.get('mobileNumber') or self.mobile_number,
+            "panCardNumber": cld.get('panCardNumber') or self.random_pan,
             "startDate": datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z'),  # ISO 8601 with Z
             "customerId": int(self.customer_id) if self.customer_id else None, # Convert to int
-            "kycStatus": "approved",
+            "kycStatus": cld.get('kycStatus') or "approved",  # customerData.kycStatus
             "purpose": purpose,
-            "panType": self.pan_type,
+            "panType": cld.get('panType') or self.pan_type,
             "loanId": None,
             "scrapId": None,
             "masterLoanId": None,
-            "panImg": self.pan_image,
+            "panImg": cld.get('panImg') or self.pan_image,
             "partReleaseId": None,
             "requestId": int(self.appraiser_request_id) if self.appraiser_request_id else None, # Convert to int
-            "customerName": self.full_name,
-            "form60Img": self.form60_image,
-            "age": str(self.age),
-            "branchName": branch.get('name') or "Augmont",  # customerData.internalBranch.name
+            "customerName": cld.get('customerName') or self.full_name,
+            "form60Img": cld.get('form60Img') or self.form60_image,
+            "age": str(cld.get('age') or self.age),
+            "branchName": branch.get('name') or '',  # customerData.appraiserRequest[0].internalBranch.name
             "branchDistance": None,  # the web app sends null too
-            "gender": self.gender,
-            "appraiserName": self.logged_in_appraiser_name,  # Use fetched appraiser name
+            "gender": cld.get('gender') or self.gender,
+            "appraiserName": appraiser.get('appraiserName') or self.logged_in_appraiser_name,
             "tillDateOutstanding": str(cld.get('tillDateOutstanding') if cld.get('tillDateOutstanding') is not None else "0.00"),
-            "appraiserMobileNumber": self.logged_in_appraiser_mobile_number,  # Use fetched appraiser mobile
+            "appraiserMobileNumber": appraiser.get('mobileNumber') or self.logged_in_appraiser_mobile_number,
             "currentActiveLoans": cld.get('currentActiveLoans') if cld.get('currentActiveLoans') is not None else 0,
-            "cpvImageFullUrl": f"{self.BASE_URL}/{self.DUMMY_PDF_PATH}",  # Placeholder
-            "annualIncome": kyc_personal.get('annualIncome') or self.annual_income,
-            "motherName": self.mother_name,
-            "religionId": int(self.religion_id) if self.religion_id else None, # Convert to int
-            "physicalChallengeId": int(self.physical_challenge_id) if self.physical_challenge_id else None, # Convert to int
-            "occupationId": int(self.occupation_id) if self.occupation_id else None, # Convert to int
-            "signatureProof": self.signature_proof,
-            "signatureProofImg": f"{self.BASE_URL}/{self.signature_proof}",
-            "signatureProofFileName": os.path.basename(self.signature_proof),
+            "cpvImageFullUrl": cld.get('cpvImageFullUrl'),   # customerData; null when the customer has none
+            "annualIncome": kyc_or('annualIncome', self.annual_income),
+            # KYC personal values (the portal disables each control that already has a value).
+            "motherName": kyc_or('motherName', self.mother_name),
+            "religionId": as_int(kyc_or('religionId', self.religion_id)),
+            "physicalChallengeId": as_int(kyc_or('physicalChallengeId', self.physical_challenge_id)),
+            "occupationId": as_int(kyc_or('occupationId', self.occupation_id)),
+            "industryCategoryId": kyc_personal.get('industryCategoryId'),
+            "industryId": kyc_personal.get('industryId'),
+            # Signature as stored on the KYC record: null / '' / '' when the customer has none.
+            "signatureProof": signature or None,
+            "signatureProofImg": signature_img,
+            "signatureProofFileName": signature_img.rsplit('/', 1)[-1] if signature_img else '',
             "referenceCustomerNumber": None,
-            "qualificationId": int(self.qualification_id) if self.qualification_id else None, # Convert to int
-            "politicalExposedId": int(self.political_exposed_id) if self.political_exposed_id else None, # Convert to int
-            "specialCategoryId": int(self.special_category_id) if self.special_category_id else None, # Convert to int
+            "qualificationId": as_int(kyc_or('qualificationId', self.qualification_id)),
+            # politicalExposedId / specialCategoryId are no longer on the portal's basic-details form.
             "incomeGeneratingDocuments": None,
             "purposeType": self.purpose_type or "Consumption Based",  # from the chosen purpose's group
             "checkPointers": {},
@@ -3346,6 +3697,10 @@ class GoldLoanApiTest:
             # Extract loanId and masterLoanId directly from the response JSON
             self.loan_id = str(resp_json['loanId'])
             self.master_loan_id = str(resp_json['masterLoanId'])
+            self.loan_type = resp_json.get('loanType') or self.loan_type  # every later step echoes it
+            # The portal passes this response on to the nominee step: createdBy / internalBranchId
+            # are echoed from it and an existing loanNomineeDetail is prefilled.
+            self.basic_details_response = resp_json if isinstance(resp_json, dict) else {}
             print(f'Loan basic details stored successfully. Loan ID: {self.loan_id}, Master Loan ID: {self.master_loan_id}')
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 400 and "Your loan already initiated" in e.response.text:
@@ -3382,6 +3737,14 @@ class GoldLoanApiTest:
         nominee_name = f"{nominee_names['firstName']} {nominee_names['lastName']}"
         nominee_age_val = self.random.randint(20, 60)
         nominee_relation = await self._fetch_nominee_relations()
+        basic = self.basic_details_response or {}
+        # A nominee the server already holds for this loan (basic-details loanNomineeDetail) is
+        # prefilled by the portal; reuse it instead of inventing a new one.
+        saved = basic.get('loanNomineeDetail') if isinstance(basic.get('loanNomineeDetail'), dict) else {}
+        if saved.get('nomineeName'):
+            nominee_name = saved['nomineeName']
+            nominee_age_val = int(saved.get('nomineeAge') or nominee_age_val)
+            print(f"Nominee: reusing the server's nominee {nominee_name!r}.")
 
         request_body = {
             "nomineeName": nominee_name,
@@ -3390,16 +3753,21 @@ class GoldLoanApiTest:
             "mobileNumber": self._generate_random_mobile_number(),
             "referenceCode": None,
             "nomineeType": 'major' if nominee_age_val >= 18 else 'minor',
-            "guardianName": "",
-            "guardianAge": 30,
-            "guardianRelationship": nominee_relation,  # valid lowercase relationshipName
+            # An adult nominee leaves the guardian controls untouched in the portal -> null.
+            "guardianName": None,
+            "guardianAge": None,
+            "guardianRelationship": None,
             "checkPointers": {},
             "loanId": int(self.loan_id) if self.loan_id else None, # Convert to int if not empty
             "masterLoanId": int(self.master_loan_id) if self.master_loan_id else None, # Convert to int if not empty
-            "loanType": "Fresh Loan",
-            "createdBy": str(self.logged_in_user_id) if self.logged_in_user_id else "3179",  # Use logged_in_user_id
-            "internalBranchId": int(self.internal_branch_id) if self.internal_branch_id else None, # Convert to int
+            "loanType": self.loan_type or "Fresh Loan",
+            # Echoed from the basic-details response, as the portal does (masterAndLoanIds).
+            "createdBy": basic.get('createdBy') or self.logged_in_user_id,
+            "internalBranchId": basic.get('internalBranchId') or (int(self.internal_branch_id) if self.internal_branch_id else None),
         }
+        for key in ("relationship", "mobileNumber", "nomineeType", "guardianName", "guardianAge", "guardianRelationship"):
+            if saved.get(key) not in (None, ""):
+                request_body[key] = saved[key]
 
         if nominee_age_val < 18:
             guardian_names = self._generate_random_name()
@@ -3435,6 +3803,13 @@ class GoldLoanApiTest:
         m = re.search(r'\d+', str(s))
         return int(m.group()) if m else 0
 
+    @staticmethod
+    def _is_positive_number(value) -> bool:
+        try:
+            return float(value) > 0
+        except (TypeError, ValueError):
+            return False
+
     async def _fetch_karat_details(self):
         api_path = "/api/karat-details"  # From collection example, no query params
         response = await self._make_authenticated_request('GET', api_path)
@@ -3445,7 +3820,10 @@ class GoldLoanApiTest:
         filtered_karats = []
         for k in karats:
             karat_value_str = k.get('karat')
-            if karat_value_str and self._is_integer(karat_value_str):
+            # The karat's LTV `range` drives netWtAfterPurity (netWeight * ltv% / 100), so a karat
+            # without a positive LTV option (e.g. '0 K HM' -> [0]) would value the gold at nothing.
+            usable_range = any(self._is_positive_number(x) for x in (k.get('range') or []))
+            if karat_value_str and self._is_integer(karat_value_str) and usable_range:
                 karat_value_int = self._extract_karat_value(karat_value_str)
                 if karat_value_int > 18:
                     filtered_karats.append(k)
@@ -3550,6 +3928,14 @@ class GoldLoanApiTest:
 
         # Use the REAL gold rate (not a random one) so the server's eligibility calc is sane.
         await self._fetch_gold_rate()
+        if not self.gold_rate:
+            raise RuntimeError("GET /api/gold-rate returned no goldRate; ornaments cannot be valued.")
+        # currentLtvAmount is a PER-GRAM rate in the portal: goldRate * ltvGoldValue% (global setting),
+        # e.g. 12340 * 75% = 9255 in the captured flow -- not a total.
+        settings = await self.fetch_global_setting()
+        ltv_gold_value = float(settings.get('ltvGoldValue') or 0)
+        if ltv_gold_value <= 0:
+            raise RuntimeError("Global setting ltvGoldValue is missing; the portal needs it to value ornaments.")
         num_ornaments = 4  # fixed count; total weight is sized to the target loan below
         loan_ornaments = []
 
@@ -3577,10 +3963,13 @@ class GoldLoanApiTest:
             gross_weight = self._round_double(base_gross * self.random.uniform(0.85, 1.15), 2)
             deduction_weight = self._round_double(self.random.uniform(0, 5), 2)  # 0-5 grams
             net_weight = self._round_double(gross_weight - deduction_weight, 2)
-            current_gold_rate = self._round_double(self.gold_rate, 2) if self.gold_rate else 6000.0
+            current_gold_rate = self._round_double(self.gold_rate, 2)
+            current_ltv_amount = self._round_double(current_gold_rate * ltv_gold_value / 100, 2)
 
-            ltv_range = karat_detail.get('ltvRange', [90])
-            ltv_percent = str(self.random.choice(ltv_range))
+            # The karat's LTV options are its `range` (karat-details); the portal's selectKarat uses it.
+            ltv_range = karat_detail.get('range') or karat_detail.get('ltvRange') or [90]
+            ltv_choices = [x for x in ltv_range if self._is_positive_number(x)] or [90]
+            ltv_percent = str(self.random.choice(ltv_choices))
 
             # netWtAfterPurity MUST equal what the server RECOMPUTES for eligibility, or final-loan-details
             # 400s with "total eligible ... doesn't match". Confirmed against the server's own stored
@@ -3591,17 +3980,10 @@ class GoldLoanApiTest:
             # server capped to 90. So we compute purity from the karat (realistic) but cap it at
             # ltvPercent, and store that same value as purityReading so no further server capping
             # applies -- our sent nwap then equals the server's recomputed nwap to the paisa.
-            karat_value = self._extract_karat_value(self.karat_id) or 22
-            karat_purity = karat_value / 24 * 100  # e.g. 22K -> 91.67%
-            try:
-                ltv_pct_num = float(ltv_percent)
-            except (TypeError, ValueError):
-                ltv_pct_num = karat_purity
-            purity_percentage = self._round_half_up(min(karat_purity, ltv_pct_num), 2)  # capped at LTV%
-            # Round HALF-UP like the server: on a half-cent tie (e.g. 31.65*0.90=28.485) Python's
-            # round() gives 28.48 but the server recomputes 28.49, and it validates eligibility against
-            # ITS value -> final-loan-details 400. See _round_half_up.
-            net_wt_after_purity = self._round_half_up(net_weight * (purity_percentage / 100), 2)
+            # The portal's getPurityWeight: netWtAfterPurity = netWeight * ltvPercent / 100 (2 dp,
+            # half-up like the server), with purityReading left null on the loan path. (The old capped
+            # formula only existed because the harness used to send a purityReading.)
+            net_wt_after_purity = self._round_half_up(net_weight * float(ltv_percent) / 100, 2)
 
             ornament_image_response = await self._upload_file(
                 "loan", file_type="image", file_path_override=self.ORNAMENT_IMAGE_PATH)
@@ -3624,8 +4006,8 @@ class GoldLoanApiTest:
                 "ltvPercent": ltv_percent,
                 "loanAmount": None,
                 "id": None,
-                "currentLtvAmount": current_gold_rate * net_wt_after_purity,
-                "ornamentImageData": f'{self.BASE_URL}/{ornament_image}',
+                "currentLtvAmount": current_ltv_amount,   # per-gram: goldRate * ltvGoldValue%
+                "ornamentImageData": ornament_image_response['uploadFile'].get('URL') or f'{self.BASE_URL}/{ornament_image}',
                 "weightMachineZeroWeightData": None,
                 "withOrnamentWeightData": None,
                 "stoneTouchData": None,
@@ -3637,9 +4019,9 @@ class GoldLoanApiTest:
                 "ornamentImageWithWeightData": None,
                 "ornamentImageWithXrfMachineReading": None,
                 "ornamentImageWithXrfMachineReadingData": None,
-                "approxPurityReading": str(purity_percentage), # Store purity
+                "approxPurityReading": None,   # scrap-only; null on the loan path
                 "scrapAmount": None,
-                "purityReading": str(purity_percentage), # Store purity
+                "purityReading": None,         # scrap-only; null on the loan path
                 "customerConfirmation": None,
                 "finalScrapAmountAfterMelting": None,
                 "processingCharges": None,
@@ -3647,10 +4029,12 @@ class GoldLoanApiTest:
                 "netWtAfterPurity": str(net_wt_after_purity),
                 "remark": None,
                 "isReleased": None,
+                "withOrnamentWeight": None,
+                "ltvAmount": None,
             }
             loan_ornaments.append(ornament)
 
-        total_eligible_amt = sum(o['currentLtvAmount'] for o in loan_ornaments)
+        total_eligible_amt = 0  # the portal sends this.totalAmount, which stays 0 on the loan path
 
         request_body = {
             "loanOrnaments": loan_ornaments,
@@ -3658,7 +4042,9 @@ class GoldLoanApiTest:
             "loanId": int(self.loan_id) if self.loan_id else None,
             "masterLoanId": int(self.master_loan_id) if self.master_loan_id else None,
             "fullAmount": 0,
-            "checkPointers": {},  # From collection example
+            "checkPointers": {},
+            "latitude": self.latitude or None,
+            "longitude": self.longitude or None,
         }
         try:
             response = await self._make_authenticated_request(
@@ -3673,6 +4059,9 @@ class GoldLoanApiTest:
             # ornaments (id=null, random amounts) fails with "total eligible ... doesn't match".
             server_ornaments = self._extract_ornaments_from_response(resp_json)
             server_total = self._find_key_recursive(resp_json, 'totalEligibleAmt')
+            # The portal's eligibility for final-loan-details uses this TOTAL net weight.
+            if isinstance(resp_json, dict) and resp_json.get('netWtAfterPurity') is not None:
+                self.ornaments_total_nwap = float(resp_json['netWtAfterPurity'])
             self.loan_ornaments_details = server_ornaments if server_ornaments else loan_ornaments
             self.total_eligible_amount = float(server_total) if server_total is not None else total_eligible_amt
             captured_ids = [o.get('id') for o in self.loan_ornaments_details if isinstance(o, dict)]
@@ -3936,9 +4325,9 @@ class GoldLoanApiTest:
         self.selected_scheme = scheme
         self.scheme_id = str(scheme.get('id'))
         self.partner_id = str(scheme.get('_partnerId') or '')
-        # A user-requested co-lender (via --co-lender) wins; otherwise use the scheme's own mapping.
-        self.co_lender_bank_id = (self._forced_co_lender_id
-                                  or (str(scheme.get('coLenderBankId')) if scheme.get('coLenderBankId') else None))
+        # Co-lending ONLY when requested with --co-lender: neither the scheme's own co-lender mapping
+        # nor the server's default co-lender is applied otherwise.
+        self.co_lender_bank_id = self._forced_co_lender_id or None
         # Amount range comes from the scheme's schemeAmountStart/End (falls back to legacy fields).
         self.min_loan_amount = scheme.get('schemeAmountStart') or scheme.get('minLoanAmount', 0) or 0
         self.max_loan_amount = scheme.get('schemeAmountEnd') or scheme.get('maxLoanAmount', 0) or 0
@@ -3996,10 +4385,12 @@ class GoldLoanApiTest:
                 "isNewLoanFromRenew": False,
                 "loanId": int(self.loan_id) if self.loan_id else None,
                 "masterLoanId": int(self.master_loan_id) if self.master_loan_id else None,
-                "loanType": "Fresh Loan",
+                "loanType": self.loan_type or "Fresh Loan",
                 "createdBy": str(self.logged_in_user_id) if self.logged_in_user_id else "3179",
                 "internalBranchId": int(self.internal_branch_id) if self.internal_branch_id else None,
-                "coLenderBankId": int(self.co_lender_bank_id) if self.co_lender_bank_id else None,
+                # The portal sends only a co-lender the USER picked (null otherwise); the server's
+                # default co-lender is adopted from the response below.
+                "coLenderBankId": int(self._forced_co_lender_id) if str(self._forced_co_lender_id or '').isdigit() else None,
             }
             try:
                 response = await self._make_authenticated_request('POST', api_path, json_data=request_body)
@@ -4049,6 +4440,25 @@ class GoldLoanApiTest:
                         self.loan_start_date = str(data.get('loanStartDate'))[:10]
                     if data.get('loanEndDate'):
                         self.loan_end_date = str(data.get('loanEndDate'))[:10]
+                    # The portal patches the calculator from this response: the CONFIRMED loan amount,
+                    # the secured/top-up split, manual charges and the default co-lender.
+                    if data.get('loanAmount') is not None:
+                        self.final_loan_amount = float(data['loanAmount'])
+                    if data.get('securedLoanAmount') is not None:
+                        self.secured_loan_amount = data['securedLoanAmount']
+                    self.secured_top_up_amount = data.get('securedTopUpAmount') or 0
+                    self.unsecured_top_up_amount = data.get('unsecuredTopUpAmount') or 0
+                    self.manual_charges = [
+                        {"chargeName": c.get('chargeName'), "charges": c.get('charges')} if isinstance(c, dict) else c
+                        for c in (data.get('manualCharges') or [])]
+                    default_bank = next((b for b in (data.get('coLenderBanks') or [])
+                                         if isinstance(b, dict) and b.get('isDefault')), None)
+                    self.auto_assigned_co_lender_id = default_bank['id'] if default_bank else None
+                    # No co-lending unless --co-lender was given: the server's default is NOT adopted
+                    # (the portal would pre-select it). Declining it counts as an override in the
+                    # portal, so final-loan-details carries the override flag + reason.
+                    if not self._forced_co_lender_id:
+                        self.co_lender_bank_id = ''
                     print(f"  -> captured calc params: procCharge={self.secured_processing_charge} "
                           f"interestRate={self.interest_rate} exposure={self.secured_exposure} "
                           f"tenure={self.tenure_months}")
@@ -4130,7 +4540,7 @@ class GoldLoanApiTest:
             "interestRate": self.interest_rate,  # scheme's real rate (from check-loan-type)
             "processingCharge": self.secured_processing_charge,
             "unsecuredSchemeId": None,
-            "securedLoanAmount": self.final_loan_amount, # Use dynamic value
+            "securedLoanAmount": self.secured_loan_amount if self.secured_loan_amount is not None else self.final_loan_amount,  # check-loan-type
             "unsecuredLoanAmount": None,
             "isUnsecuredSchemeApplied": False,
             "unsecuredRebateInterest": None,
@@ -4139,13 +4549,14 @@ class GoldLoanApiTest:
             "loanTransferExtraAmount": None,
             "upfrontInterestAmount": self.upfront_interest_amount or 0,  # from check-loan-type
             "topUpAmount": 0,
-            "securedTopUpAmount": 0,
-            "unsecuredTopUpAmount": 0,
-            "manualCharges": [],
+            "securedTopUpAmount": self.secured_top_up_amount,
+            "unsecuredTopUpAmount": self.unsecured_top_up_amount,
+            "manualCharges": self.manual_charges,   # check-loan-type manualCharges
             "unsecuredRpg": None,
             "securedRpg": self.secured_rpg if self.secured_rpg else 4480,  # scheme rate-per-gram
             "unsecuredPartnerId": None,
             "unsecuredprocessingCharge": 0,
+            "coLenderOverrideReason": self._co_lender_override()[1],
             "securedprocessingCharge": self.secured_processing_charge,  # from check-loan-type
             "securedExposure": str(self.secured_exposure),  # posExposureAgainstScheme (check-loan-type)
         }
@@ -4216,16 +4627,18 @@ class GoldLoanApiTest:
         calculated_total = 0.0
         for ornament in self.loan_ornaments_details:
             net_wt_after_purity = _num(ornament.get('netWtAfterPurity') or ornament.get('ornamentsCal'))
-            ornament_loan_amount = self._round_double(net_wt_after_purity * scheme_rpg, 2)
             ornaments_for_request.append({
                 "id": ornament.get('id'),
-                "loanAmount": ornament_loan_amount,
+                "loanAmount": net_wt_after_purity * scheme_rpg,   # unrounded, as the portal sends it
                 "ornamentsCal": net_wt_after_purity,
                 "rpg": scheme_rpg,
             })
-            calculated_total += ornament_loan_amount
+            calculated_total += net_wt_after_purity
 
-        self.total_eligible_amount = self._round_double(calculated_total, 2)
+        # The portal: totalAmt = +(totalNetWeightAfterPurity * rpg).toFixed(2), where the total weight
+        # is the ornaments-details response's netWtAfterPurity (fallback: sum of the ornaments').
+        total_nwap = self.ornaments_total_nwap if self.ornaments_total_nwap is not None else calculated_total
+        self.total_eligible_amount = self._round_half_up(total_nwap * scheme_rpg, 2)
         self.secured_rpg = scheme_rpg  # scheme loan rate/gram, echoed in loanFinalCalculator.securedRpg
         print(f"  -> final-loan-details totalEligibleAmt = {self.total_eligible_amount} "
               f"(sum of netWtAfterPurity * scheme rpg {scheme_rpg}).")
@@ -4243,13 +4656,13 @@ class GoldLoanApiTest:
             "tenure": tenure_months,  # server-assigned scheme tenure (from check-loan-type)
             "loanStartDate": loan_start_date,
             "loanEndDate": loan_end_date,
-            "paymentFrequency": "30 Days",
+            "paymentFrequency": self._payment_frequency(),  # scheme interestBillingCycleType
             "totalFinalInterestAmt": self.total_final_interest_amt, # from generate-interest-table
             "unsecuredInterestRate": None,
             "interestRate": self.interest_rate,  # scheme's real rate (from check-loan-type)
             "processingCharge": self.secured_processing_charge,  # scheme's real processing charge
             "unsecuredSchemeId": None,
-            "securedLoanAmount": self.final_loan_amount, # Use dynamic value
+            "securedLoanAmount": self.secured_loan_amount if self.secured_loan_amount is not None else self.final_loan_amount,  # check-loan-type
             "unsecuredLoanAmount": None,
             "isUnsecuredSchemeApplied": False,
             "unsecuredRebateInterest": 0,
@@ -4258,19 +4671,22 @@ class GoldLoanApiTest:
             "loanTransferExtraAmount": None,
             "upfrontInterestAmount": self.upfront_interest_amount,  # from check-loan-type
             "topUpAmount": 0,
-            "securedTopUpAmount": 0,
-            "unsecuredTopUpAmount": 0,
-            "manualCharges": [],
+            "securedTopUpAmount": self.secured_top_up_amount,
+            "unsecuredTopUpAmount": self.unsecured_top_up_amount,
+            "manualCharges": self.manual_charges,   # check-loan-type manualCharges
             "unsecuredRpg": None,
             "securedRpg": self.secured_rpg, # Use dynamic value
             "unsecuredPartnerId": None,
             "unsecuredprocessingCharge": 0,
+            "coLenderOverrideFlag": self._co_lender_override()[0],
+            "coLenderOverrideReason": self._co_lender_override()[1],
+            "systemAssignedBankId": self.auto_assigned_co_lender_id,
             "securedprocessingCharge": self.secured_processing_charge,  # scheme's real processing charge
             "securedExposure": str(self.secured_exposure),  # posExposureAgainstScheme (from check-loan-type)
         }
 
         request_body = {
-            "manualCharges": [],
+            "manualCharges": self.manual_charges,   # check-loan-type manualCharges
             "loanFinalCalculator": loan_final_calculator,
             "interestTable": self.interest_table_data, # Use dynamic value
             "loanId": int(self.loan_id) if self.loan_id else None,
@@ -4339,6 +4755,19 @@ class GoldLoanApiTest:
     def _is_arvog_loan(self) -> bool:
         return self._partner_key() == self.ARVOG_PARTNER_ID
 
+    def _co_lender_override(self):
+        """(flag, reason) as the portal derives them: overridden when the chosen co-lender differs
+        from the server's auto-assigned default; the reason is then mandatory
+        (GOLD_LOAN_CO_LENDER_OVERRIDE_REASON, default 'Customer preference')."""
+        default = self.auto_assigned_co_lender_id
+        if not default:
+            return False, None
+        chosen = int(self.co_lender_bank_id) if str(self.co_lender_bank_id or '').isdigit() else None
+        if chosen == int(default):
+            return False, None
+        default_reason = "Customer preference" if chosen else "No co-lending requested"
+        return True, os.getenv("GOLD_LOAN_CO_LENDER_OVERRIDE_REASON", default_reason)
+
     def _payment_frequency(self) -> str:
         """The scheme's billing cycle as the interest table names it ("30Days" -> "30 Days")."""
         cycle = str((self.secured_scheme or {}).get('interestBillingCycleType') or '').strip()
@@ -4357,7 +4786,7 @@ class GoldLoanApiTest:
 
     def _capture_stamp_duty(self, response):
         """Adopt final-loan-details' stampDutyCharges whenever the server states one (0 included);
-        the configured default (1500 / GOLD_LOAN_STAMP_DUTY) is only a fallback -- see
+        the configured default (GOLD_LOAN_STAMP_DUTY, default 0 like the portal) is only a fallback -- see
         _ensure_stamp_duty."""
         try:
             data = response.json()
@@ -4390,7 +4819,7 @@ class GoldLoanApiTest:
         """bank-details must carry the SERVER's stamp duty. If final-loan-details did not state one,
         read it from single-loan (data.stampDutyCharges). If the server still gives none:
         GOLD_LOAN_STAMP_DUTY, when set, is a deliberate override; otherwise ARVOG loans stop here
-        rather than send a guessed toBePaid, and other partners fall back to the 1500 default."""
+        rather than send a guessed toBePaid, and other partners fall back to the default (0)."""
         if self.stamp_duty_from_server:
             return
         print("Stamp duty not in final-loan-details: fetching it from single-loan before bank details.")
@@ -4473,14 +4902,20 @@ class GoldLoanApiTest:
 
         # The server's own figures from final-loan-details, falling back to check-loan-type's.
         proc_charge = num(fld.get('actualProcessingCharge'), self.secured_processing_charge)
-        upfront_interest = num(fld.get('upfrontInterestAmount'), self.upfront_interest_amount)
-        appraiser_pct = fld.get('appraiserCharges') if fld.get('appraiserChargesApplied') else 0
+        upfront_interest = num(fld.get('upfrontInterestAmount'), 0)         # res.upfrontInterestAmount || 0
+        appraiser_pct = fld.get('appraiserCharges') or 0                     # res.appraiserCharges, as sent
+        bt_money = num(balance.get('customerTransferBalance'), 0)            # bTMoney = getBalance.customerTransferBalance
         try:
             stamp_duty = float(self.stamp_duty_charges or 0)
         except (TypeError, ValueError):
             stamp_duty = 0.0
-        final_amt = float(self.final_loan_amount or 0)
-        to_be_paid = self._round_double(final_amt - proc_charge - upfront_interest - stamp_duty, 2)
+        final_amt = num(fld.get('finalLoanAmount'), self.final_loan_amount)    # res.finalLoanAmount
+        # The portal (bank details): available = final - (bTMoney + advanceBankTransfer + stampDuty +
+        # processingCharge + upfrontInterest); toBePaid = available - (actualCashGiven + appraiserCharges),
+        # where actualCashGiven = advanceCash + waiver - actualAppraiserCharges (all 0 here).
+        available_limit = self._round_double(final_amt - (bt_money + 0 + max(stamp_duty, 0) + proc_charge
+                                                          + max(upfront_interest, 0)), 2)
+        to_be_paid = self._round_double(available_limit - (0 + 0), 2)
 
         request_body = {
             "paymentType": ["bank"],
@@ -4489,7 +4924,7 @@ class GoldLoanApiTest:
             "accountNumber": account_number,
             "ifscCode": ifsc_code,
             "accountType": None,
-            "customerName": self.full_name,
+            "customerName": self.validated_customer_name or self.full_name,   # validate-account customerName
             "paymentMultiSelect": {"multiSelect": ["bank"]},
             "accountHolderName": account_holder_name,
             "bankBranchName": bank_branch_name,
@@ -4510,7 +4945,7 @@ class GoldLoanApiTest:
             "advanceCashTransactionImage": [],
             "advanceCashTransactionImageName": "",
             "advanceCashDeclarationId": [],
-            "bTMoney": 0,
+            "bTMoney": bt_money,
             "actualProcessingCharge": proc_charge,
             "toBePaid": to_be_paid,  # finalLoanAmount - processingCharge - upfrontInterest - stampDuty
             "remark": None,
@@ -4547,7 +4982,7 @@ class GoldLoanApiTest:
             "actualAppraiserCharges": 0,
             "appraiserChargesPercentage": appraiser_pct or 0,  # final-loan-details appraiserCharges
             "actualCashGiven": 0,
-            "availableLimitForDisbuserment": to_be_paid,
+            "availableLimitForDisbuserment": available_limit,
             "wavierAppraiserCharges": 0,
             "stampDutyCharges": stamp_duty,
             "stampDutyDefinitionType": self.stamp_duty_definition_type,
@@ -4557,7 +4992,7 @@ class GoldLoanApiTest:
             "checkPointers": {},  # From collection example
             "loanId": int(self.loan_id) if self.loan_id else None,
             "masterLoanId": int(self.master_loan_id) if self.master_loan_id else None,
-            "loanType": "Fresh Loan",
+            "loanType": self.loan_type or "Fresh Loan",
             "createdBy": str(self.logged_in_user_id or balance.get('userId') or ""),  # the logged-in user
             "internalBranchId": int(self.internal_branch_id) if self.internal_branch_id else None, # Convert to int
         }
@@ -4632,37 +5067,24 @@ class GoldLoanApiTest:
 
     async def add_ops_rating(self):
         api_path = "/api/loan-process/ops-rating"
-        request_body = {
-            "applicationFormForAppraiser": True,
-            "goldValuationForAppraiser": True,
-            "loanStatusForAppraiser": "approved",
-            "commentByAppraiser": "auto approved",
-            "applicationFormForBM": True,
-            "goldValuationForBM": True,
-            "loanStatusForBM": "approved",
-            "commentByBM": None,
-            "reasons": "Other",
+        # The portal's approval form is patched from masterLoan and sent with getRawValue(): Ops only
+        # CHOOSES its own three fields; everything the appraiser/BM decided is copied from the loan.
+        loan = await self._loan_record()
+        request_body = self._rating_base(loan, defaults={
+            "applicationFormForAppraiser": True, "goldValuationForAppraiser": True,
+            "loanStatusForAppraiser": "approved", "commentByAppraiser": None,
+            "applicationFormForBM": False, "goldValuationForBM": False, "loanStatusForBM": "pending",
+            "applicationFormForPartner": False, "goldValuationForPartner": False,
+            "loanStatusForPartner": "pending", "scrapStatusForAppraiser": None, "scrapStatusForBM": None,
+            "scrapStatusForOperatinalTeam": "pending", "packetApprovalByOps": None,
+            "commentByOpsForPacketApproval": "", "statusForRh": "pending", "commentByRh": "",
+            "applicationFormForRh": False, "goldValuationForRh": False,
+        })
+        request_body.update({
             "applicationFormForOperatinalTeam": True,
             "goldValuationForOperatinalTeam": True,
-            "applicationFormForPartner": False,
-            "goldValuationForPartner": False,
             "loanStatusForOperatinalTeam": "approved",
-            "loanStatusForPartner": "pending",
-            "commentByPartner": "",
-            "scrapStatusForAppraiser": None,
-            "scrapStatusForBM": None,
-            "scrapStatusForOperatinalTeam": "pending",
-            "packetApprovalByOps": None,
-            "commentByOpsForPacketApproval": "",
-            "statusForRh": "pending",
-            "commentByRh": "",
-            "applicationFormForRh": False,
-            "goldValuationForRh": False,
-            "cKycNumber": None,
-            "loanId": int(self.loan_id) if self.loan_id else None,
-            "masterLoanId": int(self.master_loan_id) if self.master_loan_id else None,
-            "loanAmountDigi": f"{float(self.final_loan_amount):.2f}" if self.final_loan_amount else "0.00",
-        }
+        })
         response = await self._make_authenticated_request(
             'POST',
             api_path,
@@ -4909,6 +5331,7 @@ class GoldLoanApiTest:
         token = r2.json().get('Token')
         assert token, f"{login_type} verify-login returned no Token: {r2.json()}"
         self._role_token_cache[mobile] = token
+        self._user_details_by_token[token] = r2.json().get('userDetails') or {}
         print(f"{login_type.capitalize()} authenticated (role token, not persisted).")
         return token
 
@@ -5011,6 +5434,8 @@ class GoldLoanApiTest:
         data = payload.get("data") if isinstance(payload, dict) else None
         if isinstance(data, dict) and data.get("loanUniqueId"):
             self.loan_unique_id = data["loanUniqueId"]
+        if isinstance(data, dict) and isinstance(data.get("masterLoan"), dict) and data["masterLoan"].get("loanType"):
+            self.loan_type = data["masterLoan"]["loanType"]
         print(f"Fetched single loan for customerLoanId {self.loan_id} "
               f"(loanUniqueId={self.loan_unique_id or 'n/a'}).")
         return payload
@@ -5090,7 +5515,7 @@ class GoldLoanApiTest:
             "sealedPacketImage": f'{self.BASE_URL}/{sealed_packet_image}',
             "packetOrnamentArray": [packet_ornament],
             "checkPointers": {},  # From collection example
-            "loanType": "Fresh Loan",  # Example
+            "loanType": self.loan_type or "Fresh Loan",  # Example
             "loanId": int(self.loan_id) if self.loan_id else None,
             "masterLoanId": int(self.master_loan_id) if self.master_loan_id else None,
             # HAR sends loanAmountDigi here (NOT createdBy/internalBranchId, which the server ignores/rejects).
@@ -5334,7 +5759,8 @@ class GoldLoanApiTest:
             details = data.get("data") if isinstance(data, dict) else data
             if isinstance(details, dict):
                 self.karza_account_details = details
-                self.bank_name = details.get("bankName") or self.bank_name
+                # The portal reads res.data.bank / res.data.branch from this lookup.
+                self.bank_name = details.get("bank") or details.get("bankName") or self.bank_name
                 self.bank_branch_name = details.get("branch") or details.get("bankBranchName") or self.bank_branch_name
             print(f"Fetched Karza account details for IFSC {ifsc}.")
             return data
@@ -5350,9 +5776,59 @@ class GoldLoanApiTest:
 
     # --- Disbursement / documents phase (from loan-flow collection) ---
 
+    async def _loan_record(self) -> dict:
+        """single-loan `data`: the record every portal loan screen is built from (the parent
+        LoanApplicationFormComponent loads it and passes it down)."""
+        return ((await self.fetch_single_loan()) or {}).get('data') or {}
+
+    @staticmethod
+    def _check_pointers(loan: dict) -> dict:
+        """Loan defects the portal sends back with every rating / packet / lock call."""
+        logs = ((loan.get('masterLoan') or {}).get('loanIncompleteReasonsLogs')) or {}
+        return (logs.get('checkPointers') if isinstance(logs, dict) else None) or {}
+
+    # Rating fields an approver does NOT choose: the portal patches them from masterLoan, so every
+    # later rating echoes what the earlier roles actually decided (e.g. BM 'pending' when the BM
+    # stage was skipped) instead of a blanket 'approved'.
+    RATING_COPIED_FIELDS = (
+        "applicationFormForAppraiser", "goldValuationForAppraiser", "loanStatusForAppraiser",
+        "commentByAppraiser", "applicationFormForBM", "goldValuationForBM", "loanStatusForBM",
+        "applicationFormForPartner", "goldValuationForPartner", "loanStatusForPartner",
+        "scrapStatusForAppraiser", "scrapStatusForBM", "scrapStatusForOperatinalTeam",
+        "packetApprovalByOps", "commentByOpsForPacketApproval", "statusForRh", "commentByRh",
+        "applicationFormForRh", "goldValuationForRh",
+        "applicationFormForOperatinalTeam", "goldValuationForOperatinalTeam", "loanStatusForOperatinalTeam",
+    )
+
+    def _rating_base(self, loan: dict, defaults: dict) -> dict:
+        master = loan.get('masterLoan') or {}
+        body = {k: master.get(k, defaults.get(k)) for k in self.RATING_COPIED_FIELDS if k in defaults}
+        comment = body.get("commentByAppraiser")
+        body["reasons"] = "Other" if comment else ""   # portal: '' with no comment, else the matching reason / 'Other'
+        body["cKycNumber"] = (loan.get('customer') or {}).get('cKycNumber')
+        body["loanId"] = loan.get('id') or (int(self.loan_id) if self.loan_id else None)
+        body["masterLoanId"] = loan.get('masterLoanId') or (int(self.master_loan_id) if self.master_loan_id else None)
+        body["loanAmountDigi"] = loan.get('loanAmount') or (
+            f"{float(self.final_loan_amount):.2f}" if self.final_loan_amount else "0.00")
+        body["loanType"] = master.get('loanType') or self.loan_type or "Fresh Loan"
+        body["checkPointers"] = self._check_pointers(loan)
+        if body["checkPointers"]:
+            # The portal refuses to APPROVE while the loan carries open defects (checkPointers;
+            # BM may ignore the UPLOAD_DOCUMENT one). Surface them so a server rejection is explained.
+            print(self._c(f"WARNING: the loan has open defects (checkPointers: "
+                          f"{', '.join(map(str, body['checkPointers']))}); the portal would block approval.",
+                          "yellow"))
+        return body
+
     async def update_loan_lock(self):
         api_path = "/api/loan-process/update-loan-lock"
-        loan_stage_id = int(self.loan_stage_id) if self.loan_stage_id and str(self.loan_stage_id).isdigit() else 8
+        # The portal locks the loan at its CURRENT stage (loanStage.id of the loan record), not the
+        # last stage of the master list.
+        loan = await self._loan_record()
+        master = loan.get('masterLoan') or {}
+        current = ((master.get('loanStage') or {}).get('id') or master.get('loanStageId')
+                   or loan.get('loanStageId') or self.loan_stage_id)
+        loan_stage_id = int(current) if current and str(current).isdigit() else 8
         request_body = {
             "masterLoanId": int(self.master_loan_id) if self.master_loan_id else None,
             "loanStageId": loan_stage_id,
@@ -5735,7 +6211,8 @@ class GoldLoanApiTest:
                       "clear it.", "red"))
 
     def _capture_validate_account_flags(self, data) -> None:
-        """Record the penny-drop verdict.
+        """Record the penny-drop verdict (and the names the portal copies into bank-details:
+        accountHolderName = data.accountName, customerName = customerName).
 
         bankTxnStatus True does NOT mean the account is VERIFIED. The server also compares the
         bank's account name against the customer name; the LIC collection accounts are never a
@@ -5748,6 +6225,12 @@ class GoldLoanApiTest:
         NOTE: the response's top-level "message" can read "Something went wrong" even on success
         -- rely on these flags, not the message.
         """
+        if isinstance(data, dict):
+            inner = data.get('data') if isinstance(data.get('data'), dict) else {}
+            if inner.get('accountName'):
+                self.account_holder_name = inner['accountName']
+            if data.get('customerName'):
+                self.validated_customer_name = data['customerName']
         self.bank_account_verified = bool(data.get('data', {}).get('bankTxnStatus')
                                           if isinstance(data.get('data'), dict)
                                           else self._find_key_recursive(data, 'bankTxnStatus'))
@@ -5767,26 +6250,282 @@ class GoldLoanApiTest:
                           f"{request_body.get('accountHolderName')!r}); it needs the OPS manual "
                           "verification step.", "yellow"))
 
-    async def upload_income_document(self) -> str:
+    async def upload_income_document(self) -> dict:
+        """Upload one income-generating document (a PDF -- the only type the upload page accepts)
+        with the reason the web app uses. Returns the server's uploadFile record."""
         api_path = f"/api/upload-file?reason=customerIncomeGeneratingDocument&customerId={self.customer_id}"
         headers = {}
         content_type = mimetypes.guess_type(self.DUMMY_PDF_PATH)[0] or "application/octet-stream"
         with open(self.DUMMY_PDF_PATH, "rb") as upload_file:
             files = {"avatar": (os.path.basename(self.DUMMY_PDF_PATH), upload_file, content_type)}
             response = await self._make_authenticated_request('POST', api_path, files=files, headers=headers)
-        data = response.json()
-        path = data['uploadFile']['path']
-        print(f"Income-generating document uploaded. Path: {path}")
-        return path
+        upload = response.json()['uploadFile']
+        print(f"Income-generating document uploaded. Path: {upload['path']}")
+        return upload
+
+    async def fetch_global_setting(self) -> dict:
+        """GET /api/global-setting: the rules the web app reads at runtime (IGLLIPApplicability,
+        consumptionLipApplicability, LIPEligibilityValidation, ...). Cached for the run."""
+        if not self.global_setting:
+            response = await self._make_authenticated_request('GET', "/api/global-setting")
+            data = response.json()
+            self.global_setting = data if isinstance(data, dict) else {}
+        return self.global_setting
+
+    # Occupation category (customerKycPersonal.occupation.category) -> the LIP income field the web
+    # app makes MANDATORY for it (LipFormComponent.applyIncomeFieldState). 'Others' makes salary /
+    # business / agricultural optional; any other category leaves only rental + other income.
+    LIP_CATEGORY_INCOME_FIELD = {
+        "Salary": "salary",
+        "Self Employed": "primaryBusinessIncome",
+        "Farmer / Agricultural Labourer": "agriculturalIncome",
+        "Others": "salary",
+    }
+    LIP_INCOME_FIELDS = ("salary", "primaryBusinessIncome", "agriculturalIncome",
+                         "rentalAssetIncome", "otherBusinessIncome")
+
+    def _build_lip_form(self, loan: dict) -> dict:
+        """The Liquid Income Program (LIP) assessment, as the web app's LipFormComponent submits it
+        (lipForm.getRawValue(), sent as `lipForm` in loan-documents). Every input comes from the
+        single-loan record, the login JWT and global settings -- nothing is invented except the
+        self-declared income/expense figures, which are sized so the customer passes the eligibility
+        rule: net monthly income > monthly interest obligation
+        (currentLoanPresentInterest + presentInterest)."""
+        customer = loan.get('customer') or {}
+        kyc = customer.get('customerKycPersonal') or {}
+        occupation = kyc.get('occupation') or {}
+        category = occupation.get('category') or 'Others'
+        personal = loan.get('loanPersonalDetail') or {}
+        master = loan.get('masterLoan') or {}
+
+        def num(value):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return 0.0
+
+        obligation = round(num(loan.get('currentLoanPresentInterest')) + num(loan.get('presentInterest')), 2)
+        household = 10000
+        business = 5000 if category == "Self Employed" else ''   # mandatory only for Self Employed
+        income = int(obligation + household + num(business)) + 25000
+
+        # Income fields the category does not enable are reset to '' by the form; enabled ones
+        # that are left empty stay null.
+        enabled = {"rentalAssetIncome", "otherBusinessIncome"}
+        if category == "Others":
+            enabled |= {"salary", "primaryBusinessIncome", "agriculturalIncome"}
+        elif category in self.LIP_CATEGORY_INCOME_FIELD:
+            enabled.add(self.LIP_CATEGORY_INCOME_FIELD[category])
+        incomes = {f: (None if f in enabled else '') for f in self.LIP_INCOME_FIELDS}
+        incomes[self.LIP_CATEGORY_INCOME_FIELD.get(category, "otherBusinessIncome")] = income
+
+        claims = jwt.decode(self.auth_token, options={"verify_signature": False}) if self.auth_token else {}
+        role_name = claims.get('roleName')
+        checker = {"checkerName": '', "checkerEmployeeId": '', "checkerDesignation": ''}
+        if master.get('commentByBM') != "auto approved" and isinstance(master.get('bm'), dict):
+            bm = master['bm']
+            roles = bm.get('roles') or [{}]
+            checker = {"checkerName": f"{bm.get('firstName')} {bm.get('lastName')}",
+                       "checkerEmployeeId": bm.get('userUniqueId'),
+                       "checkerDesignation": roles[0].get('roleName') if isinstance(roles[0], dict) else ''}
+
+        form = {
+            # Section 1 - Borrower Profile
+            "loanAccountNumber": loan.get('loanUniqueId'),
+            "customerName": f"{customer.get('firstName')} {customer.get('lastName')}",
+            "occupationType": category,
+            "occupationTypeOther": (occupation.get('name') or "Other") if category == "Others" else '',
+            "yearsInCurrentOccupation": str(self.random.randint(2, 15)),
+            "endUseOfLoan": personal.get('purpose'),
+            "assessmentDate": datetime.datetime.now(datetime.timezone.utc)
+                .isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
+            # Section 2 - Monthly Income Sources
+            **incomes,
+            # Section 3 - Monthly Expenses / Obligations
+            "householdLivingExpenses": str(household),
+            "businessOperatingExpenses": str(business) if business != '' else '',
+            "otherEmis": '',
+            "informalChitFundOutflow": '',
+            "remarks": "Self-Declared",
+            # Section 4 - Loan Eligibility
+            "newLoanRequested": loan.get('loanAmount'),
+            "presentInterest": f"{num(loan.get('presentInterest')):.2f}",
+            "totalExistingOutstanding": customer.get('tillDateOutstanding'),
+            "isOtherIncome": False,
+            # Section 5 - Officer Sign-off (maker = the logged-in user; checker = the loan's BM)
+            "assessedByName": f"{claims.get('firstName')} {claims.get('lastName')}",
+            "assessedByEmployeeId": str(claims.get('userUniqueId') or ''),
+            "assessedByDesignation": role_name[0] if isinstance(role_name, list) and role_name else (role_name or ''),
+            **checker,
+        }
+        # A loan that already has a saved assessment reopens with it: the web app overlays the
+        # saved lipFormInfo on the prefilled values. Only real form fields survive getRawValue(), so
+        # the server-computed totals (grossMonthlyIncome, isEligible, pdfUrl, existingLoanEmis, ...)
+        # are not sent back.
+        saved = ((loan.get('customerLoanDocument') or {}).get('lipFormInfo')) or {}
+        reused = [k for k in form if k in saved and saved[k] is not None]
+        for key in reused:
+            form[key] = saved[key]
+        if reused:
+            print(f"LIP assessment: reusing the saved form values ({len(reused)} fields).")
+
+        # The web form's save() refuses an ineligible customer when LIPEligibilityValidation is on
+        # (net monthly income must exceed the monthly interest obligation). If saved values fail it,
+        # re-declare the income the way a user would before saving.
+        net = self._lip_net_income(form)
+        if self.global_setting.get('LIPEligibilityValidation') and not net > obligation:
+            field = self.LIP_CATEGORY_INCOME_FIELD.get(category, "otherBusinessIncome")
+            form[field] = int(num(form.get(field)) + (obligation - net)) + 25000
+            print(f"LIP assessment: saved values were not eligible (net {net:.2f} <= obligation "
+                  f"{obligation:.2f}); re-declared {field}={form[field]}.")
+            net = self._lip_net_income(form)
+        print(f"LIP assessment: category={category!r}, net monthly income {net:.2f} vs monthly "
+              f"interest obligation {obligation:.2f} (existing loan EMIs {form['presentInterest']})")
+        return form
+
+    @staticmethod
+    def _lip_net_income(form: dict) -> float:
+        """Net monthly income exactly as LipFormComponent.calculate() derives it."""
+        def num(value):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return 0.0
+        gross = sum(num(form.get(f)) for f in ("salary", "primaryBusinessIncome", "agriculturalIncome",
+                                               "rentalAssetIncome", "otherBusinessIncome"))
+        expenses = sum(num(form.get(f)) for f in ("householdLivingExpenses", "businessOperatingExpenses",
+                                                  "otherEmis", "informalChitFundOutflow"))
+        return gross - expenses
+
+    async def verify_lip_assessment(self) -> None:
+        """Read back what the server stored for the LIP assessment (customerLoanDocument.lipFormInfo)
+        and check it: the server recomputes the totals itself, so a mismatch shows up here rather
+        than as a confusing failure at a later stage."""
+        loan = ((await self.fetch_single_loan()) or {}).get('data') or {}
+        saved = ((loan.get('customerLoanDocument') or {}).get('lipFormInfo')) or {}
+        if not saved:
+            raise RuntimeError("loan-documents was accepted but the server stored no LIP assessment "
+                               "(customerLoanDocument.lipFormInfo is empty).")
+        problems = []
+        if saved.get('isEligible') is not True:
+            problems.append(f"server isEligible={saved.get('isEligible')!r}")
+        sent_emis = (self.lip_form or {}).get('presentInterest')
+        try:
+            if sent_emis is not None and abs(float(saved.get('existingLoanEmis')) - float(sent_emis)) > 0.01:
+                problems.append(f"existingLoanEmis {saved.get('existingLoanEmis')} != sent presentInterest {sent_emis}")
+        except (TypeError, ValueError):
+            problems.append(f"existingLoanEmis unreadable: {saved.get('existingLoanEmis')!r}")
+        self._print_summary_table("LIP ASSESSMENT (as stored by the server)", {
+            "Existing loan EMIs": saved.get('existingLoanEmis'),
+            "Gross monthly income": saved.get('grossMonthlyIncome'),
+            "Total monthly expenses": saved.get('totalMonthlyExpenses'),
+            "Net monthly income": saved.get('netMonthlyIncome'),
+            "Monthly interest obligation": saved.get('totalMonthlyInterestObligation'),
+            "Total customer obligation": saved.get('totalCustomerObligation'),
+            "Eligible": saved.get('isEligible'),
+            "PDF": saved.get('pdfUrl') or "-",
+        })
+        if problems:
+            raise RuntimeError("LIP assessment stored by the server does not check out: " + "; ".join(problems))
+
+    async def _igl_document_names(self, loan: dict) -> list:
+        """Document names the upload page offers for the loan's Income Generating purpose: each
+        head's documents minus its hiddenDocuments (the web app's getVisibleDocumentHeads). Older
+        purpose records are a flat list of names."""
+        purpose_name = (loan.get('loanPersonalDetail') or {}).get('purpose')
+        record = self.purpose_record if (self.purpose_record or {}).get('name') == purpose_name else None
+        if record is None:
+            response = await self._make_authenticated_request('GET', "/api/purpose?search=&from=1&to=-1")
+            groups = response.json().get('data') or {}
+            for items in (groups.values() if isinstance(groups, dict) else [groups]):
+                record = next((p for p in (items or []) if isinstance(p, dict) and p.get('name') == purpose_name), None)
+                if record:
+                    break
+        names = []
+        for head in (record or {}).get('incomeGeneratingDocumentTypes') or []:
+            if isinstance(head, dict):
+                hidden = set(head.get('hiddenDocuments') or [])
+                names += [d for d in head.get('documents') or [] if d not in hidden]
+            elif isinstance(head, str):
+                names.append(head)
+        return names
+
+    async def _upload_loan_pdf(self) -> dict:
+        upload = (await self._upload_file("loan", file_type="pdf"))['uploadFile']
+        upload.setdefault('URL', f"{self.BASE_URL}/{upload['path']}")
+        upload.setdefault('originalname', os.path.basename(upload['path']))
+        return upload
 
     async def store_loan_documents(self):
         api_path = "/api/loan-process/loan-documents"
+
+        # The upload page is driven by the loan record (single-loan): whether the LIP assessment is
+        # required (isLIPFormRequired -- the server applies the IGL / consumption thresholds from
+        # global settings), the purpose type, and the Arvog / stamp-paper document rules.
+        loan = ((await self.fetch_single_loan()) or {}).get('data') or {}
+        master = loan.get('masterLoan') or {}
+        await self.fetch_global_setting()
 
         # Upload the required loan documents (agreement, pawn copy, scheme confirmation).
         loan_agreement = (await self._upload_file("loan", file_type="pdf"))['uploadFile']['path']
         pawn_copy = (await self._upload_file("loan", file_type="pdf"))['uploadFile']['path']
         scheme_confirmation = (await self._upload_file("loan", file_type="pdf"))['uploadFile']['path']
-        income_doc = await self.upload_income_document()
+
+        # Arvog (unless DCB is the co-lender, bank id 4): loan application, gold receipt and KFS copies
+        # are mandatory on the upload page.
+        arvog_docs = {}
+        if loan.get('isArvog') and str(master.get('bankId')) != "4":
+            application, receipt, kfs = (await self._upload_loan_pdf(), await self._upload_loan_pdf(),
+                                         await self._upload_loan_pdf())
+            arvog_docs = {
+                "loanApplicationCopy": [application['path']],
+                "loanApplicationImageName": application['originalname'],
+                "loanApplicationCopyImage": application['URL'],
+                "goldReceipt": [receipt['path']],
+                "goldReceiptName": receipt['originalname'],
+                "goldReceiptCopyName": receipt['URL'],
+                "kfsCopy": [kfs['path']],
+                "kfsCopyFullUrl": kfs['URL'],
+            }
+            print("Arvog loan: uploaded loan application, gold receipt and KFS copies.")
+        # A stamp-paper stamp duty needs the stamp paper copy.
+        stamp_paper_docs = {}
+        if loan.get('stampDutyDefinitionType') == 'stampPaper':
+            paper = await self._upload_loan_pdf()
+            stamp_paper_docs = {"stampPaperCopy": [paper['path']],
+                                "stampPaperCopyImageName": paper['originalname'],
+                                "stampPaperCopyFullUrl": paper['URL']}
+            print("Stamp duty is stamp paper: uploaded the stamp paper copy.")
+
+        # Income Generating loan: at least one income document, under one of the purpose's visible
+        # document names -> {name: {name: [filename], path: [path]}} (the web app drops `url`).
+        income_generating_documents = None
+        purpose_type = (loan.get('loanPersonalDetail') or {}).get('purposeType') or self.purpose_type
+        if purpose_type == self.PURPOSE_TYPES["igl"]:
+            names = await self._igl_document_names(loan)
+            if not names:
+                raise RuntimeError(f"Income Generating purpose {self.purpose_id!r} has no visible "
+                                   "income document types, but the upload page requires at least one.")
+            doc_name = self.random.choice(names)
+            upload = await self.upload_income_document()
+            income_generating_documents = {doc_name: {
+                "name": [upload.get('filename') or upload.get('originalname') or os.path.basename(upload['path'])],
+                "path": [upload['path']]}}
+            print(f"IGL income document submitted as {doc_name!r}.")
+
+        # Consumption supporting documents: required for a Consumption Based loan whenever the SERVER
+        # flags it (showConsumptionSupportingDocs). UAT's portal still enforces this; TEST's portal
+        # replaced it with the LIP form (and its server leaves the flag false), so the flag decides.
+        consumption_supporting_docs = None
+        if loan.get('showConsumptionSupportingDocs') and purpose_type == self.PURPOSE_TYPES["cb"]:
+            upload = await self.upload_income_document()
+            consumption_supporting_docs = [{"path": upload['path']}]
+            print("Consumption supporting document uploaded (server flag showConsumptionSupportingDocs).")
+
+        # LIP assessment, when the server says this loan needs one.
+        self.lip_form = self._build_lip_form(loan) if loan.get('isLIPFormRequired') else None
+        if self.lip_form is None:
+            print("LIP assessment not required for this loan (isLIPFormRequired is false).")
 
         await self.fetch_lead_converter()
 
@@ -5867,22 +6606,27 @@ class GoldLoanApiTest:
             "cpvImage": None,
             "cpvImageFullUrl": None,
             "leadConverterId": self.lead_converter_id or (str(self.logged_in_user_id) if self.logged_in_user_id else ""),
-            "incomeGeneratingDocuments": None,
-            "consumptionSupportingDocs": [{"path": income_doc}],
+            "incomeGeneratingDocuments": income_generating_documents,
+            # Only when the server asks for them (UAT); TEST replaced them with the LIP form.
+            **({"consumptionSupportingDocs": consumption_supporting_docs} if consumption_supporting_docs else {}),
+            "lipForm": self.lip_form,
             "cKycNumber": c_kyc_number,
             "checkPointers": {},
             "loanId": int(self.loan_id) if self.loan_id else None,
             "masterLoanId": int(self.master_loan_id) if self.master_loan_id else None,
             "loanAmountDigi": f"{float(self.final_loan_amount):.2f}" if self.final_loan_amount else "0.00",
-            "loanType": "Fresh Loan",
+            "loanType": self.loan_type or "Fresh Loan",
         }
+        request_body.update(arvog_docs)
+        request_body.update(stamp_paper_docs)
         async def send():
             return await self._make_authenticated_request('POST', api_path, json_data=request_body)
-        try:
-            await self._with_stage_recovery("loan documents", send)
-            print('Store loan documents successful.')
-        except httpx.HTTPStatusError as e:
-            print(f"Store loan documents failed (non-fatal): {e.response.status_code} - {e.response.text}")
+        # A rejected upload is FATAL: the loan cannot leave the upload-documents stage, so every
+        # later step would only fail with a confusing "stage has been changed" error.
+        await self._with_stage_recovery("loan documents", send)
+        print('Store loan documents successful.' + (' (with LIP assessment)' if self.lip_form else ''))
+        if self.lip_form:
+            await self.verify_lip_assessment()
 
     # --- Disbursement (partner login) -------------------------------------------------------------
     async def fetch_disbursement_bank_detail(self) -> dict:
@@ -5924,26 +6668,26 @@ class GoldLoanApiTest:
         disbursement-status). The partner signs off on the loan (loanStatusForPartner 'approved')
         under the partner login. Runs inside disburse_amount's partner-token block."""
         api_path = "/api/loan-process/partner-disbursement-status"
-        secured_amount = detail.get("securedLoanAmount") or f"{float(self.final_loan_amount):.2f}"
-        request_body = {
+        # The portal sends approvalForm.value: the appraiser/BM/Ops STATUS controls are disabled for
+        # the partner (left out); their application/gold flags and comments come from masterLoan.
+        loan = await self._loan_record()
+        request_body = self._rating_base(loan, defaults={
             "applicationFormForAppraiser": True, "goldValuationForAppraiser": True,
-            "commentByAppraiser": None,
-            "applicationFormForBM": True, "goldValuationForBM": True, "reasons": "",
+            "commentByAppraiser": None, "applicationFormForBM": False, "goldValuationForBM": False,
             "applicationFormForOperatinalTeam": True, "goldValuationForOperatinalTeam": True,
-            "applicationFormForPartner": True, "goldValuationForPartner": True,
-            "loanStatusForPartner": "approved",
             "scrapStatusForAppraiser": None, "scrapStatusForBM": None,
-            "scrapStatusForOperatinalTeam": "pending",
-            "packetApprovalByOps": None, "commentByOpsForPacketApproval": "",
-            "statusForRh": "pending", "commentByRh": "",
+            "scrapStatusForOperatinalTeam": "pending", "packetApprovalByOps": None,
+            "commentByOpsForPacketApproval": "", "statusForRh": "pending", "commentByRh": "",
             "applicationFormForRh": False, "goldValuationForRh": False,
-            "loanId": int(self.loan_id) if self.loan_id else detail.get("securedLoanId"),
-            "masterLoanId": int(self.master_loan_id) if self.master_loan_id else None,
-            "loanAmountDigi": secured_amount,
-            "loanType": "Fresh Loan",
+        })
+        if not request_body.get("loanId"):
+            request_body["loanId"] = detail.get("securedLoanId")
+        request_body.update({
+            "applicationFormForPartner": True,
+            "goldValuationForPartner": True,
+            "loanStatusForPartner": "approved",
             "partnerId": int(self.partner_id) if self.partner_id and str(self.partner_id).isdigit() else 152,
-            "checkPointers": {},
-        }
+        })
         try:
             response = await self._make_authenticated_request('POST', api_path, json_data=request_body)
             msg = response.json().get("message") if isinstance(response.json(), dict) else ""
@@ -5958,6 +6702,28 @@ class GoldLoanApiTest:
             else:
                 raise
 
+    @staticmethod
+    def _apply_portal_disbursement_amounts(body: dict) -> None:
+        """The portal's calcfinalLoanAmount for a fresh loan (not renew / top-up):
+            finalAmount = +((fullSecuredAmount + fullUnsecuredAmount) - (processingCharge +
+                           totalManualCharges + upfrontInterestAmount + advanceBankTransfer +
+                           actualCashGiven + appraiserCharges + stampDutyCharges + bTMoney)).toFixed(2)
+            fullAmount  = fullSecuredAmount + fullUnsecuredAmount + processingCharge +
+                          appraiserCharges + stampDutyCharges + totalManualCharges + upfrontInterestAmount
+        i.e. finalAmount is the NET amount paid out and fullAmount the gross with charges."""
+        def n(key):
+            try:
+                return float(body.get(key) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+        principal = n("fullSecuredAmount") + n("fullUnsecuredAmount")
+        deductions = (n("processingCharge") + n("totalManualCharges") + n("upfrontInterestAmount")
+                      + n("advanceBankTransfer") + n("actualCashGiven") + n("appraiserCharges")
+                      + n("stampDutyCharges") + n("bTMoney"))
+        body["finalAmount"] = round(principal - deductions + 1e-9, 2)
+        body["fullAmount"] = principal + n("processingCharge") + n("appraiserCharges") + \
+            n("stampDutyCharges") + n("totalManualCharges") + n("upfrontInterestAmount")
+
     async def _post_partner_disbursement(self, detail: dict):
         api_path = "/api/loan-process/partner-wise-disbursement"
         ubd = detail.get("userBankDetail", {}) if isinstance(detail, dict) else {}
@@ -5967,17 +6733,15 @@ class GoldLoanApiTest:
         bank_txn_id = str(self.random.randint(10**14, 10**15 - 1))
         # penalInterest comes from single-loan (data.penalInterest), as in the web app -- NOT the
         # scheme's own penalInterest, which differs (27.18 vs 2 in the capture).
+        loan = await self._loan_record()
         penal_interest = detail.get("penalInterest") if isinstance(detail, dict) else None
         if penal_interest is None:
-            try:
-                single = await self.fetch_single_loan()
-                penal_interest = ((single or {}).get("data") or {}).get("penalInterest")
-            except httpx.HTTPStatusError:
-                penal_interest = None
-        # First-month secured interest ~ actualProcessingCharge in the HAR (falls back to 0.00).
-        first_interest = "0.00"
-        if isinstance(self.interest_table_data, list) and self.interest_table_data:
-            first_interest = str(self.interest_table_data[0].get("securedInterestAmount") or "0.00")
+            penal_interest = loan.get("penalInterest")
+        # actualProcessingCharge = the loan's processing charge (the upper limit the portal checks
+        # processingCharge against): bank-detail response first, else single-loan. NOT interest.
+        actual_processing_charge = detail.get("actualProcessingCharge")
+        if actual_processing_charge is None:
+            actual_processing_charge = loan.get("actualProcessingCharge")
         bank_array = [{
             "disbursementStatus": "Disbursed to Customer",
             "ifscCode": ubd.get("ifscCode") or self.bank_ifsc_code,
@@ -5986,8 +6750,30 @@ class GoldLoanApiTest:
             "accountHolderName": ubd.get("accountHolderName") or self.account_holder_name,
             "accountNumber": ubd.get("accountNumber") or self.bank_account_number,
         }]
+        # The portal's disburse form is patched from the bank-detail response (patchValue(detail)),
+        # so every key that response carries wins over a default.
+        def d(key, default=None):
+            return detail.get(key, default) if isinstance(detail, dict) else default
+        # Payment gateway: the partner's ICICI payout config on the loan record (the portal's default
+        # gateway when there is an amount to pay); the captured flow's 5 is exactly that config id.
+        payout = next((c for c in ((loan.get('partner') or {}).get('merchantPayoutConfigs') or [])
+                       if isinstance(c, dict) and str(c.get('paymentGateway', '')).lower() == 'icici'), None)
+        # The portal pre-selects the ICICI config (id) on load when it is usable and there is an
+        # amount to pay; picking IMPS/NEFT/RTGS under OFFLINE does not change that id (the change
+        # handler finds no config named after the mode), so the id stays the ICICI one -- exactly
+        # the captured "neft + gateway 5" pair. With no usable ICICI config the id stays null.
+        to_be_paid = float(((loan.get('masterLoan') or {}).get('toBePaid')) or 0)
+        payment_gateway_id = (payout or {}).get('id') if (payout and to_be_paid > 0) else None
+        # partnerId comes from the PARTNER login's token in the portal.
+        try:
+            partner_claims = jwt.decode(self.auth_token, options={"verify_signature": False}) if self.auth_token else {}
+        except Exception:
+            partner_claims = {}
+        partner_id = partner_claims.get('partnerId') or (
+            int(self.partner_id) if self.partner_id and str(self.partner_id).isdigit() else 152)
         request_body = {
-            "isNewLoanFromRenew": False, "isTopUpAdded": False,
+            "isNewLoanFromRenew": d("isNewLoanFromRenew", False), "isTopUpAdded": d("isTopUpAdded", False),
+            "isNewLoanFromTopUp": d("isNewLoanFromTopUp", False),
             "loanId": int(self.loan_id) if self.loan_id else detail.get("securedLoanId"),
             "securedCashTransactionId": None,
             "securedBankTransactionId": bank_txn_id,
@@ -6003,13 +6789,13 @@ class GoldLoanApiTest:
             "loanAmount": final_amount, "otp": None,
             "maxAmountToBeDisbursedByCash": detail.get("maxAmountToBeDisbursedByCash", 1000000000),
             "bankArray": bank_array,
-            "masterLoanId": str(self.master_loan_id) if self.master_loan_id else detail.get("masterLoanId"),
+            "masterLoanId": int(self.master_loan_id) if str(self.master_loan_id).isdigit() else detail.get("masterLoanId"),
             "securedSchemeName": detail.get("securedSchemeName"),
             "unsecuredLoanAmount": detail.get("unsecuredLoanAmount", 0),
-            "unsecuredSchemeName": None,
+            "unsecuredSchemeName": d("unsecuredSchemeName"),
             "securedLoanAmount": secured_amount,
             "securedLoanId": detail.get("securedLoanId") or (int(self.loan_id) if self.loan_id else None),
-            "unsecuredLoanId": None, "scrapId": None, "scrapAmount": None, "transactionId": None,
+            "unsecuredLoanId": d("unsecuredLoanId"), "scrapId": None, "scrapAmount": None, "transactionId": None,
             "fullSecuredAmount": detail.get("fullSecuredAmount", final_amount),
             "fullUnsecuredAmount": detail.get("fullUnsecuredAmount", 0),
             "processingCharge": detail.get("processingCharge", 0),
@@ -6017,26 +6803,29 @@ class GoldLoanApiTest:
             "unsecuredProcessingCharge": detail.get("unsecuredProcessingCharge", 0),
             "isUnsecuredSchemeApplied": detail.get("isUnsecuredSchemeApplied", False),
             "securedLoanUniqueId": detail.get("securedLoanUniqueId"),
-            "unsecuredLoanUniqueId": None,
-            "finalAmount": final_amount, "fullAmount": final_amount,
-            "bankTransferType": "neft",
-            "loanTransferExtraAmount": None, "otherAmountTransactionId": None, "utrNumber": None,
+            "unsecuredLoanUniqueId": d("unsecuredLoanUniqueId"),
+            "finalAmount": None, "fullAmount": None,   # computed below, as calcfinalLoanAmount
+            "bankTransferType": self.transfer_mode,   # IMPS / NEFT / RTGS (OFFLINE), lowercased like the portal
+            "loanTransferExtraAmount": d("loanTransferExtraAmount"),
+            "otherAmountTransactionId": d("otherAmountTransactionId"), "utrNumber": d("utrNumber"),
             "totalManualCharges": detail.get("totalManualCharges", 0),
             "upfrontInterestAmount": detail.get("upfrontInterestAmount", 0),
             "upfrontTransactionId": None, "upfrontReceiptImage": None, "upfrontReceipt": None,
-            "fullUnsecuredTopUpAmount": 0, "fullSecuredTopUpAmount": 0, "finalTopUpAmount": 0,
-            "securedTopUpAmount": 0, "unsecuredTopUpAmount": 0,
-            "advanceBankTransfer": 0, "advanceCash": 0, "bTMoney": 0,
+            "fullUnsecuredTopUpAmount": d("fullUnsecuredTopUpAmount", 0), "fullSecuredTopUpAmount": d("fullSecuredTopUpAmount", 0),
+            "finalTopUpAmount": d("finalTopUpAmount", 0),
+            "securedTopUpAmount": d("securedTopUpAmount", 0), "unsecuredTopUpAmount": d("unsecuredTopUpAmount", 0),
+            "advanceBankTransfer": d("advanceBankTransfer", 0), "advanceCash": d("advanceCash", 0), "bTMoney": d("bTMoney", 0),
             "penalInterest": penal_interest if penal_interest is not None else 2,
             "advancedCashReceiptImage": None, "advanceCashDeclarationImage": None,
-            "receiptNumber": None, "appraiserCharges": 0,
-            "actualProcessingCharge": first_interest,
-            "actualCashGiven": 0, "stampDutyRemarks": "",
+            "receiptNumber": d("receiptNumber"), "appraiserCharges": d("appraiserCharges", loan.get("appraiserCharges") or 0),
+            "actualProcessingCharge": actual_processing_charge,
+            "actualCashGiven": d("actualCashGiven", 0), "stampDutyRemarks": "",
             "stampDutyCharges": detail.get("stampDutyCharges") or f"{float(self.stamp_duty_charges or 0):.2f}",
-            "paymentGatewayId": 5,  # env constant from HAR (Roshan partner gateway)
-            "partnerId": int(self.partner_id) if self.partner_id and str(self.partner_id).isdigit() else 152,
-            "loanType": "Fresh Loan",
+            "paymentGatewayId": payment_gateway_id,   # partner.merchantPayoutConfigs (icici)
+            "partnerId": partner_id,                  # the partner login's token
+            "loanType": self.loan_type or "Fresh Loan",
         }
+        self._apply_portal_disbursement_amounts(request_body)
         response = await self._make_authenticated_request('POST', api_path, json_data=request_body)
         msg = response.json().get("message") if isinstance(response.json(), dict) else ""
         print(f"Disbursement successful: {msg}")
@@ -6097,14 +6886,17 @@ class GoldLoanApiTest:
             branch_candidates = [str(b.get("id")) for b in (loc_data.get("partnerBranch") or [])
                                  if b.get("id")] or [self.PARTNER_BRANCH_ID]
         partner_branch_id, un_data = branch_candidates[0], {}
+        receiver_type = "PartnerUser"
         for candidate in branch_candidates:
             un = await self._make_authenticated_request(
                 'GET', f"/api/packet-tracking/user-name?mobileNumber={partner_user_mobile}"
                        f"&receiverType=PartnerUser&partnerBranchId={candidate}"
                        f"&masterLoanId={self.master_loan_id}&allUsers=1")
-            data = un.json().get("data") if isinstance(un.json(), dict) else None
+            un_json = un.json() if isinstance(un.json(), dict) else {}
+            data = un_json.get("data")
             if isinstance(data, dict) and data.get("id"):
                 partner_branch_id, un_data = candidate, data
+                receiver_type = un_json.get("receiverType") or "PartnerUser"
                 break
         partner_receiver_id = un_data.get("id")
         user_full = f"{un_data.get('firstName','')} {un_data.get('lastName','')}".strip()
@@ -6132,7 +6924,7 @@ class GoldLoanApiTest:
             "barcodeNumber": barcodes,
             "mobileNumber": partner_user_mobile,
             "user": user_full,
-            "receiverType": "PartnerUser",
+            "receiverType": receiver_type,  # as the user-name lookup answered
             "otp": "1234", "referenceCode": ref,
             "userReceiverId": None, "customerReceiverId": None,
             "partnerReceiverId": partner_receiver_id,
@@ -6348,7 +7140,7 @@ class GoldLoanApiTest:
             else:
                 setattr(self, field, "")
         # Stamp duty goes back to the configured default, not 0 -- the next loan still pays it.
-        self.stamp_duty_charges = float(os.getenv("GOLD_LOAN_STAMP_DUTY", "1500"))
+        self.stamp_duty_charges = float(os.getenv("GOLD_LOAN_STAMP_DUTY", "0"))
         self.stamp_duty_definition_type = None
         self.stamp_duty_from_server = False
         # Containers
@@ -6357,6 +7149,11 @@ class GoldLoanApiTest:
         self.final_loan_details_data = {}
         self.secured_scheme = {}
         self.purpose_record = {}
+        self.lip_form = None
+        self.loan_type = ''
+        self.customer_user_type = ''
+        self.ornaments_total_nwap = None
+        self.basic_details_response = {}
         self.selected_scheme = {}
         self.loan_ornaments_details = []
         self.interest_table_data = []
@@ -6647,23 +7444,29 @@ def validate_cli(args, fail):
     """
     if args.count < 1:
         fail("--count must be at least 1")
-    if args.count > 1 and args.kyc in ("auto", "ovd") and not args.customer:
+    releases_pan = args.kyc == "auto" and getattr(args, "release_kyc_docs", False)
+    if args.count > 1 and args.kyc in ("auto", "ovd") and not args.customer and not releases_pan:
         # One real person's documents can only be registered against ONE customer, so a batch of
-        # NEW customers cannot use a real-identity KYC mode (same rule as test_kyc.py --count).
+        # NEW customers cannot use a real-identity KYC mode (same rule as kyc_only.py --count).
         # With --customer no new customer is created, so the combination is fine there.
+        # (auto: the Aadhaar is made unique per customer -- random 8 + real last 4 -- but the real
+        # PAN has no such workaround; ovd: the real OVD number.)
+        blocker = "PAN" if args.kyc == "auto" else "OVD"
         fail(f"--count {args.count} cannot be combined with --kyc {args.kyc}: the real "
-             "PAN/Aadhaar/OVD in the identity profile can only be registered against one "
-             "customer. Use --kyc manual for a batch, or add --customer.")
+             f"{blocker} in the identity profile can only be registered against one "
+             "customer. Use --kyc manual for a batch, add --customer"
+             + (", or add --release-kyc-docs (TEST/UAT) to free the PAN before each customer."
+                if args.kyc == "auto" else "."))
 
 
 def main():
     """Command-line entry point. Two ways to run the full Gold Loan journey:
 
       Brand-new customer (DEFAULT, no flags) -- create the customer, run KYC, then the loan flow:
-          python src/maintest.py
+          python flows/e2e_full_loan.py
 
       Existing customer -- reuse an already-KYC'd customer and just do a new loan against it:
-          python src/maintest.py --customer MS35QNJP
+          python flows/e2e_full_loan.py --customer MS35QNJP
 
     Either way the run goes end-to-end: (customer/KYC ->) appraiser request -> ornaments ->
     scheme/eligibility -> bank details -> assign packet -> ratings -> disbursement -> submit packet
@@ -6675,18 +7478,17 @@ def main():
     """
     import argparse
     parser = argparse.ArgumentParser(
-        prog="maintest.py",
         description="Augmont Gold Loan end-to-end API test harness "
                     "(customer/KYC -> loan -> assign packet -> disburse -> submit packet).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
-               "  python src/maintest.py                          # NEW customer -> full create + KYC -> loan\n"
-               "  python src/maintest.py --customer MS35QNJP      # existing customer -> new loan\n"
-               "  python src/maintest.py --partner arvog          # loan under the Arvog (ARV10) partner\n"
-               "  python src/maintest.py --co-lender              # pick a co-lender from a menu\n"
-               "  python src/maintest.py --co-lender DCB          # co-lending with a named bank\n"
-               "  python src/maintest.py --scheme 853 --amount 550000\n"
-               "  python src/maintest.py --env uat                # run the whole flow on UAT (gfau)\n",
+               "  python flows/e2e_full_loan.py                          # NEW customer -> full create + KYC -> loan\n"
+               "  python flows/e2e_full_loan.py --customer MS35QNJP      # existing customer -> new loan\n"
+               "  python flows/e2e_full_loan.py --partner arvog          # loan under the Arvog (ARV10) partner\n"
+               "  python flows/e2e_full_loan.py --co-lender              # pick a co-lender from a menu\n"
+               "  python flows/e2e_full_loan.py --co-lender DCB          # co-lending with a named bank\n"
+               "  python flows/e2e_full_loan.py --scheme 853 --amount 550000\n"
+               "  python flows/e2e_full_loan.py --env uat                # run the whole flow on UAT (gfau)\n",
     )
     parser.add_argument("--env", choices=sorted(GoldLoanApiTest.ENVIRONMENTS),
                         default=os.getenv("GOLD_LOAN_ENV", GoldLoanApiTest.DEFAULT_ENV).strip().lower(),
@@ -6732,6 +7534,18 @@ def main():
     parser.add_argument("--purpose", metavar="NAME",
                         help="Pin one loan purpose by name, e.g. \"Agricultural Purposes\" "
                              "(overrides --purpose-type; its own type is used).")
+    parser.add_argument("--transfer-mode", choices=list(GoldLoanApiTest.TRANSFER_MODES),
+                        default=(os.getenv("GOLD_LOAN_TRANSFER_MODE") or "neft").strip().lower(),
+                        help="Disbursement bank transfer mode (default: %(default)s): the portal's "
+                             "manual OFFLINE options NEFT / IMPS / RTGS, with a UTR. ICICI / RazorpayX "
+                             "payouts are not used.")
+    parser.add_argument("--release-kyc-docs", action="store_true",
+                        help="TEST/UAT only: before KYC, free the identity profile's REAL PAN (and full "
+                             "Aadhaar) from the KYC records (POST /api/e-kyc/remove), so --kyc auto can "
+                             "register them on a new customer again. Allows --kyc auto with --count > 1.")
+    parser.add_argument("--record-har", metavar="PATH",
+                        help="Record every request/response of the run to a HAR 1.2 file at PATH "
+                             "(tokens redacted), e.g. reference/gold-loan-e2e-flow.har.")
     parser.add_argument("--fresh-request", action="store_true",
                         help="If an appraiser request already exists for the customer, cancel its "
                              "loan and create a new request. Default is to RESUME the existing "
@@ -6763,6 +7577,11 @@ def main():
     if args.fresh_request:
         os.environ["GOLD_LOAN_FRESH_APPRAISER_REQUEST"] = "true"
     os.environ["GOLD_LOAN_PURPOSE_TYPE"] = args.purpose_type
+    os.environ["GOLD_LOAN_TRANSFER_MODE"] = args.transfer_mode
+    if args.record_har:
+        os.environ["GOLD_LOAN_HAR_PATH"] = args.record_har
+    if args.release_kyc_docs:
+        os.environ["GOLD_LOAN_RELEASE_KYC_DOCS"] = "true"
     if args.purpose:
         os.environ["GOLD_LOAN_PURPOSE"] = args.purpose
 
@@ -6800,9 +7619,15 @@ def main():
         who = (f"the SAME customer {args.customer}" if args.customer else "a NEW customer each")
         print(f">> Batch: {args.count} loans for {who}, in ONE session "
               "(one login per role for the batch).")
-        passed = asyncio.run(suite.run_many(login_type=args.login, count=args.count))
+        try:
+            passed = asyncio.run(suite.run_many(login_type=args.login, count=args.count))
+        finally:
+            suite.write_har()   # --record-har: written even when the run fails
         sys.exit(0 if passed else 1)
-    asyncio.run(suite.run_e2e_test(login_type=args.login))
+    try:
+        asyncio.run(suite.run_e2e_test(login_type=args.login))
+    finally:
+        suite.write_har()   # --record-har: written even when the run fails
 
 
 if __name__ == "__main__":
