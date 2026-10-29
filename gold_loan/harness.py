@@ -272,6 +272,8 @@ class GoldLoanApiTest:
         self.har_path = os.getenv("GOLD_LOAN_HAR_PATH", "").strip()
         self._har_entries = []
         self._current_step = ""
+        self.disbursement_summary = {}   # net amount / mode / UTR actually sent at disbursement
+        self.lip_eligible = None         # server's verdict on the stored LIP assessment
         if self.transfer_mode not in self.TRANSFER_MODES:
             raise ValueError(f"Unknown transfer mode {self.transfer_mode!r}; use one of {self.TRANSFER_MODES}.")
         self.submit_all_kyc_response = {}      # submit-all-kyc-info response (feeds the ops approval)
@@ -6425,6 +6427,7 @@ class GoldLoanApiTest:
             "Eligible": saved.get('isEligible'),
             "PDF": saved.get('pdfUrl') or "-",
         })
+        self.lip_eligible = saved.get('isEligible')
         if problems:
             raise RuntimeError("LIP assessment stored by the server does not check out: " + "; ".join(problems))
 
@@ -6826,6 +6829,9 @@ class GoldLoanApiTest:
             "loanType": self.loan_type or "Fresh Loan",
         }
         self._apply_portal_disbursement_amounts(request_body)
+        self.disbursement_summary = {"net": request_body.get("finalAmount"),
+                                     "mode": request_body.get("bankTransferType"),
+                                     "utr": request_body.get("securedBankTransactionId")}
         response = await self._make_authenticated_request('POST', api_path, json_data=request_body)
         msg = response.json().get("message") if isinstance(response.json(), dict) else ""
         print(f"Disbursement successful: {msg}")
@@ -7051,6 +7057,33 @@ class GoldLoanApiTest:
             self.auth_token = saved_token
         return row
 
+    def _loan_summary_extras(self, loan: dict) -> dict:
+        """The important run values for the closing LOAN DETAILS table (no extra API calls): what
+        the loan was for, who lends it, what it cost and how it was paid out."""
+        scheme = self.secured_scheme or self.selected_scheme or {}
+        fld = self.final_loan_details_data or {}
+        co_lender = loan.get("loanCoLenderBank")
+        if isinstance(co_lender, dict):
+            co_lender = co_lender.get("name") or co_lender.get("bankName") or co_lender.get("id")
+        disb = self.disbursement_summary or {}
+        if self.lip_form is None:
+            lip = "not required"
+        else:
+            lip = "required - eligible" if self.lip_eligible else f"required - eligible={self.lip_eligible}"
+        return {
+            "Purpose": f"{self.purpose_id or '-'} ({self.purpose_type or '-'})",
+            "Partner / Scheme": f"{(self.selected_scheme or {}).get('_partnerName') or self.partner_id or '-'} / "
+                                f"{scheme.get('schemeName') or '-'} (id {self.scheme_id or '-'})",
+            "Co-lender": co_lender or (self.co_lender_bank_id or "none"),
+            "Interest Rate": f"{self.interest_rate}%" if self.interest_rate not in (None, "") else "-",
+            "Processing Charge": fld.get("actualProcessingCharge", self.secured_processing_charge),
+            "Stamp Duty": self.stamp_duty_charges,
+            "Net Disbursed": (f"{disb.get('net')} via {str(disb.get('mode') or '').upper()} (UTR {disb.get('utr')})"
+                              if disb else "-"),
+            "Packet": getattr(self, "_created_packet_unique", None) or "-",
+            "LIP Assessment": lip,
+        }
+
     async def fetch_loan_details(self) -> dict:
         """Final step: search the loan-details list by the loan's unique id (AUGM-…) and display the
         completed loan's key attributes. Mirrors the UI loading the loan after submit-packet. Returns
@@ -7092,7 +7125,10 @@ class GoldLoanApiTest:
             "Customer": f"{cust.get('firstName','')} {cust.get('lastName','')} "
                         f"({cust.get('customerUniqueId','')}, {cust.get('mobileNumber','')})".strip(),
             "PAN": cust.get("panCardNumber"),
+            "KYC Mode": (self.kyc_mode_effective if self.kyc_mode_effective == self.kyc_mode_requested
+                         else f"{self.kyc_mode_requested} -> {self.kyc_mode_effective} (degraded)"),
             "Appraiser": f"{appr.get('firstName','')} {appr.get('lastName','')}".strip(),
+            **self._loan_summary_extras(loan),
         }
         self._print_summary_table(f"LOAN DETAILS ({details['Loan Unique ID']})", details)
         print(f"Loan process complete — stage: {stage.get('name')}.")
@@ -7153,6 +7189,8 @@ class GoldLoanApiTest:
         self.loan_type = ''
         self.customer_user_type = ''
         self.ornaments_total_nwap = None
+        self.disbursement_summary = {}
+        self.lip_eligible = None
         self.basic_details_response = {}
         self.selected_scheme = {}
         self.loan_ornaments_details = []
