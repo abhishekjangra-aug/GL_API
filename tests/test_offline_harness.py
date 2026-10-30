@@ -2989,7 +2989,7 @@ def single_loan(**over):
     data.update(over)
     return {"data": data}
 
-def run_loan_documents(loan, lip_validation=True, stored_lip=None):
+def run_loan_documents(loan, lip_validation=True, stored_lip=None, igl_docs="1", igl_files=1, uploads=None):
     """Drive store_loan_documents against a mocked server. After loan-documents is posted the
     mock's single-loan carries the LIP assessment the server would store (eligible, with
     existingLoanEmis = the sent presentInterest) unless `stored_lip` overrides it."""
@@ -2998,10 +2998,16 @@ def run_loan_documents(loan, lip_validation=True, stored_lip=None):
                                "roleName": ["Appraiser"], "id": 1473}, "offline-test-key-0123456789abcdef", algorithm="HS256")
     s.customer_id, s.loan_id, s.master_loan_id, s.final_loan_amount = "1", "2", "3", 400000
     s.purpose_record = IGL_PURPOSE
+    s.igl_docs_choice, s.igl_doc_files = igl_docs, igl_files   # set directly: env vars would leak
     def responder(path):
         if "single-loan" in path: return loan
         if "global-setting" in path: return {"LIPEligibilityValidation": lip_validation}
-        if "upload-file" in path: return {"uploadFile": {"path": "uploads/x/doc.pdf", "filename": "doc.pdf"}}
+        if "upload-file" in path:
+            if uploads is None:
+                return {"uploadFile": {"path": "uploads/x/doc.pdf", "filename": "doc.pdf"}}
+            uploads.append(path)   # numbered so a test can count distinct uploads
+            n = len(uploads)
+            return {"uploadFile": {"path": f"uploads/x/doc{n}.pdf", "filename": f"doc{n}.pdf"}}
         return {}
     calls = []
     def responder_with_readback(path):
@@ -3113,6 +3119,40 @@ def _():
     eq(lip["yearsInCurrentOccupation"], "7", "saved value reused")
     ok("grossMonthlyIncome" not in lip and "pdfUrl" not in lip, "server-computed fields not sent back")
     ok(G._lip_net_income(lip) > 108166.5 + 4440.0, "income re-declared to pass eligibility")
+
+@test("upload-docs: IGL sends ONE income document by default (the page's minimum)")
+def _():
+    docs = run_loan_documents(single_loan())["incomeGeneratingDocuments"]
+    eq(len(docs), 1, "one document type")
+    eq([len(v["path"]) for v in docs.values()], [1], "one file")
+    ok(set(docs) <= {"7/12", "Land records"}, "a visible document name (hidden ones never used)")
+
+@test("upload-docs: --igl-docs all --igl-doc-files 3 fills every visible type, LIP form alongside")
+def _():
+    uploads = []
+    body = run_loan_documents(single_loan(), igl_docs="all", igl_files=3, uploads=uploads)
+    docs = body["incomeGeneratingDocuments"]
+    eq(sorted(docs), ["7/12", "Land records"], "every visible type, none of the hidden ones")
+    eq([len(v["path"]) for v in docs.values()], [3, 3], "three files each")
+    eq(len({p for v in docs.values() for p in v["path"]}), 6, "six distinct uploads")
+    ok(all(set(v) == {"name", "path"} for v in docs.values()), "name + path only (url dropped)")
+    ok(sum("reason=customerIncomeGeneratingDocument" in u for u in uploads) == 6, "uploaded as income documents")
+    ok(body["lipForm"] is not None, "the LIP form still goes with them")
+
+@test("upload-docs: more types than the purpose offers are capped; over 10 files per type is refused")
+def _():
+    docs = run_loan_documents(single_loan(), igl_docs="5")["incomeGeneratingDocuments"]
+    eq(len(docs), 2, "capped at the 2 visible types")
+    os.environ["GOLD_LOAN_IGL_DOC_FILES"] = "11"
+    try:
+        with redirect_stdout(io.StringIO()):
+            G()
+    except ValueError as e:
+        ok("1..10" in str(e), f"page limit named: {e}")
+    else:
+        raise Fail("11 files per document type must be refused")
+    finally:
+        del os.environ["GOLD_LOAN_IGL_DOC_FILES"]
 
 @test("upload-docs: a stamp-paper stamp duty sends the stamp paper copy")
 def _():

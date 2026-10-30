@@ -110,6 +110,8 @@ python flows/e2e_full_loan.py --env uat --customer MS35QNJP # existing customer,
 | `--kyc-profile PATH`| `config/kyc_identity.json` | Real identity data for `auto`/`ovd`.           |
 | `--login ROLE`      | `appraiser` | Login role for the main flow.                                 |
 | `--transfer-mode M` | `neft`      | Disbursement transfer mode: `neft`, `imps` or `rtgs` (manual, with a UTR). |
+| `--igl-docs N\|all` | `1` | IGL loans: how many income document types to upload (`all` = every visible type). |
+| `--igl-doc-files M` | `1` | IGL loans: PDFs per income document type (1–10). |
 | `--cash-amount N\|full` | *(off — all by bank)* | Pay part of the loan in **cash** at bank details (the portal's advance cash), the rest by bank; `full` = all in cash. |
 | `--release-kyc-docs`| off         | TEST/UAT: free the profile's real PAN (+ Aadhaar) before KYC — see below. |
 | `--fresh-request`   | off         | Cancel an existing appraiser request's loan and start a new request. |
@@ -390,7 +392,7 @@ The upload-documents step mirrors the web portal, driven by the loan record (`si
 | LIP eligibility (`LIPEligibilityValidation`) | portal rule | net monthly income > monthly interest obligation (`currentLoanPresentInterest + presentInterest`); income is declared to clear it |
 | Saved assessment on a resumed loan | `customerLoanDocument.lipFormInfo` | saved values are reused (re-declared if no longer eligible) |
 | After upload | server-stored `lipFormInfo` | read back; the step fails unless the server marks it eligible and stores the same Existing Loan EMIs |
-| **IGL income documents** | purpose's `incomeGeneratingDocumentTypes` minus `hiddenDocuments` | one PDF under a randomly chosen visible document (at least one is mandatory) |
+| **IGL income documents** | purpose's `incomeGeneratingDocumentTypes` minus `hiddenDocuments` | by default one PDF under one randomly chosen visible document type (at least one is mandatory); `--igl-docs N\|all` fills N (or every) visible type and `--igl-doc-files M` puts M PDFs under each (1–10, the page's limit). The LIP form goes in the same request whenever it is required. |
 | Consumption (CB) loans | `showConsumptionSupportingDocs` on the loan | none on TEST (the LIP form replaced them); one consumption supporting document only when the server flags it (UAT's older portal) |
 | **Arvog** (co-lender not DCB) | `isArvog`, `masterLoan.bankId` | loan application, gold receipt and KFS copies |
 | Stamp paper | `stampDutyDefinitionType == "stampPaper"` | stamp paper copy |

@@ -269,6 +269,16 @@ class GoldLoanApiTest:
         # bank-details step (the portal's "advance cash"); the bank transfer pays the rest. 'full' =
         # everything in cash (to-be-paid 0, the portal's dummy "TO PAID ZERO" bank details).
         self.cash_amount_choice = (os.getenv("GOLD_LOAN_CASH_AMOUNT") or "").strip().lower()
+        # --igl-docs N|all / --igl-doc-files M: how many of the purpose's income document TYPES an IGL
+        # loan fills at upload documents (default 1, the page's minimum) and how many PDFs go under
+        # each (1..10, the page's maximum). The LIP form is sent alongside whenever it is required.
+        self.igl_docs_choice = (os.getenv("GOLD_LOAN_IGL_DOCS") or "1").strip().lower()
+        self.igl_doc_files = int(os.getenv("GOLD_LOAN_IGL_DOC_FILES") or 1)
+        if not 1 <= self.igl_doc_files <= self.IGL_MAX_FILES_PER_DOC:
+            raise ValueError(f"--igl-doc-files must be 1..{self.IGL_MAX_FILES_PER_DOC} "
+                             f"(the upload page's limit), not {self.igl_doc_files}.")
+        if self.igl_docs_choice != "all" and not (self.igl_docs_choice.isdigit() and int(self.igl_docs_choice) >= 1):
+            raise ValueError(f"--igl-docs must be a number >= 1 or 'all', not {self.igl_docs_choice!r}.")
         self.cash_given = 0.0             # advance cash actually sent on bank-details
         self.bank_dummy_details = False   # True when nothing is paid by bank (full cash)
         # --release-kyc-docs / GOLD_LOAN_RELEASE_KYC_DOCS: free the identity profile's REAL PAN (and full
@@ -6558,6 +6568,29 @@ class GoldLoanApiTest:
         print(f"Income-generating document uploaded. Path: {upload['path']}")
         return upload
 
+    IGL_MAX_FILES_PER_DOC = 10   # UploadDocumentsComponent: 'You can upload a maximum of 10 files.'
+
+    async def _igl_income_documents(self, names: list) -> dict:
+        """incomeGeneratingDocuments for the loan-documents body: `--igl-docs` of the purpose's visible
+        document types (random, distinct; 'all' = every one), each with `--igl-doc-files` PDFs ->
+        {type: {name: [filename, ...], path: [path, ...]}} (the web app drops `url` before sending)."""
+        count = len(names) if self.igl_docs_choice == "all" else int(self.igl_docs_choice)
+        if count > len(names):
+            print(f"--igl-docs {count}: the purpose offers only {len(names)} document type(s); using all of them.")
+            count = len(names)
+        chosen = self.random.sample(names, count)
+        documents = {}
+        for doc_name in chosen:
+            entry = documents.setdefault(doc_name, {"name": [], "path": []})
+            for _ in range(self.igl_doc_files):
+                upload = await self.upload_income_document()
+                entry["name"].append(upload.get('filename') or upload.get('originalname')
+                                     or os.path.basename(upload['path']))
+                entry["path"].append(upload['path'])
+        print(f"IGL income documents: {len(chosen)} type(s) x {self.igl_doc_files} file(s) -> "
+              + ", ".join(repr(n) for n in chosen))
+        return documents
+
     async def fetch_global_setting(self) -> dict:
         """GET /api/global-setting: the rules the web app reads at runtime (IGLLIPApplicability,
         consumptionLipApplicability, LIPEligibilityValidation, ...). Cached for the run."""
@@ -6802,12 +6835,7 @@ class GoldLoanApiTest:
             if not names:
                 raise RuntimeError(f"Income Generating purpose {self.purpose_id!r} has no visible "
                                    "income document types, but the upload page requires at least one.")
-            doc_name = self.random.choice(names)
-            upload = await self.upload_income_document()
-            income_generating_documents = {doc_name: {
-                "name": [upload.get('filename') or upload.get('originalname') or os.path.basename(upload['path'])],
-                "path": [upload['path']]}}
-            print(f"IGL income document submitted as {doc_name!r}.")
+            income_generating_documents = await self._igl_income_documents(names)
 
         # Consumption supporting documents: required for a Consumption Based loan whenever the SERVER
         # flags it (showConsumptionSupportingDocs). UAT's portal still enforces this; TEST's portal
@@ -8008,6 +8036,12 @@ def main():
     parser.add_argument("--fresh-login", action="store_true",
                         help="Ignore the saved login sessions (config/session_tokens.json) and log every "
                              "role in with OTP. Default: reuse a role's saved token until it expires.")
+    parser.add_argument("--igl-docs", metavar="N|all",
+                        help="IGL loans: how many of the purpose's income document types to upload at "
+                             "upload documents (default 1; 'all' = every visible type). The LIP form is "
+                             "sent alongside whenever the server requires it.")
+    parser.add_argument("--igl-doc-files", type=int, metavar="M",
+                        help="IGL loans: PDFs per income document type, 1-10 (default 1).")
     parser.add_argument("--cash-amount", metavar="N|full",
                         help="Hand part of the loan over in CASH at bank details (the portal's advance "
                              "cash; a 2%% appraiser charge may apply) and pay the rest by bank. 'full' = "
@@ -8055,6 +8089,10 @@ def main():
         os.environ["GOLD_LOAN_CASH_AMOUNT"] = args.cash_amount
     if args.fresh_login:
         os.environ["GOLD_LOAN_SESSION_CACHE"] = "false"
+    if args.igl_docs:
+        os.environ["GOLD_LOAN_IGL_DOCS"] = args.igl_docs
+    if args.igl_doc_files:
+        os.environ["GOLD_LOAN_IGL_DOC_FILES"] = str(args.igl_doc_files)
     if args.record_har:
         os.environ["GOLD_LOAN_HAR_PATH"] = args.record_har
     if args.release_kyc_docs:

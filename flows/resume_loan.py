@@ -469,6 +469,10 @@ def build_parser():
                         help="Partner whose login disburses the loan (default: roshan).")
     parser.add_argument("--fresh-login", action="store_true",
                         help="Ignore the saved login sessions and log every role in with OTP.")
+    parser.add_argument("--igl-docs", metavar="N|all",
+                        help="IGL loans: income document types to upload (default 1; 'all').")
+    parser.add_argument("--igl-doc-files", type=int, metavar="M",
+                        help="IGL loans: PDFs per income document type, 1-10 (default 1).")
     parser.add_argument("--dry-run", action="store_true",
                         help="Resolve the loan and print the plan without changing anything.")
     parser.add_argument("--list-steps", action="store_true",
@@ -493,6 +497,10 @@ def main():
     os.environ["GOLD_LOAN_ENV"] = args.env
     if args.fresh_login:
         os.environ["GOLD_LOAN_SESSION_CACHE"] = "false"
+    if args.igl_docs:
+        os.environ["GOLD_LOAN_IGL_DOCS"] = args.igl_docs
+    if args.igl_doc_files:
+        os.environ["GOLD_LOAN_IGL_DOC_FILES"] = str(args.igl_doc_files)
     os.environ["GOLD_LOAN_PARTNER_NAME"] = {"roshan": "ROSHAN PARTNER", "arvog": "ARVOG"}[args.partner]
 
     runner = ResumeLoanTest(args)

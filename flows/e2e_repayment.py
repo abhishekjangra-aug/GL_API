@@ -52,6 +52,10 @@ def build_parser():
                         help="Partner of the loan; its branch user hands the packet back on a release.")
     parser.add_argument("--transfer-mode", choices=list(GoldLoanApiTest.TRANSFER_MODES), default="neft",
                         help="OFFLINE payment mode for the repayment (and the new loan's disbursement).")
+    parser.add_argument("--igl-docs", metavar="N|all",
+                        help="IGL loans: income document types to upload (default 1; 'all').")
+    parser.add_argument("--igl-doc-files", type=int, metavar="M",
+                        help="IGL loans: PDFs per income document type, 1-10 (default 1).")
     parser.add_argument("--cash-amount", metavar="N|full",
                         help="Pay part (or 'full') of the NEW loan in cash at bank details; "
                              "default: everything by bank transfer.")
@@ -183,6 +187,10 @@ def main():
     os.environ["GOLD_LOAN_PURPOSE_TYPE"] = args.purpose_type
     if args.cash_amount:
         os.environ["GOLD_LOAN_CASH_AMOUNT"] = args.cash_amount
+    if args.igl_docs:
+        os.environ["GOLD_LOAN_IGL_DOCS"] = args.igl_docs
+    if args.igl_doc_files:
+        os.environ["GOLD_LOAN_IGL_DOC_FILES"] = str(args.igl_doc_files)
     if args.purpose:
         os.environ["GOLD_LOAN_PURPOSE"] = args.purpose
     if args.amount:
