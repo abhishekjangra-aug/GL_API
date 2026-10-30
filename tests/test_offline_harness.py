@@ -25,6 +25,10 @@ from contextlib import redirect_stdout
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["GOLD_LOAN_COLOR"] = "off"
+# Never read or write the real saved login sessions: the session tests opt in with a temp file.
+os.environ["GOLD_LOAN_SESSION_CACHE"] = "false"
+os.environ["GOLD_LOAN_SESSION_FILE"] = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                    "__no_such_session_file__.json")
 os.environ.setdefault("GOLD_LOAN_LOG_LEVEL", "quiet")
 
 import httpx  # noqa: E402
@@ -3114,6 +3118,681 @@ def _():
 def _():
     body = run_loan_documents(single_loan(stampDutyDefinitionType="stampPaper"))
     ok(body["stampPaperCopy"] and body["stampPaperCopyFullUrl"], "stamp paper copy sent")
+
+
+# --------------------------------------------------------------------------------------------
+# GROUP: repayment -- renewal / top-up / part & full release (gold_loan/repayment.py)
+# --------------------------------------------------------------------------------------------
+
+from gold_loan.repayment import RepaymentScenarios, RepaymentScenarioError  # noqa: E402
+from flows.e2e_repayment import resume_point  # noqa: E402
+
+def repayment(scenario="renewal", responder=None, loan=None):
+    """A RepaymentScenarios on a mocked suite. `responder(method, path, token, body)` answers
+    every request; role logins hand out 'tok-<role>' so a test can tell who made a call."""
+    s = suite()
+    s.logged_in_user_id = 1473
+    calls = []
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        calls.append((method, path, s.auth_token, json_data))
+        payload = responder(method, path, s.auth_token, json_data) if responder else {}
+        class R:
+            content = b"{}"
+            def json(self_inner): return payload
+        return R()
+    async def role_token(role):
+        return f"tok-{role}"
+    s._make_authenticated_request = fake
+    s._role_token = role_token
+    r = RepaymentScenarios(s, scenario)
+    r.master_loan_id = "12284"
+    r.loan = loan or {"customerId": 9332, "customer": {"firstName": "A", "lastName": "B"},
+                      "loanOrnamentsDetail": [{"id": 1, "masterLoanId": 12284},
+                                              {"id": 2, "masterLoanId": 12284}]}
+    return s, r, calls
+
+@test("repayment: the renewal id is read from renewal/submit's 'renewealLoan' (sic)")
+def _():
+    eq(RepaymentScenarios._id_from({"message": "Success", "renewealLoan": {"id": 2930, "masterLoanId": 12284}},
+                                   "loanRenewalId"), 2930, "id from the nested request")
+    eq(RepaymentScenarios._id_from({"partReleaseId": 7}, "partReleaseId"), 7, "explicit key wins")
+    eq(RepaymentScenarios._id_from({"message": "Success"}, "fullReleaseId"), None, "nothing to read")
+
+@test("repayment: the offline payment is NEFT/IMPS/RTGS with a UTR and no cash or cheque fields")
+def _():
+    s, r, _ = repayment()
+    s.transfer_mode = "imps"
+    pay = r.offline_payment("1140")
+    eq(pay["paymentType"], "IMPS", "portal value is upper-case")
+    eq(pay["paidAmount"], 1140.0, "amount as a number")
+    ok(pay["transactionId"].startswith("UTR") and pay["transactionId"].isupper(), "UTR, upper-cased")
+    ok(all(pay[k] is None for k in ("chequeNumber", "cashReceiptNumber", "cashReceiptUrl",
+                                    "depositStatus", "paymentReceivedDate")), "cash/cheque fields null")
+    ok(re.match(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$", pay["depositDate"]), "JSON Date format")
+    close(s)
+
+@test("repayment: payObject is the summary's dues + charges, then the payment, then ornamentWeight")
+def _():
+    s, r, _ = repayment()
+    r._selected_ornaments = r.loan["loanOrnamentsDetail"]
+    r.summary = {"loanInfo": {"interestAmount": 5, "penalInterest": 0, "totalPayableAmount": 1140},
+                 "stampDuty": {"stampDutyCharges": 0, "stampDutyDefinitionType": None, "stampDutyPercent": None},
+                 "calculationData": {"upfrontInterestAmount": 0},
+                 "ornamentWeight": {"releaseNetWeight": 129.12, "paidAmount": "ignored-by-weight?"}}
+    body = r._pay_object(841, 0, 400, "400.00", 4533, {"paymentType": "NEFT", "paidAmount": 1140},
+                         "Marriage", "Consumption Based", 2)
+    eq(body["ornamentId"], [1, 2], "every selected ornament")
+    eq((body["payableAmount"], body["schemeId"], body["actualProcessingCharge"]), (1140, 841, "400.00"),
+       "dues + new scheme charges (actual charge stays a 2dp string)")
+    eq((body["loanPurpose"], body["loanPurposeType"], body["coLenderBankId"]),
+       ("Marriage", "Consumption Based", 2), "purpose + co-lender")
+    eq(body["releaseNetWeight"], 129.12, "ornamentWeight merged in")
+    eq(body["paidAmount"], "ignored-by-weight?", "ornamentWeight is applied LAST (Object.assign order)")
+    close(s)
+
+@test("repayment: a request the approver cannot see (branch-scoped list) is found and approved as admin")
+def _():
+    row = {"id": 2930, "masterLoanId": 12284, "amountStatus": "pending",
+           "transaction": {"utrNumber": "UTR1"},
+           "masterLoan": {"customer": {"customerUniqueId": "MVTK8W3V"}}}
+    def respond(method, path, token, body):
+        if path.startswith("/api/renewal?"):
+            return {"data": [row] if token == "tok-admin" else []}
+        return {"message": "Success"}
+    s, r, calls = repayment(responder=respond)
+    asyncio.run(quiet_async(r.approve_amount))
+    eq(r.approver_role, "admin", "switched to admin")
+    eq(s.customer_unique_id, "MVTK8W3V", "customer unique id taken from the row (the screen masks it)")
+    lock = [c for c in calls if c[1] == "/api/loan-process/update-loan-lock"][0]
+    put = [c for c in calls if c[1] == "/api/renewal/amount-status"][0]
+    eq((lock[2], lock[3]["loanStageId"]), ("tok-admin", "renewLoan"), "admin locks the renewLoan stage")
+    eq(put[3], {"loanRenewalId": 2930, "amountStatus": "completed", "utrNumber": "UTR1"},
+       "only the enabled controls are sent")
+    close(s)
+
+def quiet_async(fn, *a):
+    async def run():
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            return await fn(*a)
+    return run()
+
+@test("repayment: a re-run picks up the open request instead of placing a second one")
+def _():
+    row = {"id": 2930, "masterLoanId": 12284, "amountStatus": "pending", "isAppraiserAssigned": False,
+           "transaction": {}, "masterLoan": {"customer": {"customerUniqueId": "MVTK8W3V"}}}
+    def respond(method, path, token, body):
+        if path.startswith("/api/renewal?"):
+            return {"data": [row]}
+        if path.startswith("/api/renewal/apply-loan/"):
+            return {"loanId": 14298, "masterLoanId": 12293, "loanCurrentStage": "2"}
+        return {"message": "Success"}   # update-loan-lock answers exactly "Success"
+    s, r, calls = repayment(responder=respond)
+    new = asyncio.run(quiet_async(r.renewal))
+    paths = [c[1] for c in calls]
+    ok("/api/renewal/amount" not in paths and "/api/renewal/submit" not in paths, "nothing re-placed")
+    ok("/api/renewal/assign-appraiser" in paths, "carried on to the assignment")
+    ok(any(p.startswith("/api/renewal/apply-loan/MVTK8W3V?loanRenewalId=2930") for p in paths),
+       "apply-loan with the customer unique id and the request id in the signed path")
+    eq((new["loanId"], new["masterLoanId"]), ("14298", "12293"), "the opened loan's ids")
+    close(s)
+
+def claim(scenario, rows_by_list, outstanding="400000.00"):
+    """claim_parent() with the given request-list rows; returns (result or exception, calls)."""
+    def respond(method, path, token, body):
+        for prefix, rows in rows_by_list.items():
+            if path.startswith(prefix + "?"):
+                return {"data": rows}
+        return {"data": []}
+    s, r, calls = repayment(scenario, responder=respond)
+    r.loan = {**r.loan, "outstandingAmount": outstanding}
+    try:
+        result = asyncio.run(quiet_async(r.claim_parent))
+    except RepaymentScenarioError as e:
+        result = e
+    close(s)
+    return result, calls
+
+RENEWED = {"id": 2925, "masterLoanId": 12284, "amountStatus": "completed", "isRenewalLoanCreated": True}
+OPEN_PART = {"id": 77, "masterLoanId": 12284, "amountStatus": "pending", "partReleaseStatus": "pending"}
+
+@test("repayment: a parent loan that already went through a scenario is refused, whatever the scenario")
+def _():
+    for scenario in ("renewal", "renewal-topup", "topup", "part-release", "full-release"):
+        result, _ = claim(scenario, {"/api/renewal": [RENEWED]})
+        ok(isinstance(result, RepaymentScenarioError) and "one scenario only" in str(result),
+           f"{scenario}: refused after a completed renewal ({result})")
+
+@test("repayment: an open request of ANOTHER scenario blocks the parent; the same one is resumed")
+def _():
+    result, _ = claim("full-release", {"/api/jewellery-release/part-release": [OPEN_PART]})
+    ok(isinstance(result, RepaymentScenarioError) and "in progress" in str(result), "full release refused")
+    result, _ = claim("part-release", {"/api/jewellery-release/part-release": [OPEN_PART]})
+    eq((result or {}).get("id"), 77, "part release resumes its own open request")
+
+@test("repayment: a rejected request does not use the loan up; nothing outstanding does")
+def _():
+    rejected = dict(RENEWED, isRenewalLoanCreated=False, amountStatus="rejected")
+    result, _ = claim("renewal", {"/api/renewal": [rejected]})
+    eq(result, None, "rejected = never happened, a new request may be placed")
+    result, _ = claim("topup", {}, outstanding="0.00")
+    ok(isinstance(result, RepaymentScenarioError) and "nothing outstanding" in str(result),
+       "a closed / carried-over parent is refused")
+
+@test("repayment: a released part release is still OPEN until its document is on file")
+def _():
+    released = dict(OPEN_PART, partReleaseStatus="released", newLoanId=12300, isLoanCreated=True)
+    result, _ = claim("part-release", {"/api/jewellery-release/part-release": [released]})
+    eq((result or {}).get("id"), 77, "released + new loan opened, no document yet -> resume")
+    done = dict(released, documents=["uploads/doc.pdf"])
+    result, _ = claim("part-release", {"/api/jewellery-release/part-release": [done]})
+    eq((result or {}).get("id"), 77, "parent's part finished -> the re-run only finishes the new loan")
+    result, _ = claim("full-release", {"/api/jewellery-release/part-release": [done]})
+    ok(isinstance(result, RepaymentScenarioError) and "12300" in str(result),
+       "another scenario on that parent is refused, naming the loan it produced")
+    full_done = {"id": 9, "masterLoanId": 12284, "amountStatus": "completed",
+                 "fullReleaseStatus": "released", "documents": ["x.pdf"]}
+    result, _ = claim("full-release", {"/api/jewellery-release/full-release": [full_done]})
+    ok(isinstance(result, RepaymentScenarioError), "a finished full release has nothing left: refused")
+
+@test("repayment: the parent's history is read as admin across all three lists")
+def _():
+    _, calls = claim("topup", {})
+    lists = {c[1].split("?")[0] for c in calls}
+    eq(lists, {"/api/renewal", "/api/jewellery-release/part-release",
+               "/api/jewellery-release/full-release"}, "every scenario list checked")
+    ok(all(c[2] == "tok-admin" for c in calls), "branch-scoped lists read as admin")
+
+@test("repayment: top-up / renewal scheme must fit the new amount and a usable net top-up")
+def _():
+    s, r, _ = repayment("topup")
+    schemes = [{"id": 1, "netTopUp": "0", "totalOutstanding": 400000, "schemeAmountStart": "0", "schemeAmountEnd": "1000000"},
+               {"id": 2, "netTopUp": "150000", "totalOutstanding": 400000, "schemeAmountStart": "0", "schemeAmountEnd": "500000"},
+               {"id": 3, "netTopUp": "150000", "totalOutstanding": 400000, "schemeAmountStart": "0", "schemeAmountEnd": "1500000"}]
+    scheme, top_up = r._pick_top_up_scheme(schemes, minimum_top_up=0)
+    eq((scheme["id"], top_up), (3, 150000.0), "no top-up / out of range schemes skipped")
+    r.scenario = "renewal"
+    eq(r._pick_top_up_scheme(schemes, 0)[0]["id"], 1, "plain renewal adds no top-up")
+    s.forced_scheme_id = "2"
+    r.scenario = "topup"
+    try:
+        r._pick_top_up_scheme(schemes, 0)
+    except RepaymentScenarioError as e:
+        ok("pinned" in str(e), "pinned scheme that does not fit says so")
+    else:
+        raise Fail("a pinned scheme outside its range must not be used")
+    close(s)
+
+@test("repayment: due interest is quick-paid with deCryptedAmount, then the deposit is confirmed")
+def _():
+    state = {"paid": False}
+    def respond(method, path, token, body):
+        if path.startswith("/api/quick-pay/payable-amount"):
+            return {"data": {"securedPenalInterest": 0, "unsecuredPenalInterest": 0, "gstOnPenalInterest": 0,
+                             "interest": 296, "totalManualCharges": 0, "payableAmount": 296}}
+        if path == "/api/quick-pay/payment":
+            state["paid"] = True
+            state["utr"] = body["paymentDetails"]["transactionId"]
+            return {"data": "success"}
+        if path.startswith("/api/deposit?"):
+            return {"data": [{"id": 12281, "masterLoanId": 12284, "depositStatus": "Pending",
+                              "bankTransactionUniqueId": state.get("utr"), "transactionAmont": "296.00",
+                              "receivedAmountForBranchId": None}]}
+        if path.startswith("/api/jewellery-release/"):
+            return {"customerLoan": {**r.loan, "loanOrnamentsDetail": r.loan["loanOrnamentsDetail"]},
+                    "isPayableAmount": not state.get("confirmed")}
+        if path == "/api/quick-pay/confirm-payment":
+            state["confirmed"] = True
+            state["confirm"] = body
+        return {"message": "success"}
+    s, r, calls = repayment("topup", responder=respond)
+    r.release_info = {"isPayableAmount": True}
+    asyncio.run(quiet_async(r.pay_due_interest))
+    payment = [c[3] for c in calls if c[1] == "/api/quick-pay/payment"][0]
+    eq(payment["payableAmount"], 296.0, "tilldate amount = penal + GST + interest + manual charges")
+    ok(payment["deCryptedAmount"].startswith("U2FsdGVkX1"), "amount also sent CryptoJS-encrypted")
+    eq(payment["interestAmountPaidTill"], "tilldate", "portal default")
+    eq((state["confirm"]["transactionId"], state["confirm"]["status"], state["confirm"]["depositAmount"]),
+       (12281, "Completed", "296.00"), "the pending deposit is confirmed")
+    close(s)
+
+@test("repayment: a top-up loan resumes at bank details; renewal / part release follow the record")
+def _():
+    eq(resume_point("topup"), "bank", "server already posted the top-up's final-loan-details")
+    eq(resume_point("renewal"), None, "renewal: plan from the loan record")
+    eq(resume_point("part-release"), None, "part release: plan from the loan record")
+
+@test("repayment: the portal's guards stop a scenario the screen would not offer")
+def _():
+    s, r, _ = repayment("topup")
+    r.loan = {**r.loan, "dpdDays": 3, "loanEndDate": "2099-01-01"}
+    try:
+        r._check_allowed()
+    except RepaymentScenarioError as e:
+        ok("DPD" in str(e), "top-up refused with DPD > 1")
+    else:
+        raise Fail("top-up with DPD 3 must be refused")
+    r.scenario = "part-release"
+    r.loan = {**r.loan, "dpdDays": 0, "loanOrnamentsDetail": [{"id": 1}]}
+    try:
+        r._check_allowed()
+    except RepaymentScenarioError as e:
+        ok("2 ornaments" in str(e), "part release needs something left to keep")
+    else:
+        raise Fail("part release of a single-ornament loan must be refused")
+    close(s)
+
+def stage_record(stage_name=None, stage_id=None, **master):
+    return {"data": {"masterLoan": {"loanStage": {"name": stage_name}, "loanStageId": stage_id, **master}}}
+
+@test("repayment: ops rating is skipped (no 400) when the loan is already past it")
+def _():
+    s = suite()
+    async def record():
+        return stage_record("partner approval", 18)["data"]
+    s._loan_record = record
+    sent = []
+    async def add():
+        sent.append(1)
+    s.add_ops_rating = add
+    asyncio.run(quiet_async(s.submit_ops_rating))
+    eq(sent, [], "no ops-rating call on a renewal loan already at partner approval")
+    close(s)
+
+@test("repayment: disbursement and submit-packet stop when the server already completed the loan")
+def _():
+    s = suite()
+    async def record():
+        return stage_record("packet submitted", 13)["data"]
+    s._loan_record = record
+    calls = record_requests(s)
+    asyncio.run(quiet_async(s.submit_packet))
+    eq(calls, [], "renewal loan at 'packet submitted': nothing to submit")
+    eq(asyncio.run(quiet_async(s._loan_already_complete, "x")), True, "stage 13 is complete")
+    async def open_record():
+        return stage_record("disbursement pending", 4)["data"]
+    s._loan_record = open_record
+    eq(asyncio.run(quiet_async(s._loan_already_complete, "x")), False, "a fresh loan carries on")
+    close(s)
+
+@test("repayment: bank details pays out only the TOP-UP on a top-up loan (portal toBePaid rule)")
+def _():
+    def run(master):
+        s = suite()
+        fake_uploads(s)
+        s.final_loan_details_data = {"finalLoanAmount": 545954.52, "actualProcessingCharge": 145.95,
+                                     "upfrontInterestAmount": 0, "getBalance": {"customerTransferBalance": 0}}
+        s.stamp_duty_charges = 0
+        async def record():
+            return {"masterLoan": master}
+        async def no_stamp():
+            return None
+        s._loan_record = record
+        s._ensure_stamp_duty = no_stamp
+        calls = record_requests(s)
+        asyncio.run(quiet_async(s.store_bank_details))
+        close(s)
+        return [c[2] for c in calls if c[1] == "/api/loan-process/bank-details"][0]
+    eq(run({})["toBePaid"], 545808.57, "fresh loan: final - processing")
+    eq(run({"isTopUpAdded": True, "isNewLoanFromTopUp": True, "topUpAmount": "145954.52"})["toBePaid"],
+       145808.57, "top-up loan: top-up - processing")
+    eq(run({"isTopUpAdded": True, "isNewLoanFromRenew": True, "topUpAmount": "212453.63"})["toBePaid"],
+       212453.63, "renewal + top-up: no processing / stamp duty taken out")
+
+def bank_body_with_cash(cash=None, limit=500000, multi=True):
+    """store_bank_details on a mocked fresh loan (545954.52, processing 145.95, 2% appraiser charge)."""
+    s = suite(**({"GOLD_LOAN_CASH_AMOUNT": cash} if cash else {}))
+    fake_uploads(s)
+    s.master_loan_id, s.loan_id = "12295", "14300"
+    s.final_loan_details_data = {"finalLoanAmount": 545954.52, "actualProcessingCharge": 145.95,
+                                 "upfrontInterestAmount": 0, "getBalance": {"customerTransferBalance": 0},
+                                 "appraiserChargesApplied": True, "appraiserChargesPercentage": 2,
+                                 "getAdvanceCashParameters": {"totalLimitForCashDisbursal": limit,
+                                                              "multiModeDisbursement": multi}}
+    s.stamp_duty_charges = 0
+    async def record():
+        return {"masterLoan": {}}
+    async def no_stamp():
+        return None
+    s._loan_record = record
+    s._ensure_stamp_duty = no_stamp
+    calls = record_requests(s, lambda path: {"cashReceiptNumber": "CRN00001"} if "cash-receipt" in path
+                            else {"uploadFile": {"path": "uploads/loan/r.pdf", "URL": "http://x/r.pdf",
+                                                 "originalname": "r.pdf"}})
+    try:
+        asyncio.run(quiet_async(s.store_bank_details))
+    finally:
+        close(s)
+    body = [c[2] for c in calls if c[1] == "/api/loan-process/bank-details"][0]
+    return body, [c[1] for c in calls], s
+
+@test("bank-cash: no --cash-amount = the whole amount by bank, no cash fields")
+def _():
+    body, paths, _ = bank_body_with_cash()
+    eq((body["advanceCash"], body["actualCashGiven"], body["appraiserCharges"], body["toBePaid"]),
+       (0, 0, 0, 545808.57), "bank pays everything")
+    ok(not any("cash-receipt" in p for p in paths), "no cash receipt")
+
+@test("bank-cash: part cash lowers toBePaid; 2% appraiser charge; receipt issued and uploaded")
+def _():
+    body, paths, s = bank_body_with_cash("100000")
+    eq((body["advanceCash"], body["actualAppraiserCharges"], body["appraiserCharges"], body["actualCashGiven"]),
+       (100000.0, 2000.0, 2000.0, 98000.0), "portal calculateToBePaidAmount")
+    eq(body["toBePaid"], 445808.57, "available - (cash given + appraiser charges)")
+    eq((body["receiptNumber"], body["advanceCashTransactionId"], body["isDummyDetails"]),
+       ("CRN00001", ["uploads/loan/r.pdf"], False), "receipt number + proof; real bank account kept")
+    ok("/api/loan-process/cash-receipt" in paths, "cash receipt requested")
+
+@test("bank-cash: 'full' pays everything in cash with the portal's dummy bank details")
+def _():
+    body, _, s = bank_body_with_cash("full", limit=1000000)   # TEST's 5L limit would refuse 5.46L
+    eq(body["toBePaid"], 0, "nothing by bank")
+    eq((body["accountNumber"], body["ifscCode"], body["accountHolderName"], body["isDummyDetails"]),
+       ("100000000000", "AUGM0000000", "TO PAID ZERO", True), "addDummyDetails()")
+    ok(s.bank_dummy_details, "ops bank verification will be skipped")
+
+@test("bank-cash: over the cash limit, over the loan, or split without multi-mode is refused")
+def _():
+    for cash, kw, word in (("600000", {}, "limit"), ("100000", {"multi": False}, "multiModeDisbursement")):
+        try:
+            bank_body_with_cash(cash, **kw)
+        except ValueError as e:
+            ok(word in str(e), f"{cash}: {e}")
+        else:
+            raise Fail(f"cash {cash} {kw} must be refused")
+
+@test("bank-cash: a fully-cash loan disburses with the transfer type kept (NEFT), no UTR, no gateway")
+def _():
+    s = suite()
+    s.loan_id, s.master_loan_id, s.final_loan_amount = "14310", "12310", 400000
+    s.cash_given = 399600.0
+    detail = {"securedLoanAmount": "0.00", "finalLoanAmount": 400000, "fullSecuredAmount": 400000,
+              "processingCharge": 400, "actualCashGiven": 391608.0, "appraiserCharges": 7992.0,
+              "advanceCash": 399600, "userBankDetail": {"accountNumber": "100000000000",
+                                                         "ifscCode": "AUGM0000000"}}
+    async def record():
+        return {"masterLoan": {"toBePaid": "0.00"},
+                "partner": {"merchantPayoutConfigs": [{"id": 5, "paymentGateway": "ICICI"}]}}
+    s._loan_record = record
+    calls = record_requests(s, lambda path: {"message": "Your loan amount has been disbursed successfully"})
+    asyncio.run(quiet_async(s._post_partner_disbursement, detail))
+    body = [c[2] for c in calls if c[1].endswith("partner-wise-disbursement")][0]
+    eq(body["finalAmount"], 0, "nothing paid by bank")
+    eq((body["bankTransferType"], body["securedBankTransactionId"], body["paymentGatewayId"]),
+       ("neft", None, None), "mode kept (portal requires it), no UTR, no gateway")
+    close(s)
+
+@test("repayment: disbursement of a top-up loan pays out the top-up (portal calcfinalLoanAmount)")
+def _():
+    # The server's disbursement-loan-bank-detail for top-up loan 14300 (live TEST).
+    body = {"isTopUpAdded": True, "isNewLoanFromRenew": False, "fullSecuredAmount": 545954.52,
+            "fullUnsecuredAmount": 0, "fullSecuredTopUpAmount": 145954.52, "fullUnsecuredTopUpAmount": 0,
+            "processingCharge": 145.95, "totalManualCharges": 0, "upfrontInterestAmount": 0,
+            "advanceBankTransfer": 0, "actualCashGiven": 0, "appraiserCharges": 0,
+            "stampDutyCharges": 0, "bTMoney": 0}
+    G._apply_portal_disbursement_amounts(body)
+    eq(body["finalAmount"], 145808.57, "net = top-up - processing charge")
+    eq(round(body["fullAmount"], 2), 546100.47, "gross = whole loan + charges")
+    fresh = {k: v for k, v in body.items() if not k.endswith("TopUpAmount")}
+    fresh.update(isTopUpAdded=False, fullSecuredAmount=400000, processingCharge=400)
+    G._apply_portal_disbursement_amounts(fresh)
+    eq(fresh["finalAmount"], 399600.0, "fresh loan unchanged: loan - processing")
+    renew = dict(body, isNewLoanFromRenew=True, stampDutyCharges=50, upfrontInterestAmount=10)
+    G._apply_portal_disbursement_amounts(renew)
+    eq(renew["finalAmount"], 145954.52, "renewal + top-up: no processing, upfront or stamp duty taken out")
+
+
+# --------------------------------------------------------------------------------------------
+# GROUP: purpose-scheme -- the scheme must take the loan's purpose type (loanPurposeType)
+# --------------------------------------------------------------------------------------------
+
+PS_CB, PS_IGL = "Consumption Based", "Income Generating"
+PS_PURPOSES = {PS_CB: [{"name": "Marriage"}, {"name": "Medical"}],
+            PS_IGL: [{"name": "Agro"}, {"name": "Test Demo"}]}
+
+@test("purpose-scheme: new loan drops a scheme that does not take the loan's purpose type")
+def _():
+    s = suite()
+    s.purpose_type = PS_IGL
+    ok_cb, why = s._scheme_eligibility({"id": 1, "loanPurposeType": [PS_CB]}, [], 400000)
+    ok_both, _ = s._scheme_eligibility({"id": 2, "loanPurposeType": [PS_CB, PS_IGL]}, [], 400000)
+    ok_none, _ = s._scheme_eligibility({"id": 3}, [], 400000)
+    eq((ok_cb, ok_both, ok_none), (False, True, True), "PS_IGL loan: PS_CB-only out, PS_CB+PS_IGL in, unspecified in")
+    ok("purpose type" in why, f"reason says why: {why}")
+    s.purpose_type = PS_CB
+    eq(s._scheme_eligibility({"id": 1, "loanPurposeType": [PS_CB]}, [], 400000)[0], True, "PS_CB loan keeps it")
+    close(s)
+
+def purpose_repayment(choice="", type_choice="cb"):
+    s, r, _ = repayment("topup")
+    s.purpose_choice, s.purpose_type_choice = choice, type_choice
+    r.purposes = PS_PURPOSES
+    asyncio.run(quiet_async(r.resolve_purpose_type))
+    return s, r
+
+@test("purpose-scheme: the wanted type comes from --purpose (its own type) or --purpose-type")
+def _():
+    for choice, type_choice, expected in (("Agro", "cb", PS_IGL), ("", "igl", PS_IGL), ("", "cb", PS_CB),
+                                          ("", "any", None), ("igl", "cb", PS_IGL)):
+        s, r = purpose_repayment(choice, type_choice)
+        eq(r.wanted_purpose_type, expected, f"--purpose {choice!r} --purpose-type {type_choice}")
+        close(s)
+
+@test("purpose-scheme: top-up / renewal only consider schemes that take the purpose type")
+def _():
+    s, r = purpose_repayment("", "igl")
+    schemes = [{"id": 1, "loanPurposeType": [PS_CB], "netTopUp": "150000", "totalOutstanding": 400000,
+                "schemeAmountStart": "0", "schemeAmountEnd": "1500000"},
+               {"id": 2, "loanPurposeType": [PS_CB, PS_IGL], "netTopUp": "150000", "totalOutstanding": 400000,
+                "schemeAmountStart": "0", "schemeAmountEnd": "1500000"}]
+    eq(r._pick_top_up_scheme(schemes, 0)[0]["id"], 2, "PS_CB-only scheme skipped for an PS_IGL loan")
+    try:
+        r._pick_top_up_scheme(schemes[:1], 0)
+    except RepaymentScenarioError as e:
+        ok("Income Generating" in str(e), f"says which type was missing: {e}")
+    else:
+        raise Fail("no scheme for the type must stop the run")
+    close(s)
+
+@test("purpose-scheme: the purpose is picked within the type (PS_IGL prefers Agro), never switched")
+def _():
+    s, r = purpose_repayment("", "igl")
+    eq(r.pick_purpose({"id": 2, "loanPurposeType": [PS_CB, PS_IGL]}), ("Agro", PS_IGL), "preferred PS_IGL purpose")
+    try:
+        r.pick_purpose({"id": 1, "loanPurposeType": [PS_CB]})
+    except RepaymentScenarioError as e:
+        ok("does not allow" in str(e), "a PS_CB-only scheme is refused, not silently used as PS_CB")
+    else:
+        raise Fail("must not fall back to another purpose type")
+    close(s)
+    s, r = purpose_repayment("Medical", "igl")
+    eq(r.pick_purpose({"id": 2, "loanPurposeType": [PS_CB, PS_IGL]}), ("Medical", PS_CB), "pinned purpose wins")
+    close(s)
+
+
+@test("packets: the partner-branch user is searched in every branch; 404 means 'not this one'")
+def _():
+    s = suite()
+    s.master_loan_id = "10584"
+    tried = []
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        branch = re.search(r"partnerBranchId=(\d+)", path).group(1)
+        tried.append(branch)
+        if branch != "71":
+            raise http_error(404, {"message": "Partner user not found!"}, path)
+        class R:
+            def json(self_inner): return {"data": {"id": 501, "firstName": "QA", "lastName": "Test"},
+                                          "receiverType": "PartnerUser"}
+        return R()
+    s._make_authenticated_request = fake
+    branch, user, kind = asyncio.run(quiet_async(s.find_partner_branch_user, "8888888880", ["66", "71", "80"]))
+    eq((branch, user["id"], kind, tried), ("71", 501, "PartnerUser", ["66", "71"]),
+       "branch 66 404s, the user is found in 71, the search stops there")
+    tried.clear()
+    branch, user, _ = asyncio.run(quiet_async(s.find_partner_branch_user, "8888888880", ["66"]))
+    eq((branch, user), ("66", {}), "no match: first branch, no user (caller warns / stops)")
+    close(s)
+
+
+@test("packets: the packet receiver is a user of the branch, from the admin partner-branch-user list")
+def _():
+    s = suite()
+    s.master_loan_id = "10584"
+    def row(mobile, branch, partner=10):
+        return {"mobileNumber": mobile, "isActive": True, "partner": {"id": partner},
+                "partnerBranch": {"id": branch, "name": f"b{branch}"}}
+    listing = {"Data": [row("7575415140", 66), row("8888888880", 71), row("9638542714", 71),
+                        row("8652849318", 146, partner=152)], "count": 4}
+    tokens, lookups = [], []
+    async def role(kind):
+        return f"tok-{kind}"
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        tokens.append((path.split("?")[0], s.auth_token))
+        if path.startswith("/api/partner-branch-user"):
+            payload = listing
+        else:
+            mobile = re.search(r"mobileNumber=(\d+)", path).group(1)
+            branch = re.search(r"partnerBranchId=(\d+)", path).group(1)
+            lookups.append((mobile, branch))
+            known = {("7575415140", "66"), ("8888888880", "71"), ("9638542714", "71")}
+            if (mobile, branch) not in known:
+                raise http_error(404, {"message": "Partner user not found!"}, path)
+            payload = {"data": {"id": int(mobile[-3:]), "firstName": "U"}, "receiverType": "PartnerUser"}
+        class R:
+            def json(self_inner): return payload
+        return R()
+    s._role_token = role
+    s._make_authenticated_request = fake
+    # loan branch 66 first: the configured 8888888880 is not in it, so 66's own user receives it
+    got = asyncio.run(quiet_async(s.resolve_packet_receiver, 10, ["66", "71"], "8888888880"))
+    eq((got[0], got[3]), ("66", "7575415140"), "a user OF the packet's branch receives it")
+    eq(lookups, [("7575415140", "66")], "no lookups of users from other branches")
+    ok(("/api/partner-branch-user", "tok-admin") in tokens, "list read as admin")
+    # branch 71 first: the configured user belongs to it and is preferred
+    lookups.clear()
+    got = asyncio.run(quiet_async(s.resolve_packet_receiver, 10, ["71", "66"], "8888888880"))
+    eq((got[0], got[3]), ("71", "8888888880"), "configured user used in its own branch")
+    close(s)
+
+
+# --------------------------------------------------------------------------------------------
+# GROUP: session -- saved login sessions (config/session_tokens.json)
+# --------------------------------------------------------------------------------------------
+
+import tempfile  # noqa: E402
+import time  # noqa: E402
+
+def jwt_token(uid=1473, branch=33, ttl=86400):
+    now = int(time.time())
+    return jwt.encode({"id": uid, "internalBranchId": branch, "iat": now, "exp": now + ttl},
+                      "offline-test-signing-key-0123456789abcdef", algorithm="HS256")
+
+def session_suite(path=None, responder=None):
+    """A suite with the session cache ON, on a temp file; OTP logins hand out fresh JWTs."""
+    path = path or os.path.join(tempfile.mkdtemp(), "session_tokens.json")
+    s = suite(GOLD_LOAN_SESSION_CACHE="true", GOLD_LOAN_SESSION_FILE=path)
+    s.auth_token = None
+    s.internal_branch_id = ""
+    calls, issued = [], []
+    async def fake(method, path_, json_data=None, params=None, files=None, headers=None):
+        calls.append((method, path_, s.auth_token))
+        if path_.endswith("user-send-otp"):
+            payload, status = {"referenceCode": "ref"}, 200
+        elif path_.endswith("verify-login"):
+            issued.append(jwt_token(uid=len(issued) + 1))
+            payload, status = {"Token": issued[-1], "userDetails": {"stateId": 1}}, 200
+        else:
+            payload, status = (responder(path_, s.auth_token) if responder else ({}, 200))
+        class R:
+            status_code = status
+            content = b"{}"
+            def json(self_inner): return payload
+        return R()
+    s._make_authenticated_request = fake
+    return s, calls, issued, path
+
+@test("session: a fresh login is saved; the next run reuses it with no OTP")
+def _():
+    s, calls, issued, path = session_suite()
+    asyncio.run(quiet_async(s.login, "8880008881"))
+    eq((s.logins_fresh, s.logins_reused, s.auth_token), (1, 0, issued[0]), "first run logs in")
+    close(s)
+    s2, calls2, _, _ = session_suite(path)
+    asyncio.run(quiet_async(s2.login, "8880008881"))
+    eq((s2.logins_fresh, s2.logins_reused, s2.auth_token), (0, 1, issued[0]), "second run reuses the token")
+    eq(calls2, [], "no OTP call at all")
+    eq((s2.logged_in_user_id, s2.internal_branch_id), (1, "33"), "user id + branch still read from the JWT")
+    close(s2)
+
+@test("session: role tokens are saved per mobile and environment")
+def _():
+    s, _, issued, path = session_suite()
+    asyncio.run(quiet_async(s._role_token, "admin"))
+    close(s)
+    saved = json.load(open(path))
+    key = next(iter(saved))
+    ok(key.startswith("test|"), f"keyed by environment + host: {key}")
+    ok(s._get_mobile_number_for_login_type("admin") in saved[key], "admin's mobile saved")
+    s2, calls2, _, _ = session_suite(path)
+    eq(asyncio.run(quiet_async(s2._role_token, "admin")), issued[0], "admin token reused in the next run")
+    eq(calls2, [], "no OTP")
+    close(s2)
+
+@test("session: an expired (or nearly expired) token is not reused")
+def _():
+    path = os.path.join(tempfile.mkdtemp(), "session_tokens.json")
+    s, _, _, _ = session_suite(path)
+    s._session_store("8880008881", jwt_token(ttl=300), {})   # inside the 10-minute margin
+    asyncio.run(quiet_async(s.login, "8880008881"))
+    eq((s.logins_fresh, s.logins_reused), (1, 0), "logged in again")
+    close(s)
+
+@test("session: a saved token the server rejects (401) is replaced once and the call retried")
+def _():
+    path = os.path.join(tempfile.mkdtemp(), "session_tokens.json")
+    stale = jwt_token(uid=99)
+    s0, _, _, _ = session_suite(path)
+    s0._session_store("8880008881", stale, {})
+    close(s0)
+    s = suite(GOLD_LOAN_SESSION_CACHE="true", GOLD_LOAN_SESSION_FILE=path)
+    sent = []
+    async def gateway(verb, api_path, send_once):
+        auth = s._last_headers.get("Authorization", "")
+        sent.append((api_path, auth[7:19]))
+        if api_path.endswith("verify-login"):
+            body, status = {"Token": jwt_token(uid=5), "userDetails": {}}, 200
+        elif api_path.endswith("user-send-otp"):
+            body, status = {"referenceCode": "r"}, 200
+        else:
+            body, status = {"message": "ok"}, (401 if auth.endswith(stale) else 200)
+        return httpx.Response(status, json=body, request=httpx.Request(verb, "http://h" + api_path))
+    async def capture(verb, api_path, send_once):
+        return await gateway(verb, api_path, send_once)
+    original = s._make_authenticated_request
+    async def spy(method, api_path, json_data=None, params=None, files=None, headers=None):
+        headers = headers if headers is not None else {}
+        s._last_headers = headers
+        return await original(method, api_path, json_data, params, files, headers)
+    s._make_authenticated_request = spy
+    s._send_with_gateway_retry = capture
+    asyncio.run(quiet_async(s.login, "8880008881"))
+    eq(s.auth_token, stale, "the saved token is used first")
+    r = asyncio.run(quiet_async(s._make_authenticated_request, "GET", "/api/global-setting"))
+    eq(r.status_code, 200, "the call succeeds after the re-login")
+    ok(s.auth_token != stale and s.logins_fresh == 1, "one OTP login replaced the token")
+    saved = json.load(open(path))
+    eq(next(iter(saved.values()))["8880008881"]["token"], s.auth_token, "the new token is saved")
+    close(s)
+
+@test("session: --fresh-login (cache off) always uses OTP and saves nothing")
+def _():
+    path = os.path.join(tempfile.mkdtemp(), "session_tokens.json")
+    s, _, _, _ = session_suite(path)
+    s.session_cache_enabled = False
+    asyncio.run(quiet_async(s._role_token, "ops"))
+    eq((s.logins_fresh, s.logins_reused), (1, 0), "OTP login")
+    ok(not os.path.exists(path), "no session file written")
+    close(s)
 
 
 # --------------------------------------------------------------------------------------------

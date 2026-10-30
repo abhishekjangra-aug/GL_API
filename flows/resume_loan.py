@@ -127,9 +127,11 @@ SCHEME_INDEX = STEP_INDEX["scheme"]
 
 
 class ResumeLoanTest:
-    def __init__(self, args):
+    def __init__(self, args, suite=None):
+        """`suite` lets another flow hand over its own logged-in GoldLoanApiTest (the repayment
+        scenarios drive the loan a renewal / top-up / part release opens this way)."""
         self.args = args
-        self.suite = GoldLoanApiTest()
+        self.suite = suite or GoldLoanApiTest()
         self.loan_record = {}
         self.stage_id = None
         self.stage_name = ""
@@ -241,6 +243,11 @@ class ResumeLoanTest:
             suite.partner_id = str(data["partnerId"])
         if data.get("schemeId"):
             suite.scheme_id = str(data["schemeId"])
+        # The loan's purpose (basic details): the scheme step only offers schemes for its type.
+        personal = data.get("loanPersonalDetail") if isinstance(data.get("loanPersonalDetail"), dict) else {}
+        if personal.get("purposeType"):
+            suite.purpose_type = personal["purposeType"]
+            suite.purpose_id = personal.get("purpose") or suite.purpose_id
         # Financials the later steps send back verbatim (toBePaid, loanAmountDigi, ratings).
         for attr, value in (
             ("secured_rpg", data.get("rpg")),
@@ -369,6 +376,37 @@ class ResumeLoanTest:
 
     # ---------------------------------------------------------------- driving it
 
+    async def run_steps(self, steps):
+        """Run the planned steps on the (already logged-in) suite, then read the loan back."""
+        suite = self.suite
+        # Generate this run's packet up front, as harness does -- but only when the loan still
+        # has to be sealed into one (the packet step is in the plan).
+        if any(step.key == "packet" for step in steps):
+            suite._log_step("Generate Packet (admin)")
+            await suite.prepare_packet()
+
+        for step in steps:
+            suite._log_step(f"{step.key} - {step.label}")
+            await step.run(suite)
+
+        suite._log_step("Load Loan Details")
+        await suite.fetch_loan_details()
+
+    async def complete(self, loan_id, master_loan_id="", after_rehydrate=None):
+        """Drive a loan this process already knows by id to completion, in the current session
+        (no login, client left open). `after_rehydrate(suite)` may restore state the record does
+        not carry. Returns the step key it resumed at, or None when nothing was left."""
+        self.suite.loan_id = str(loan_id)
+        self.suite.master_loan_id = str(master_loan_id or "")
+        await self.rehydrate()
+        if after_rehydrate:
+            after_rehydrate(self.suite)
+        steps = self.plan()
+        self.print_plan(steps)
+        if steps:
+            await self.run_steps(steps)
+        return self.resume_key
+
     async def run(self):
         suite = self.suite
         suite._banner("RESUME LOAN", f"env={suite.env_name}, login={self.args.login}")
@@ -388,18 +426,7 @@ class ResumeLoanTest:
                 await suite.fetch_loan_details()
                 return True
 
-            # Generate this run's packet up front, as harness does -- but only when the loan still
-            # has to be sealed into one (the packet step is in the plan).
-            if any(step.key == "packet" for step in steps):
-                suite._log_step("Generate Packet (admin)")
-                await suite.prepare_packet()
-
-            for step in steps:
-                suite._log_step(f"{step.key} - {step.label}")
-                await step.run(suite)
-
-            suite._log_step("Load Loan Details")
-            await suite.fetch_loan_details()
+            await self.run_steps(steps)
             suite._banner("RESULT - PASSED",
                           f"loan resumed from '{self.resume_key}' and completed")
             suite._print_run_metrics(passed=True)
@@ -440,6 +467,8 @@ def build_parser():
                         help="Login role for the main flow (default: appraiser).")
     parser.add_argument("--partner", choices=["roshan", "arvog"], default="roshan",
                         help="Partner whose login disburses the loan (default: roshan).")
+    parser.add_argument("--fresh-login", action="store_true",
+                        help="Ignore the saved login sessions and log every role in with OTP.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Resolve the loan and print the plan without changing anything.")
     parser.add_argument("--list-steps", action="store_true",
@@ -462,6 +491,8 @@ def main():
     # The environment picks the base URL and every role's login mobile, so it has to be set
     # before the suite is constructed.
     os.environ["GOLD_LOAN_ENV"] = args.env
+    if args.fresh_login:
+        os.environ["GOLD_LOAN_SESSION_CACHE"] = "false"
     os.environ["GOLD_LOAN_PARTNER_NAME"] = {"roshan": "ROSHAN PARTNER", "arvog": "ARVOG"}[args.partner]
 
     runner = ResumeLoanTest(args)

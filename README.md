@@ -50,6 +50,11 @@ The flow spans several roles; the harness logs into each one as needed (static O
 | Partner branch user (Roshan) | 8652849318 | 8652849318 | Receives the packet at submit-packet |
 | Partner branch user (Arvog)  | 7777777788 | 8888888880 | Receives the packet at submit-packet |
 
+Each partner branch has its own users. At submit-packet (and when a release collects the packet) the
+receiver is taken from the branch the packet goes to: the loan's own partner branch first, using the
+admin **Partner Branch User** list. The mobile above is preferred when it belongs to that branch;
+otherwise one of that branch's users receives it. `GOLD_LOAN_PARTNER_BRANCH_ID` pins a branch.
+
 `GOLD_LOAN_PARTNER_USER_MOBILE` overrides the branch user if one of these ever changes. Everything
 else about the partner handover (packet location, partner branch id) is resolved from the API at
 runtime, so it needs no per-environment config.
@@ -105,6 +110,7 @@ python flows/e2e_full_loan.py --env uat --customer MS35QNJP # existing customer,
 | `--kyc-profile PATH`| `config/kyc_identity.json` | Real identity data for `auto`/`ovd`.           |
 | `--login ROLE`      | `appraiser` | Login role for the main flow.                                 |
 | `--transfer-mode M` | `neft`      | Disbursement transfer mode: `neft`, `imps` or `rtgs` (manual, with a UTR). |
+| `--cash-amount N\|full` | *(off — all by bank)* | Pay part of the loan in **cash** at bank details (the portal's advance cash), the rest by bank; `full` = all in cash. |
 | `--release-kyc-docs`| off         | TEST/UAT: free the profile's real PAN (+ Aadhaar) before KYC — see below. |
 | `--fresh-request`   | off         | Cancel an existing appraiser request's loan and start a new request. |
 | `--count N`         | `1`         | Create N loans back to back in one logged-in session.          |
@@ -255,7 +261,14 @@ python flows/e2e_full_loan.py --amount 300000
 python flows/e2e_full_loan.py --customer MS35QNJP --amount 550000
 ```
 
-Every run logs in fresh (there is no session cache to reuse or clear).
+**Saved login sessions.** Every role's login token is saved in `config/session_tokens.json`
+(git-ignored, per environment and mobile) and reused by every runner until it is within 10 minutes of
+expiring (tokens last 24 h), so a run normally sends **no OTP at all** and the backend's hourly login
+cap is not spent. Only tokens are saved — never customer / loan / KYC state. If the server rejects a
+saved token (someone logged into the portal with that mobile, or an earlier auth failure ended it),
+the request gets one automatic re-login and is retried. `--fresh-login` (any runner) or
+`GOLD_LOAN_SESSION_CACHE=false` logs every role in with OTP; deleting the file has the same effect once.
+The run summary says how many logins used OTP and how many were reused.
 
 Run `python flows/e2e_full_loan.py --help` for the auto-generated usage.
 
@@ -273,6 +286,9 @@ All optional; sensible defaults are baked in. Common ones:
 | `GOLD_LOAN_AMOUNT`                    | Requested loan amount (also settable via `--amount`)       |
 | `GOLD_LOAN_HTTP_TIMEOUT`              | Seconds to wait for a server reply (default `60`; httpx's own default of 5 s was too short) |
 | `GOLD_LOAN_TRANSFER_MODE`             | Disbursement transfer mode `neft` / `imps` / `rtgs` (also settable via `--transfer-mode`) |
+| `GOLD_LOAN_SESSION_CACHE`             | `false` = ignore the saved login sessions and log in with OTP (also `--fresh-login`; default on) |
+| `GOLD_LOAN_SESSION_FILE`              | Where login sessions are saved (default `config/session_tokens.json`) |
+| `GOLD_LOAN_CASH_AMOUNT`               | Advance cash at bank details, rupees or `full` (also settable via `--cash-amount`; default none = all by bank) |
 | `GOLD_LOAN_RELEASE_KYC_DOCS`          | `true` = free the profile's real PAN (+ Aadhaar) before KYC, TEST/UAT only (also `--release-kyc-docs`) |
 | `GOLD_LOAN_STAMP_DUTY`                | Stamp duty used **only** when the server states none (default `0`, as the portal) |
 | `GOLD_LOAN_CO_LENDER_OVERRIDE_REASON` | Reason sent when a server-default co-lender is overridden / declined |
@@ -305,6 +321,24 @@ file at all:
 
 Paths may be relative to the **project root** or absolute; relative ones are anchored at the repo
 root, so a run works from any working directory.
+
+### Cash at bank details (`--cash-amount`)
+
+By default the whole loan goes to the customer's bank account. `--cash-amount N` hands ₹N over in cash
+at the bank-details step (the portal's **advance cash**) and the bank transfer pays the rest;
+`--cash-amount full` pays everything in cash. Mirrors the portal's bank-details screen:
+
+- to-be-paid = available limit − (cash given + appraiser charges); when the partner applies appraiser
+  charges (TEST: 2 %) they are taken on the cash amount (cash given = cash − charges);
+- a cash receipt number comes from `POST loan-process/cash-receipt` and the signed receipt is uploaded
+  as the advance-cash proof;
+- `full`: to-be-paid 0, the portal's placeholder bank details ("TO PAID ZERO", `AUGM0000000`), no
+  penny-drop and no ops bank verification. At disbursement the transfer type is still sent
+  (`--transfer-mode`, NEFT by default — the portal requires one because the loan's payment mode stays
+  "bank"), but with **no UTR** and no payment gateway, since ₹0 goes by bank;
+- refused up front like the portal: over the branch cash limit (`totalLimitForCashDisbursal`, TEST ₹5L),
+  over the loan amount, on a Godrej (bank 2) co-lender loan, or a cash + bank split when the branch's
+  `multiModeDisbursement` is off.
 
 ## KYC on its own
 
@@ -379,6 +413,68 @@ python flows/kyc_only.py --kyc auto --count 3 --release-kyc-docs     # 3 auto-KY
 
 This detaches the document from whichever customer holds it — use it on test data only.
 
+## Repayment scenarios: renewal, top-up, part release, full release
+
+`flows/e2e_repayment.py` runs one repayment scenario on a **disbursed** loan, exactly as the portal's
+repayment screens do (the request bodies are taken from the portal code; see `gold_loan/repayment.py`).
+Without `--loan` / `--master-loan-id` it first creates a new loan (the full e2e journey) in the same
+session, so every role logs in once.
+
+```bash
+python flows/e2e_repayment.py --scenario renewal                       # new loan, then renew it
+python flows/e2e_repayment.py --scenario renewal-topup --loan AUGM-71513
+python flows/e2e_repayment.py --scenario topup --master-loan-id 12282
+python flows/e2e_repayment.py --scenario part-release --loan AUGM-16432
+python flows/e2e_repayment.py --scenario full-release --loan AUGM-76668 --transfer-mode imps
+```
+
+| Scenario | What happens | New loan? |
+|---|---|---|
+| `renewal` | renewal scheme (`get-top-up-scheme`) → `renewal/amount` → customer **consent OTP** → interest paid (`renewal/submit`) → funds approval (`renewal/amount-status`) → assign appraiser → `renewal/apply-loan` | yes — same amount, new scheme / tenure |
+| `renewal-topup` | as renewal, with the scheme's net top-up added | yes — outstanding + top-up |
+| `topup` | due interest quick-paid and its deposit confirmed → top-up scheme → `loan-process/re-calculate` → consent OTP → `top-up/loan-preview` → `top-up/create-new-loan` → `final-loan-details` (the body the server built) | yes — outstanding + top-up |
+| `part-release` | new-loan scheme (`partner-scheme-amount`, part-release flags) → release summary (`POST jewellery-release`) → paid (`jewellery-release/part-release`) → funds approval → assign appraiser → packet collected from the partner branch and handed to the customer → status `released` → release document → `jewellery-release/apply-loan` | yes — on the ornaments that stay |
+| `full-release` | release summary for every ornament → paid (`jewellery-release/full-release`) → funds approval → assign releaser → packet collected and handed to the customer → status `released` → release document | no — the loan closes |
+
+The new loan is then driven to completion by the resume machinery (`flows/resume_loan.py`): bank
+details, appraiser rating, packet, documents (LIP), ratings, partner approval, disbursement.
+
+How the server treats these loans (found on TEST, mirrored by the harness):
+
+- **Payments are the portal's OFFLINE entries** (NEFT / IMPS / RTGS with a UTR, `--transfer-mode`); no
+  payment gateway. A quick-pay also sends the amount encrypted (`deCryptedAmount`), and stays
+  "Pending" (the interest stays due) until the deposit is confirmed (`quick-pay/confirm-payment`).
+- **A top-up is refused while interest is due**, so the run quick-pays it first, as the portal sends the
+  user to the interest screen.
+- **The approval lists are branch-scoped.** Ops (and the appraiser) on TEST sit in branch 33 and do not
+  see a branch-1 loan's request; the run then approves / assigns as admin and says so (`--approver`).
+- **Renewal loans skip the ops rating** and complete at **partner approval**: the server takes them
+  straight to stage 13 "packet submitted" (no disbursement call, the packet never moves). This held for
+  renewal + top-up too — check with the business whether the top-up money is paid out some other way.
+- **Bank details on a top-up loan pay out only the top-up**: to-be-paid = `masterLoan.topUpAmount` -
+  charges (the old outstanding is carried over). On a renewal with a top-up no processing charge or
+  stamp duty is taken from the payout.
+- **Purpose and scheme stay aligned.** The new loan's purpose type comes from `--purpose` (that purpose's
+  own type) or `--purpose-type` (`cb` default, `igl`, `any`) and is resolved *before* the scheme: only
+  schemes whose `loanPurposeType` takes it are considered, and the purpose is picked inside that type
+  (IGL prefers `Agro`). If no scheme takes the type, the run stops and says so — it never switches type.
+- The consent OTP is the 6-digit admin OTP `123456` (`GOLD_LOAN_CONSENT_OTP`).
+- **One scenario per parent loan.** Before anything is paid the run reads the loan's history (renewal,
+  part-release and full-release lists, as admin) and refuses a parent that already went through any
+  scenario, has an open request of a *different* scenario, or has nothing outstanding (closed, or
+  carried into the loan a renewal / top-up opened). The only re-run allowed is to **finish a scenario
+  that was started on it and is not complete** — that open request is picked up, never placed twice;
+  when the parent's part is done but the renewal / part-release loan it opened is not, the re-run
+  only drives that loan to completion. A rejected request does not count. Use the loan a scenario produced (or a new loan) for the next one.
+
+Live status on TEST: `renewal`, `renewal-topup` and `topup` verified end to end (renewal of 12284 →
+AUGM-16432; renewal + top-up of 12283 → AUGM-76668; top-up of 12293 → loan 14301, ₹1,77,598.40 paid
+out). `part-release` verified through placement, approval, appraiser, packet collection from the
+partner branch, customer hand-over and `released` (request 1823 on 12294, new loan 12300 opened);
+driving that new loan to completion is still to be run. `full-release` has not been run live yet.
+The customer hand-over already stores the release documents (NOC acknowledgement, pawn copy,
+hand-over photo), so the separate document upload is skipped when they are on file.
+
 ## How the harness mirrors the portal
 
 The request bodies were audited against the **live portal code** (screen by screen) and the captured
@@ -392,8 +488,8 @@ traffic. Values the portal pre-fills, looks up or computes are taken from the se
 | Appraiser request | The customer's branch (`internalBranch.id`); for an appraiser login the appraiser id is the login itself. |
 | Basic details / nominee | Branch, appraiser, outstanding, active loans, KYC personal values and signature from `customer-loan-details`; nominee `createdBy` / branch from the basic-details response, an existing nominee reused, guardian fields `null` for an adult nominee. |
 | Ornaments | `currentLtvAmount` = gold rate × global `ltvGoldValue` % (per gram); `netWtAfterPurity` = net weight × LTV %; LTV options from the karat's `range`; `totalEligibleAmt` 0; latitude/longitude sent. |
-| Scheme / eligibility | Loan amount, secured / top-up split, manual charges and billing cycle from `check-loan-type`; eligibility = server's total net weight × scheme rate per gram. |
-| Bank details | Balances, cash limits, charges and **stamp duty from `final-loan-details`** (the server's figure always wins; `0` when none is stated, like the portal); to-be-paid = final amount − (balance transfer + stamp duty + processing charge + upfront interest); bank name from the IFSC lookup; account-holder / customer name from the penny-drop result. |
+| Scheme / eligibility | Only schemes whose `loanPurposeType` includes the loan's purpose type are used (a pinned `--scheme` that does not take it stops the run); loan amount, secured / top-up split, manual charges and billing cycle from `check-loan-type`; eligibility = server's total net weight × scheme rate per gram. |
+| Bank details | Balances, cash limits, charges and **stamp duty from `final-loan-details`** (the server's figure always wins; `0` when none is stated, like the portal); to-be-paid = final amount (on a **top-up** loan: the top-up amount) − (balance transfer + stamp duty + processing charge + upfront interest; a renewal with a top-up keeps processing / stamp duty in the payout); bank name from the IFSC lookup; account-holder / customer name from the penny-drop result. |
 | Ratings | Ops and partner ratings copy the appraiser / BM decisions from the loan record (`single-loan → masterLoan`). Open loan defects (`checkPointers` — problems the server recorded on the loan, which block approval in the portal) are printed as a warning. |
 | Loan lock | Locked at the loan's **current** stage. |
 | Disbursement | `actualProcessingCharge` = processing charge; `finalAmount` = net amount paid out, `fullAmount` = gross with charges; payment gateway id from the partner's payout config; partner id from the partner login; penal interest from `single-loan`; NEFT / IMPS / RTGS with a UTR. |
@@ -401,6 +497,7 @@ traffic. Values the portal pre-fills, looks up or computes are taken from the se
 | Network | 60-second reply timeout (`GOLD_LOAN_HTTP_TIMEOUT`); file uploads are retried after a lost reply, other writes are not (they might already have been applied). |
 
 **Rate limits:** the backend limits logins — one OTP per number per minute, and an hourly cap
+(the saved login sessions above avoid most logins; a cap still blocks the ones that are needed)
 (HTTP 429 "Come back after an hour"). A run logs in once per role and reuses the tokens, but many runs
 back to back can still hit the cap; wait it out (the portal itself keeps working).
 
@@ -429,14 +526,17 @@ A pass means "the requests we build match the ones the browser sent, and the con
 ├── .gitignore
 ├── gold_loan/                    The library (import it; it is not a test).
 │   ├── __init__.py
-│   └── harness.py                GoldLoanApiTest — every API step, signing, encryption — plus the
-│                                 full-loan CLI (main()) that the flows reuse.
+│   ├── harness.py                GoldLoanApiTest — every API step, signing, encryption — plus the
+│   │                             full-loan CLI (main()) that the flows reuse.
+│   └── repayment.py              RepaymentScenarios — renewal, top-up, part / full release on a
+│                                 disbursed loan (wraps GoldLoanApiTest).
 ├── flows/                        Runnable live scenarios, one per file. Naming: e2e_<scenario>.py
 │   │                             for loan journeys, <area>_<action>.py for focused runs.
 │   ├── e2e_full_loan.py          Complete loan: customer/KYC -> ... -> disbursement -> submit packet.
 │   ├── e2e_stop_before_documents.py     Loan up to (not including) Upload Documents.
 │   ├── e2e_stop_before_disbursement.py  Loan up to and including Ops Rating.
 │   ├── resume_loan.py            Finish an in-flight loan from the stage it is at.
+│   ├── e2e_repayment.py          Renewal / renewal + top-up / top-up / part release / full release.
 │   ├── kyc_only.py               KYC only (all three identity modes, no loan process).
 │   ├── kyc_release_documents.py  TEST/UAT: free a PAN / Aadhaar so it can be registered again.
 │   └── create_packets.py         Bulk packet creation + appraiser assignment (admin).
@@ -487,7 +587,7 @@ Generated at runtime, in the project root (git-ignored): `loan_calc_debug.json`,
   confirmed live: the loan steps **after** KYC on the OVD path (where `panCardNumber` is null), and the
   `auto` Aadhaar rule (random 8 + real last 4) — the real PAN was already registered; run it with
   `--release-kyc-docs`.
-- **Deliberately not modelled** (renewal / top-up or webcam-only paths): the "nothing to pay" dummy bank
+- **Deliberately not modelled** (webcam-only and edge paths): the "nothing to pay" dummy bank
   details, geo-tagged webcam uploads, the auto-mode address taken from the Aadhaar XML, and the
   date-of-birth / gender prefills from `e-kyc/data`.
 - For the deep "why", the hard-won domain rules, and per-endpoint gotchas, read
@@ -516,6 +616,7 @@ and `flows/e2e_stop_before_disbursement.py` (stops after ops rating), which reus
 | `--purpose-type` | `cb` \| `igl` \| `any` | `cb` | Loan purpose type: Consumption Based, Income Generating, or either. A random active purpose of that type is chosen. | `GOLD_LOAN_PURPOSE_TYPE` |
 | `--purpose` | purpose name | *(random)* | Pin one purpose by name (e.g. `"Agricultural Purposes"`); its own type is used. Fails with the available list if the environment has no such purpose. | `GOLD_LOAN_PURPOSE` |
 | `--transfer-mode` | `neft` \| `imps` \| `rtgs` | `neft` | Disbursement bank transfer mode: the portal's manual OFFLINE options, with a UTR (ICICI / RazorpayX payouts are not used). | `GOLD_LOAN_TRANSFER_MODE` |
+| `--cash-amount` | rupees \| `full` | *(off)* | Advance cash handed over at bank details; the bank transfer pays the rest (see *Cash at bank details*). | `GOLD_LOAN_CASH_AMOUNT` |
 | `--release-kyc-docs` | *(switch)* | off | TEST/UAT only: before KYC, free the identity profile's real PAN (and full Aadhaar) via `POST /api/e-kyc/remove`, so `--kyc auto` can register them again; allows `--kyc auto --count N`. | `GOLD_LOAN_RELEASE_KYC_DOCS=true` |
 | `--fresh-request` | *(switch)* | off | If the customer already has an appraiser request, cancel its loan and create a new request (default: resume it). | `GOLD_LOAN_FRESH_APPRAISER_REQUEST=true` |
 | `--count` | N | `1` | Create N loans back to back in one logged-in session. A failed loan does not stop the batch. | — |
@@ -570,6 +671,23 @@ and `flows/e2e_stop_before_disbursement.py` (stops after ops rating), which reus
 | `--partner` | `roshan` \| `arvog` | `roshan` | Partner whose login disburses the loan. |
 | `--dry-run` | *(switch)* | off | Resolve the loan and print the plan without changing anything. |
 | `--list-steps` | *(switch)* | off | List the resumable step keys and exit. |
+
+### `flows/e2e_repayment.py` — renewal / top-up / part & full release
+
+| Flag | Values | Default | What it does |
+|---|---|---|---|
+| `--scenario` | `renewal`, `renewal-topup`, `topup`, `part-release`, `full-release` | — (required) | What to do with the loan. |
+| `--loan` | `AUGM-XXXXX` | — | An existing **disbursed** loan. Omit (and `--master-loan-id`) to create a new loan first. |
+| `--master-loan-id` | id | — | The existing loan's master loan id, instead of `--loan`. |
+| `--env` | `test` \| `uat` | `test` | Target environment. |
+| `--login` | role | `appraiser` | Login role for the main flow. |
+| `--partner` | `roshan` \| `arvog` | `roshan` | Partner of the loan (its branch user hands the packet back on a release; disburses the new loan). |
+| `--transfer-mode` | `neft` \| `imps` \| `rtgs` | `neft` | Offline payment mode for the repayment and the new loan's disbursement. |
+| `--cash-amount` | rupees \| `full` | *(off)* | Pay part / all of the NEW loan in cash at bank details. |
+| `--purpose-type` / `--purpose` | as the full-loan flow | `cb` | Purpose of the new loan (limited to the new scheme's purpose types). |
+| `--new-scheme` | scheme id | *(first that fits)* | Pin the scheme the renewal / top-up / part-release loan moves to. |
+| `--approver` | `ops` \| `admin` | `ops` | Who approves the payment and assigns the appraiser; admin is used automatically when ops cannot see the branch's request. |
+| `--customer`, `--amount`, `--scheme` | as the full-loan flow | — | Only when the loan is created first. |
 
 ### Other scripts
 

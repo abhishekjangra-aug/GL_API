@@ -16,7 +16,7 @@ Single-file async Python harness that drives the **Augmont Gold Loan (GL) backen
 - **`flows/`** — runnable LIVE scenarios, one CLI per file. Naming: `e2e_<scenario>.py` for loan
   journeys (`e2e_full_loan`, `e2e_stop_before_documents`, `e2e_stop_before_disbursement`) and
   `<area>_<action>.py` / `<action>_<object>.py` for focused runs (`kyc_only`, `create_packets`,
-  `resume_loan`). No `test_` prefix: these hit the real backend and are not unit tests.
+  `resume_loan`, `e2e_repayment`). No `test_` prefix: these hit the real backend and are not unit tests.
   Each flow puts the project root on `sys.path` and imports `gold_loan.harness`.
 - **`tests/`** — OFFLINE regression tests only (`test_<what>.py`; currently `test_offline_harness.py`,
   run as `python tests/test_offline_harness.py [group-prefix]`). Test names are `"<group>: <behaviour>"`.
@@ -136,11 +136,11 @@ request body, signature and domain rule stays defined once in `gold_loan/harness
 - **`existing_customer_unique_id` / `existing_customer_id` are NOT in `PER_LOAN_STATE`** — they are
   run-wide choices that `run_e2e_test` re-reads each loan; clearing them would turn loans 2..N of a
   `--customer` batch into new-customer runs. A test pins this.
-  No `--customer` → `main()` clears `existing_customer_unique_id` so `run_e2e_test` takes the create-customer + full-KYC path. With `--customer` → resolves that customer and skips KYC if already approved. `--amount` sets `GOLD_LOAN_AMOUNT`. Both modes run the identical end-to-end flow through disbursement → submit-packet → load-loan-details. (The constructor default for `GOLD_LOAN_EXISTING_CUSTOMER_UNIQUE_ID` is now `""` — the bare command creates a new customer, it no longer defaults to MS35QNJP.) **Every run logs in fresh — there is no session/token persistence.**
+  No `--customer` → `main()` clears `existing_customer_unique_id` so `run_e2e_test` takes the create-customer + full-KYC path. With `--customer` → resolves that customer and skips KYC if already approved. `--amount` sets `GOLD_LOAN_AMOUNT`. Both modes run the identical end-to-end flow through disbursement → submit-packet → load-loan-details. (The constructor default for `GOLD_LOAN_EXISTING_CUSTOMER_UNIQUE_ID` is now `""` — the bare command creates a new customer, it no longer defaults to MS35QNJP.) **Login tokens ARE persisted (config/session_tokens.json, TOKENS ONLY — never customer, loan or KYC state (restoring that once caused "PAN already exists")) — see "Saved login sessions".**
 - **Reference/ground-truth data (do NOT modify): `reference/gold-loan-e2e-flow.har` and `reference/ovd-kyc-flow.har`** (the latter captures KYC via an OVD instead of PAN: `verify-dl`/`verify-voter-id`, `panType:"ovd"`, Form 97; it ends at the consent OTP).
   `gold-loan-e2e-flow.har` is one consolidated HAR of the complete journey (customer/KYC → appraiser → ornaments → scheme → final-loan → bank details → assign packet → ratings → loan documents → partner approval → disbursement → submit packet → load details), 244 API calls. Each entry's `comment` tags its stage (A = customer/KYC/loan/bank/packet/docs, B0 = partner approval, B = disbursement, C = submit-packet/load-details). Merged from four captures, so ids differ across stages — it's a step reference, not one live session. The older per-stage HARs / loan-flow JSON were consolidated into this file and removed.
 - Assets (required at runtime, do NOT delete) live in **`assets/`**, resolved via a project-root anchor computed from `__file__` (so CWD-independent): `assets/AADHAR.png` (REAL aadhaar image, 1150x337 — required for KYC upload), `assets/PAN.png`, `assets/scale.jpg` (ornament), `assets/cancelled-cheque-1.png` (bank cheque), `assets/CPV.pdf` (PDF uploads), `assets/dummy_image.png`.
-- Generated at runtime (project root): `loan_calc_debug.json` (eligibility diagnostics dump — read this when debugging final-loan-details). **No session/token files are written — session persistence was removed (it caused stale-state bugs, e.g. a restored `random_pan` → "PAN already exists"; every run logs in fresh).**
+- Generated at runtime (project root): `loan_calc_debug.json` (eligibility diagnostics dump — read this when debugging final-loan-details). `config/session_tokens.json` — saved login TOKENS only (see "Saved login sessions"). The old full-state session persistence stays removed (a restored `random_pan` → "PAN already exists").
 
 ## Environment variables (all `GOLD_LOAN_*`)
 
@@ -197,7 +197,21 @@ The harness runs against **either environment**, chosen with `--env {test|uat}` 
 
 **`_make_authenticated_request(method, api_path, json_data, params, files, headers)`** is the one gateway every endpoint routes through. It:
 - Adds the HMAC signature + auth headers.
-- **No auth retry/relogin.** On 401 it raises with a clear message; the run logs in fresh at the start and there is no mid-flight re-login.
+- **One re-login on a 401, for SAVED tokens only.** If the bearer came from the saved sessions
+  (`_restored_tokens`), `_relogin_after_401` drops it, OTP-logs that mobile in, swaps the new token into
+  `auth_token` / `_role_token_cache`, saves it, and the request is re-sent once (a 401 is refused before
+  processing, so even a write is safe). A token from this run's own OTP login still just raises.
+
+## Saved login sessions (`config/session_tokens.json`)
+- `login()` and `_role_token()` both go through `_session_token(mobile)`: saved + unexpired (JWT `exp`
+  minus `SESSION_EXPIRY_MARGIN` 600 s; tokens live 24 h) -> reuse, no OTP; else `_otp_login` (send-otp ->
+  verify-login, sent WITHOUT a bearer) and `_session_store`. Keyed `"<env>|<BASE_URL>"` -> mobile ->
+  {token, userDetails (state/city for customer creation), expires}. TOKENS ONLY — never customer, loan or KYC state (restoring that once caused "PAN already exists").
+- Off: `--fresh-login` on every runner / `GOLD_LOAN_SESSION_CACHE=false` (old path `_login_with_otp`).
+  `GOLD_LOAN_SESSION_FILE` overrides the path. Run metrics print OTP vs reused login counts.
+- The backend invalidates a token when the same mobile logs in elsewhere (portal) — handled by the
+  401 re-login. Offline tests force the cache OFF and a dummy path; the `session` group opts in with a
+  temp file (a test once leaked fake tokens into the real file — keep that isolation).
 - **Gateway retry (502/503/504 + transport blips), asymmetric on purpose.** nginx answers 502 while the backend restarts, and one blip used to lose a whole run — or a whole `--count` batch (live: `GET /api/customer` 502 killed loan 2, `update-loan-lock` 502 killed loan 1). `_send_with_gateway_retry` retries **GET** on 502/503/504 and on any transport error, with a linear backoff. A **write is NOT retried on a gateway status** — nginx cannot say whether the backend applied it first, and re-sending a create would duplicate a customer/loan/rating, i.e. manufacture the very "already exists" mess the appraiser-request code exists to clean up; it prints a line saying so. A write IS retried on `ConnectError`/`ConnectTimeout` (no connection ⇒ nothing processed) but NOT on a read timeout (the request went out). Tunable: `GOLD_LOAN_GATEWAY_RETRIES` (default 3, `1` disables), `GOLD_LOAN_GATEWAY_RETRY_DELAY` (default 2s).
 - Normalizes the body via `_js_number_normalize` before signing/sending.
 
@@ -344,6 +358,15 @@ This is the most fragile area. Rules verified empirically against captured reque
 - Purpose lists differ per env: TEST has IGL `Agricultural Purposes`/`Agro`/`Test Demo`; UAT has no `Agricultural Purposes` (it has CB `Agriculture`). IGL purposes carry `incomeGeneratingDocumentTypes` (TEST: categories `Agri Loan`/`Proof of Income`/`Business Proof Documents` with `documents` + `hiddenDocuments`).
 - Confirmed live: basic-details ACCEPTS an IGL purpose with `incomeGeneratingDocuments: null` (TEST `Agricultural Purposes`, UAT `TESTING`). Whether IGL documents are demanded later (upload documents) is not yet verified.
 
+- **Scheme ↔ purpose type.** Every scheme lists `loanPurposeType` (partner-scheme-amount, catalog and
+  get-top-up-scheme all carry it). `GoldLoanApiTest.scheme_allows_purpose(scheme, type)`:
+  `_scheme_eligibility` drops schemes not taking `self.purpose_type` (purpose is chosen at basic
+  details, before the scheme step); a pinned `--scheme` that does not take it raises. Resume reads
+  `loanPersonalDetail.purposeType` into `purpose_type`. Repayment: `resolve_purpose_type()` (pinned
+  purpose -> its type; cb/igl alias; any -> None) runs before every scheme pick; schemes are filtered by
+  `scheme_fits_purpose`; `pick_purpose` never switches type (IGL prefers `IGL_PURPOSE`). On TEST a CB
+  loan's partner-scheme-amount returned only CB schemes (85/85) — the server may filter too.
+
 ## Server-sourced request values (no hard-coded examples)
 Request fields are filled from earlier responses, mapped from the HAR (same key + value in a prior response):
 - **basic-details** <- `customer-loan-details` `customerData`: `branchName` (`internalBranch.name`), `tillDateOutstanding`, `currentActiveLoans`, `annualIncome` (`customerKycPersonal.annualIncome`), `age`. Stored as `self.customer_loan_data`.
@@ -379,6 +402,21 @@ Request fields are filled from earlier responses, mapped from the HAR (same key 
 - **`toBePaid` MUST equal `finalLoanAmount − processingCharge − upfrontInterestAmount`** — else bank-details 400s with **"To Be Paid amount is incorrect"**. Do NOT hardcode it. `processingCharge`/`upfrontInterestAmount` are scheme-specific and captured from **check-loan-type** (`data.securedprocessingCharge` = `max(processingChargeFixed, processingChargePercent% × amount)`; `data.upfrontInterestAmount`), stored in `self.secured_processing_charge`/`self.upfront_interest_amount`. `store_bank_details` computes `to_be_paid` and sets `toBePaid`, `availableLimitForDisbuserment` (= toBePaid), `processingCharge`, and `actualProcessingCharge` from these. Confirmed against a 200 capture: final 400000, procCharge 4000 → toBePaid 396000. A scheme with 0 processing charge → toBePaid = finalLoanAmount.
 - **Do NOT trust the validate-account `message` field** — it can read `"Something went wrong"` even on a fully successful verification (`bankTxnStatus: true`). Rely on `bankTxnStatus`, not `message`.
 - **Manual fallback inside `store_bank_details`:** if `bankTxnStatus` is false/absent it sends `isManuallyVerified: true` + `manualVerifiedStatus: "verified"`. This is cosmetic — the server overrides it (see above); the real manual verification is the ops `bank-verification-manual` call. Passbook proof is a cheque PNG image (`CHEQUE_IMAGE_PATH`), not a PDF; `passbookProofImageName` is `[]`.
+
+- **Advance cash (`--cash-amount N|full`, `GOLD_LOAN_CASH_AMOUNT`; default OFF = all by bank).** The
+  portal's bank-details "advance cash" (loans keep `paymentType:["bank"]`; cash is the advance-cash
+  block). `_advance_cash_plan`: charges = cash x `appraiserChargesPercentage`% when
+  `appraiserChargesApplied` (TEST 2%); `actualCashGiven` = cash - charges; toBePaid = available -
+  (actualCashGiven + appraiserCharges). Refused: > `totalLimitForCashDisbursal` (TEST 500000), > loan
+  amount, Godrej co-lender (bank 2), split with `multiModeDisbursement` false. `_issue_cash_receipt`:
+  `POST loan-process/cash-receipt {masterLoanId, paymentFor/type:'Disbursement', amount, appraiserCharges}`
+  -> `cashReceiptNumber` -> `receiptNumber`; receipt PDF uploaded `upload-file?reason=loan&masterLoanId`
+  -> `advanceCashTransactionId/Image/ImageName`. `full` -> toBePaid 0 + addDummyDetails (100000000000 /
+  AUGM0000000 / "TO PAID ZERO", `isDummyDetails` true); `validate_account` and
+  `ops_manual_bank_verification` skip. Disbursement at finalAmount <= 0: `bankTransferType` kept (portal
+  requires it while paymentMode includes 'bank', and lower-cases it), `securedBankTransactionId` None
+  (UTR only required when finalAmount > 0), `paymentGatewayId` None. Part cash live-verified (loan 14302:
+  50000 cash, bank 349600 NEFT + UTR); `full` not yet live.
 
 ## Packet creation, assignment & sealing
 - **Every run generates its own packet first**: `prepare_packet()` (admin create + assign to the logged-in appraiser) runs right after login in `run_e2e_test` and both stop-before runners, and in `flows/resume_loan.py` when the plan includes the `packet` step. `add_packet_images` seals into that packet and only creates one itself if `packet_prepared` is False. `_reset_for_next_loan` clears it, so each loan in a `--count` batch gets a fresh packet.
@@ -418,13 +456,113 @@ After ops rating the loan is disbursed, then the packet is handed to the partner
 - **Partner approval, immediately before disbursement** (`_partner_disbursement_status`, from `partner approval.har`): POST `/api/loan-process/partner-disbursement-status` with the partner signing off — `applicationFormForPartner:true`, `goldValuationForPartner:true`, `loanStatusForPartner:"approved"`, plus the other roles' flags, `loanId`/`masterLoanId`/`loanAmountDigi`/`partnerId`/`loanType:"Fresh Loan"`/`checkPointers:{}`. Response `{"message":"success"}`. Runs inside the partner-token block, right after validate-account. **TOLERANT of an already-advanced stage:** in our flow the ops rating usually moves the loan to "disbursement pending" already, so this call 400s with *"Loan Stage has been changed to: disbursement pending, please re-visit…"*. That IS the state disbursement needs, so `_partner_disbursement_status` catches a 400 containing "disbursement pending" and continues (the successful disbursement HAR never even included this call).
 - **Source the disbursement body from `disbursement-loan-bank-detail.data`** (`fetch_disbursement_bank_detail`) — it carries `finalLoanAmount`, `securedLoanAmount`, `securedLoanUniqueId` (AUGM-…), `securedSchemeName`, `securedLoanId`, `userBankDetail` (customer bank), processing charges, etc. `partner-wise-disbursement` echoes these plus transaction fields: `securedBankTransactionId` (random 15-digit UTR), `securedAmountDisbursedByBank`, `paymentMode:["bank"]`, `bankArray:[{disbursementStatus:"Disbursed to Customer", ...bank}]`, `bankTransferType:"neft"`, `penalInterest:2`, `paymentGatewayId:5`, `partnerId` (152), `actualProcessingCharge` (≈ month-1 secured interest). Response: `{"message":"Your loan amount has been disbursed successfully", data:{interestTable}}`.
 - **Submit packet runs as the APPRAISER** (`submit_packet`): `update-loan-lock` → GET `packet-tracking/view-packets?masterLoanId` (→ barcode + packetUniqueId) → GET `packet-location` list → GET `packet-tracking/get-particular-location?packetLocationId=4&masterLoanId` (→ partnerId/name) → GET `packet-tracking/user-name?mobileNumber=…&receiverType=PartnerUser&partnerBranchId=…` (→ partnerReceiverId + name) → POST `partner-user-otp/send-otp` `{mobileNumber, id:<appraiserId>, type:"updateLocationCollect", masterLoanId}` → POST `partner-user-otp/verify-otp` `{otp:"1234", referenceCode, type:"updateLocationCollect"}` → POST `packet-tracking/submit-packet-location`. Response: `{"message":"packet location submitted"}`.
+- **The partner-branch user is searched across ALL the partner's branches** (`find_partner_branch_user`,
+  used by submit-packet and the release collect step): a user resolves only under their own branch and
+  every other branch answers **404 "Partner user not found!"** (live UAT, Arvog: 8888888880 sits in
+  branch "Test", not the first listed 66). A 404 means "next branch"; it used to abort the step.
+  `GOLD_LOAN_PARTNER_BRANCH_ID` pins one branch.
+- **The packet RECEIVER comes from the branch** (`resolve_packet_receiver`): every partner branch has its
+  own users (admin "Partner Branch User": `GET /api/partner-branch-user?search=&from&to&partnerType=partner`,
+  rows under **`Data`** — capital D — each with `mobileNumber`, `isActive`, `partner.id`,
+  `partnerBranch.id/name`; read as admin, `partner_branch_users`). Branch order: the loan's
+  `masterLoan.partnerBranchId` first, then the partner's other branches; per branch the configured
+  `partner_user_mobiles` number only if it belongs there, then that branch's other users, each confirmed
+  via `user-name`; OTP goes to the confirmed user. No list -> old behaviour (configured mobile, all branches).
 - **Submit-packet collection point is RESOLVED LIVE, not hardcoded** (it differs per env/partner): the packet location id comes from matching `location == "partner branch in"` in the `/api/packet-location` list (`PACKET_LOCATION_NAME`; fallback `PACKET_LOCATION_ID="4"`), and `partnerBranchId` from `get-particular-location`'s `data.partnerBranch[0].id` (fallback `PARTNER_BRANCH_ID="146"` = Roshan/Nerul on test). Both accept env overrides (`GOLD_LOAN_PACKET_LOCATION_ID`, `GOLD_LOAN_PARTNER_BRANCH_ID`). The partner-branch USER mobile comes from `_partner_user_mobile()` (per env + partner; test-Arvog is unknown → raises unless `GOLD_LOAN_PARTNER_USER_MOBILE` is set). `submit-packet-location.barcodeNumber` is `[{Barcode:<UPPER>, packetId:<lower packetUniqueId>}]`.
 - **`loanUniqueId` (AUGM-…) is assigned at the ASSIGN-PACKET stage**, not at disbursement. It's carried in `single-loan.data.loanUniqueId`; since `add_packet_images` calls `fetch_single_loan`, capture `self.loan_unique_id` there. Disbursement's `securedLoanUniqueId` is only a fallback. This id feeds the disbursement body and the final loan-details search.
 - **Load loan details (final step, `fetch_loan_details`)** — goes through `find_loan_row` (see the ladder above), NOT a bare `loan-details` query. **It RAISES when the loan cannot be read back, and when `loan_unique_id` is empty.** Returning `{}` there let a completed run print *"RESULT - PASSED"* while its closing verification silently found nothing (live: `Loan details: no loan found for loanUniqueId=AUGM-59084` followed by PASSED); and the old empty-id fallback took `data[0]` of the unfiltered list, i.e. printed a DIFFERENT loan as if it were this run's. Display fields: `loanStage.name` (**"packet submitted" / id 13 = process complete**), `finalLoanAmount`, `tenure`, `loanStartDate`/`loanEndDate`, `customer` (name/uniqueId/mobile/PAN via `customer` + `customerLoan[0].loanUniqueId`), `appraiser`. A completed run ends at loanStage 13.
 
+## Repayment scenarios (`gold_loan/repayment.py`, `flows/e2e_repayment.py`)
+
+`RepaymentScenarios(suite, scenario, approver_role)` wraps a logged-in `GoldLoanApiTest`; scenarios
+`renewal`, `renewal-topup`, `topup`, `part-release`, `full-release`. Source of truth: the portal's
+`PartReleaseComponent` (repayment screen, chunk c_19), `JewelleryReleaseService` (c_common),
+`PaymentDialogComponent`, `LoanConsentDialogComponent`, `PaymentPreviewComponent`, and the
+funds-approvals screens in c_13 (`UpdateStatusComponent`, `AssignAppraiserComponent`,
+`UpdateLocationComponent`, `UploadDocumentComponent`, `DepositListComponent`). The flow creates a loan
+first when no `--loan/--master-loan-id` is given, then drives any NEW loan with
+`ResumeLoanTest(args, suite).complete(loanId, masterLoanId, after_rehydrate)`.
+
+- **Query strings go in the signed path** (`RepaymentScenarios._q`). httpx `params=` breaks the HMAC
+  -> 401 "auth failed", and that failure ALSO kills the server session (every later call:
+  "Please login first").
+- `GET jewellery-release/<masterLoanId>` = the repayment screen's loan. It MASKS the customer
+  (`customerUniqueId` null, mobile XXXXXX…): take the unique id from the approval-list row
+  (`masterLoan.customer.customerUniqueId`) or `get_customer_by_id`. `isPayableAmount` = interest due.
+- **Approval lists are branch-scoped** (`/api/renewal`, `/api/jewellery-release/part-release|full-release`,
+  `/api/deposit`): ops + the appraiser are branch 33 on TEST and do not see a branch-1 loan's request.
+  `find_request` scans as `approver_role` (default ops), then admin, and sticks to admin. The
+  `search` param on `/api/renewal` is ignored (harmless); only `from`/`to` are sent.
+- **Offline payment** (`offline_payment`) = PaymentDialog `getRawValue()` for NEFT/IMPS/RTGS: bank
+  fields + `transactionId` (UTR, upper-case) + `depositDate` (local time labelled Z); every
+  cash/cheque field null. Never a gateway.
+- **payObject** (`_pay_object`, PartReleaseComponent.apiCall): summary dues (`loanInfo`), new-scheme
+  charges (`actualProcessingCharge` is a 2dp STRING — `toFixed`), stamp duty, `coLenderBankId` (only
+  banks 2/4 are carried), purpose; then `Object.assign(payment, summary.ornamentWeight)` — order matters.
+- **Consent OTP** (renewal / top-up): `customer-otp/send-otp {type:'loanConsent', masterLoanId,
+  transactionType, newLoanAmount, interestRate (LAST schemeInterest rate), tenure}` ->
+  `verify-otp-admin {…, otp:'123456', consentInfo}` (`GOLD_LOAN_CONSENT_OTP`). Live-verified.
+- **Renewal**: `get-top-up-scheme?schemeFor=renewal|renewalPlusTopUp` -> `POST renewal/amount
+  {masterLoanId, ornamentId:[all], newSchemeId, wavier:0, coLenderBankId, topUpAmount}` -> consent
+  -> `renewal/submit` (answer `{renewealLoan:{id,…}}` — sic) -> admin: `update-loan-lock
+  {loanStageId:'renewLoan'}` + `PUT renewal/amount-status {loanRenewalId, amountStatus:'completed',
+  utrNumber}` (form.value = enabled controls only) -> `POST renewal/assign-appraiser` ->
+  `GET renewal/apply-loan/<customerUniqueId>?loanRenewalId=` (server opens the new loan, stage 6).
+  The new loan then needs ornaments -> … -> documents; **the server skips the ops rating (stage goes
+  to 'partner approval') and partner approval alone completes it (stage 13)** — no disbursement, no
+  packet submission. Same for renewal + top-up (open question for the business: is the top-up paid out
+  elsewhere?). Harness: `submit_ops_rating` skips at `PAST_OPS_RATING_STAGES`; `disburse_amount` /
+  `submit_packet` skip via `_loan_already_complete` (stages 12/13/14/20 or `isLoanCompleted`).
+- **Top-up**: refused while interest is due -> quick-pay first: `quick-pay/payable-amount` ->
+  amount = 'tilldate' (penal + GST + `interest` + manual charges) -> `confirm-payment-info` ->
+  `POST quick-pay/payment {masterLoanId, payableAmount, deCryptedAmount, paymentDetails,
+  interestAmountPaidTill:'tilldate'}` — **`deCryptedAmount` = CryptoJS AES of `"<amount>_AUGQ"`
+  (same helper as identity numbers); without it: 500**. The deposit then stays Pending (interest
+  still due) until `POST quick-pay/confirm-payment {transactionId:<deposit row id>, status:'Completed',
+  paymentReceivedDate, masterLoanId, depositAmount:transactionAmont, receivedAmountForBranchId}`.
+  Then `get-top-up-scheme?schemeFor=topup` (skip netTopUp <= 0 or <= minimumTopUpAmount; new
+  amount must sit in the scheme range) -> `loan-process/re-calculate` -> consent ->
+  `top-up/loan-preview` -> `top-up/create-new-loan` -> **POST final-loan-details with the server's
+  `req` verbatim** -> resume at **bank** (`resume_point`). Re-running ornaments/scheme on a top-up
+  loan recomputes it as a fresh loan (toBePaid 400, and it left loan 14300 unable to disburse:
+  "loanOrnamentValuationHistory.disbursedValueOfOrnament cannot be null").
+- **Top-up money rules** (portal BankDetails / Disburse components): bank-details toBePaid base =
+  `masterLoan.topUpAmount` when `isTopUpAdded` (else finalLoanAmount); a renewal with a top-up (or
+  `isLoanAmountToDisbursed`) keeps processing / stamp duty in the payout. Disbursement pays
+  `securedTopUpAmount`; `_apply_portal_disbursement_amounts` uses the top-up principal for
+  `finalAmount`.
+- **Part release** (not yet live): `GET scheme/partner-scheme-amount/<branch>?parentLoanId&isFromRelease=true
+  &masterLoanId&isNewLoanFromPartRelease=true` -> `POST jewellery-release {masterLoanId, ornamentId:[subset],
+  newSchemeId, wavier, coLenderBankId}` -> `jewellery-release/part-release` -> amount-status
+  (`partReleaseId`, lock 'partRelease') -> `jewellery-release/assign-appraiser` -> packet release ->
+  `PUT jewellery-release/appraiser-status {partReleaseId, partReleaseStatus:'released'}` ->
+  `jewellery-release/document` -> `GET jewellery-release/apply-loan/<uid>?partReleaseId=`.
+- **Full release** (not yet live): `POST jewellery-release` (all ornaments, newSchemeId null) ->
+  `jewellery-release/full-release` -> `PUT jewellery-release/full-release/amount-status`
+  (`fullReleaseId`, lock 'fullRelease') -> `assign-releaser` (appraiser stands in: `userType:'appraiser'`,
+  `releaserId` = appraiser id, `appraiserId` dropped) -> packet release -> `releaser-status
+  {fullReleaseStatus:'released'}` -> `full-release/document`.
+- **Packet release** (UpdateLocationComponent, not yet live): collect = `next-packet-location` ->
+  partner-user OTP `updateLocationHandover` -> `POST packet-tracking/packet-release-collect`
+  (locationForm.getRawValue(), barcodes `{Barcode, packetId}`); hand-over = `packet-tracking/customer-info`
+  -> customer OTP `updateLocationCollect` -> `jewellery-release/noc` (acknowledgement path) + photo
+  (`upload-file?reason=user`) -> `POST packet-tracking/packet-release-home-in` (location 7, lat/long,
+  `isPartRelease`/`isFullRelease`).
+- **One scenario per parent loan** (user rule). `claim_parent` (called by every scenario, top-up
+  included, before any payment) reads all three request lists as admin: a finished request
+  (`isRenewalLoanCreated` / `newLoanId` / renewed / released) or an open request of ANOTHER scenario
+  -> refuse; an open request of THIS scenario -> resume it; rejected -> ignored; parent with
+  `outstandingAmount` <= 0 -> refuse. A FINISHED request of this scenario with `newLoanId` (renewal /
+  part release) -> `child_only`: skip to apply-loan and drive the new loan; the flow refuses if that
+  loan is complete too. Release "finished" = status `released` AND `documents` on file — and
+  `packet-release-home-in` itself stores documents / pawnCopy / customerHandOver (live, request 1823),
+  while the server already sets `isLoanCreated`/`newLoanId` at the hand-over (so newLoanId != done).
+  `jewellery-release/document` (needs `customerHandOver` too) is skipped when documents exist.
+  Never re-test a scenario on a used parent; use its child loan.
+
 ## Full E2E order (`run_e2e_test`)
 
-Authentication → (Create Customer **or** Load Existing Customer) → KYC Process → Appraiser Request & Loan Basics (`create_appraiser_request`, `track_loan_history`, `fetch_max_loan_limit`, `store_loan_basic_details`, `store_nominee_details`, `store_ornament_details`) → Scheme/Balance/Loan-Type (`check_loan_type`, `get_interest_rate`, `generate_interest_table`, `get_final_loan_details`) → **Bank Details** (`fetch_bank_details`, **`validate_account`**, `store_bank_details`, `add_appraiser_rating`) → **Assign Packet** (`add_packet_images`, `update_loan_lock`) → **BM Rating if > 5L** (`submit_bm_rating_if_required`, bm login) → **Upload Documents** (`store_loan_documents`) → **Manual Bank Verification** (`ops_manual_bank_verification`, ops login — clears the pending bank verification, else disbursement is blocked) → **Ops Rating** (`submit_ops_rating`, ops login) → **Disbursement** (`disburse_amount`, partner login per env/partner — includes `_partner_disbursement_status` partner approval right before `partner-wise-disbursement`) → **Submit Packet** (`submit_packet`, appraiser — completes the loan) → **Load Loan Details** (`fetch_loan_details`, search by loanUniqueId + display; ends at loanStage 13 "packet submitted"). Order matters: packet is sealed BEFORE BM/ops sign off, docs upload BEFORE ops rating, partner approval BEFORE disbursement, and disbursement BEFORE submit-packet. Ends with run metrics (no session is persisted — every run logs in fresh).
+Authentication → (Create Customer **or** Load Existing Customer) → KYC Process → Appraiser Request & Loan Basics (`create_appraiser_request`, `track_loan_history`, `fetch_max_loan_limit`, `store_loan_basic_details`, `store_nominee_details`, `store_ornament_details`) → Scheme/Balance/Loan-Type (`check_loan_type`, `get_interest_rate`, `generate_interest_table`, `get_final_loan_details`) → **Bank Details** (`fetch_bank_details`, **`validate_account`**, `store_bank_details`, `add_appraiser_rating`) → **Assign Packet** (`add_packet_images`, `update_loan_lock`) → **BM Rating if > 5L** (`submit_bm_rating_if_required`, bm login) → **Upload Documents** (`store_loan_documents`) → **Manual Bank Verification** (`ops_manual_bank_verification`, ops login — clears the pending bank verification, else disbursement is blocked) → **Ops Rating** (`submit_ops_rating`, ops login) → **Disbursement** (`disburse_amount`, partner login per env/partner — includes `_partner_disbursement_status` partner approval right before `partner-wise-disbursement`) → **Submit Packet** (`submit_packet`, appraiser — completes the loan) → **Load Loan Details** (`fetch_loan_details`, search by loanUniqueId + display; ends at loanStage 13 "packet submitted"). Order matters: packet is sealed BEFORE BM/ops sign off, docs upload BEFORE ops rating, partner approval BEFORE disbursement, and disbursement BEFORE submit-packet. Ends with run metrics (incl. OTP vs reused logins).
 
 ## Working conventions (user feedback — honor these)
 
@@ -435,7 +573,7 @@ Authentication → (Create Customer **or** Load Existing Customer) → KYC Proce
 
 ## Method index (quick jump — line numbers drift, Grep to confirm)
 
-Auth/env: `login` (fresh login each run, static OTP 1234), `_role_token` (admin/bm/ops/partner token swap), `_get_mobile_number_for_login_type`, `_partner_key`, `_partner_login_mobile`, `_partner_user_mobile`, `_make_authenticated_request`, `_generate_signature`, `_js_number_normalize`. (Session persistence was removed — no `_save/_load_storage_state`, `_verify_session`, or `_is_token_expired`.)
+Auth/env: `login` (saved session or OTP 1234), `_session_token`/`_otp_login`/`_relogin_after_401` (saved login sessions), `_role_token` (admin/bm/ops/partner token swap), `_get_mobile_number_for_login_type`, `_partner_key`, `_partner_login_mobile`, `_partner_user_mobile`, `_make_authenticated_request`, `_generate_signature`, `_js_number_normalize`. (Full-state session persistence stays removed — no `_save/_load_storage_state`; only tokens are saved.)
 Customer/KYC: `add_customer`, `initiate_kyc`/`_safe_initiate_kyc`, `get_customer_by_id`, `get_kyc_customer_detail`, `save_customer_info`, `save_customer_personal_details`, `save_customer_address`, `submit_all_kyc_info`, `kyc_ops_approval`, `_use_existing_customer`, `_run_full_kyc`, `_existing_customer_kyc_ready`, `_prepare_loan_fields_from_existing`.
 KYC modes/verification: `_load_kyc_profile`, `_validate_kyc_profile`, `_resolve_profile_path`, `_verify_pan_auto`, `_verify_aadhaar_xml_auto`, `_verify_ovd_auto`, `_kyc_iso_dob`, `_kyc_ddmmyyyy_dob`, `_kyc_note`, `_kyc_degrade_to_manual`, `_kyc_document_label`, `_is_duplicate_document_error`, `_abort_on_duplicate_document`, `_duplicate_reason`, `_safe_json`, `_age_from_dob`, `_print_kyc_mode_header`, `_print_kyc_verification_summary`; properties `kyc_identity_type_id`, `kyc_uses_real_identity`; constants `KYC_MODES`, `OVD_CATALOG`, `PAN_TYPES`, `KYC_PROFILE_ENV_KEYS`, `KYC_MODE_REQUIRED_FIELDS`, `DUPLICATE_DOCUMENT_MARKERS`; exception `KycDocumentAlreadyExistsError`.
 Loan: `create_appraiser_request`, `_fetch_existing_appraiser_request`, `store_loan_basic_details`, `store_nominee_details`, `store_ornament_details`, `_fetch_gold_rate`, `_fetch_partner_scheme_amount`, `_apply_scheme`, `fetch_co_lender_banks`, `choose_co_lender_interactive`, `check_loan_type`, `get_interest_rate`, `generate_interest_table`, `get_final_loan_details`, `_dump_loan_calc_diagnostics`, `store_bank_details`, `add_*_rating`/`submit_bm_rating_if_required`/`submit_ops_rating`, `add_packet_images`/`create_packet`/`assign_packet`, `update_loan_lock`, `validate_account`, `ops_manual_bank_verification`, `store_loan_documents`, `disburse_amount`/`_partner_disbursement_status`/`_post_partner_disbursement`, `submit_packet`, `fetch_loan_details`.

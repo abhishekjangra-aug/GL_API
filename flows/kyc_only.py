@@ -290,6 +290,8 @@ def main():
                "\nA loan against the resulting customer is created with:\n"
                "  python flows/e2e_full_loan.py --customer <uniqueId>\n",
     )
+    parser.add_argument("--fresh-login", action="store_true",
+                        help="Ignore the saved login sessions and log every role in with OTP.")
     parser.add_argument("--env", choices=sorted(GoldLoanApiTest.ENVIRONMENTS),
                         default=os.getenv("GOLD_LOAN_ENV", GoldLoanApiTest.DEFAULT_ENV).strip().lower(),
                         help="Target environment (default: %(default)s).")
@@ -337,6 +339,8 @@ def main():
 
     # These are read by the constructor, so set them before it runs.
     os.environ["GOLD_LOAN_ENV"] = args.env
+    if args.fresh_login:
+        os.environ["GOLD_LOAN_SESSION_CACHE"] = "false"
     os.environ["GOLD_LOAN_KYC_MODE"] = args.kyc
     if args.release_kyc_docs:
         os.environ["GOLD_LOAN_RELEASE_KYC_DOCS"] = "true"

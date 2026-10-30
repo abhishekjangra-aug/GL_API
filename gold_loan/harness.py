@@ -6,6 +6,7 @@ import hashlib
 import json
 import random
 import datetime
+import time
 import os
 import sys
 import urllib.parse
@@ -264,6 +265,12 @@ class GoldLoanApiTest:
         # Disbursement transfer mode: the portal's OFFLINE payout options IMPS / NEFT / RTGS (no direct
         # ICICI / RazorpayX access). --transfer-mode / GOLD_LOAN_TRANSFER_MODE, default NEFT.
         self.transfer_mode = (os.getenv("GOLD_LOAN_TRANSFER_MODE") or "neft").strip().lower()
+        # --cash-amount N|full / GOLD_LOAN_CASH_AMOUNT: part of the loan handed over in CASH at the
+        # bank-details step (the portal's "advance cash"); the bank transfer pays the rest. 'full' =
+        # everything in cash (to-be-paid 0, the portal's dummy "TO PAID ZERO" bank details).
+        self.cash_amount_choice = (os.getenv("GOLD_LOAN_CASH_AMOUNT") or "").strip().lower()
+        self.cash_given = 0.0             # advance cash actually sent on bank-details
+        self.bank_dummy_details = False   # True when nothing is paid by bank (full cash)
         # --release-kyc-docs / GOLD_LOAN_RELEASE_KYC_DOCS: free the identity profile's REAL PAN (and full
         # Aadhaar) on TEST/UAT before KYC, so --kyc auto can register them on a new customer again.
         self.release_kyc_docs = os.getenv("GOLD_LOAN_RELEASE_KYC_DOCS", "").lower() in ("1", "true", "yes")
@@ -337,6 +344,18 @@ class GoldLoanApiTest:
         self._forced_co_lender_id = None  # resolved bank id when co-lending is requested
         self._role_token_cache = {}  # mobile -> token, so a role (e.g. admin) logs in ONCE per run
                                      # (the OTP send-endpoint rate-limits repeat requests within a minute)
+        # Saved login sessions (config/session_tokens.json): every role's token is reused across runs
+        # until it expires, so a run does not spend the backend's hourly login allowance. TOKENS ONLY
+        # -- never customer / loan / KYC state (restoring that once caused "PAN already exists").
+        # --fresh-login / GOLD_LOAN_SESSION_CACHE=false turns it off.
+        self.session_cache_enabled = os.getenv("GOLD_LOAN_SESSION_CACHE", "true").strip().lower() \
+            not in ("0", "false", "no", "off")
+        self.session_file = os.getenv("GOLD_LOAN_SESSION_FILE") or os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "session_tokens.json")
+        self._token_mobile = {}        # token -> mobile, to log the right number in again on a 401
+        self._restored_tokens = set()  # tokens that came from the saved sessions
+        self.logins_fresh = 0
+        self.logins_reused = 0
         self.loan_stage_id = ''
         self.loan_unique_id = ''  # e.g. AUGM-67273, captured at disbursement; used to search loan-details
         self.min_loan_amount = 0
@@ -1109,7 +1128,8 @@ class GoldLoanApiTest:
             headers = {}
 
         # Always set/update the Authorization header with the current token. The token comes from the
-        # fresh login at the start of the run; there is no per-request re-login.
+        # login at the start of the run (a saved session or an OTP login); a saved token the server
+        # rejects gets one re-login below.
         if self.auth_token:
             headers['Authorization'] = f'Bearer {self.auth_token}'
         # Else, if no token, Authorization header will not be set. This is fine for initial login steps.
@@ -1151,6 +1171,14 @@ class GoldLoanApiTest:
             return await self.client.put(api_path, json=json_data, headers=headers)
 
         response = await self._send_with_gateway_retry(verb, api_path, send_once)
+
+        if response.status_code == 401 and headers.get('Authorization', '').startswith('Bearer '):
+            # A saved session the server dropped: log that mobile in again and retry ONCE. A 401 is
+            # refused before anything is processed, so re-sending (even a write) is safe.
+            fresh = await self._relogin_after_401(headers['Authorization'][7:])
+            if fresh:
+                headers['Authorization'] = f'Bearer {fresh}'
+                response = await self._send_with_gateway_retry(verb, api_path, send_once)
 
         if response.status_code == 401:
             raise httpx.HTTPStatusError(
@@ -1209,7 +1237,149 @@ class GoldLoanApiTest:
 
     # --- API Call Methods ---
 
+    # ---------------------------------------------------------------- saved login sessions
+
+    SESSION_EXPIRY_MARGIN = 600   # seconds: a token this close to `exp` is not reused
+
+    def _session_key(self) -> str:
+        """Sessions are per backend: the environment plus its host (GOLD_LOAN_BASE_URL may point
+        elsewhere)."""
+        return f"{self.env_name}|{self.BASE_URL}"
+
+    def _load_sessions(self) -> dict:
+        try:
+            with open(self.session_file, encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _write_sessions(self, data: dict) -> None:
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self.session_file)), exist_ok=True)
+            with open(self.session_file, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=1)
+        except OSError as e:
+            print(f"Could not save the login session ({e}); the next run will log in again.")
+
+    @staticmethod
+    def _token_expiry(token: str) -> float:
+        try:
+            return float(jwt.decode(token, options={"verify_signature": False}).get("exp") or 0)
+        except Exception:
+            return 0.0
+
+    def _session_lookup(self, mobile: str):
+        """(token, userDetails) of a saved, unexpired session for `mobile`, else None."""
+        if not self.session_cache_enabled:
+            return None
+        entry = self._load_sessions().get(self._session_key(), {}).get(str(mobile))
+        if not isinstance(entry, dict) or not entry.get("token"):
+            return None
+        expires = self._token_expiry(entry["token"])
+        if expires - self.SESSION_EXPIRY_MARGIN <= time.time():
+            return None
+        return entry["token"], entry.get("userDetails") or {}
+
+    def _session_store(self, mobile: str, token: str, user_details: dict) -> None:
+        if not self.session_cache_enabled:
+            return
+        data = self._load_sessions()
+        data.setdefault(self._session_key(), {})[str(mobile)] = {
+            "token": token, "userDetails": user_details or {},
+            "expires": datetime.datetime.fromtimestamp(self._token_expiry(token)).isoformat(timespec="seconds"),
+        }
+        self._write_sessions(data)
+
+    def _session_drop(self, mobile: str) -> None:
+        data = self._load_sessions()
+        if data.get(self._session_key(), {}).pop(str(mobile), None) is not None:
+            self._write_sessions(data)
+
+    async def _otp_login(self, mobile: str):
+        """user-send-otp -> verify-login (static OTP 1234). Returns (token, userDetails). Sent
+        without a bearer token: a stale one must not ride along when this is a re-login."""
+        saved_token, self.auth_token = self.auth_token, None
+        try:
+            sent = await self._make_authenticated_request(
+                'POST', "/api/user-otp/user-send-otp",
+                json_data={"mobileNumber": mobile, "type": "login", "id": None},
+                headers={'Content-Type': 'application/json'})
+            reference = sent.json().get('referenceCode')
+            assert reference, f"send-otp returned no referenceCode for {mobile}: {sent.json()}"
+            verified = await self._make_authenticated_request(
+                'POST', "/api/auth/verify-login",
+                json_data={"referenceCode": reference, "otp": 1234, "type": "login", "isFromWeb": True},
+                headers={'Content-Type': 'application/json'})
+        finally:
+            self.auth_token = saved_token
+        body = verified.json()
+        token = body.get('Token')
+        assert token, f"verify-login returned no Token for {mobile}: {body}"
+        user_details = body.get('userDetails') or {}
+        self.logins_fresh += 1
+        self._token_mobile[token] = mobile
+        self._user_details_by_token[token] = user_details
+        self._session_store(mobile, token, user_details)
+        return token, user_details
+
+    async def _session_token(self, mobile: str, label: str):
+        """A token for `mobile`: the saved session when it is still valid, else a fresh OTP login."""
+        saved = self._session_lookup(mobile)
+        if saved:
+            token, user_details = saved
+            self.logins_reused += 1
+            self._token_mobile[token] = mobile
+            self._restored_tokens.add(token)
+            self._user_details_by_token[token] = user_details
+            expires = datetime.datetime.fromtimestamp(self._token_expiry(token)).strftime("%d %b %H:%M")
+            print(f"{label}: reusing the saved session for {mobile} (valid until {expires}; no OTP).")
+            return token, user_details
+        print(f"{label}: logging in {mobile} with OTP...")
+        return await self._otp_login(mobile)
+
+    async def _relogin_after_401(self, stale_token: str):
+        """A saved session the server no longer accepts (someone logged in elsewhere with that
+        mobile, or an auth failure ended it): drop it, log that mobile in again, and swap the new
+        token in everywhere the old one was in use. Returns the new token, or None."""
+        mobile = self._token_mobile.get(stale_token)
+        if not mobile or stale_token not in self._restored_tokens:
+            return None
+        print(self._c(f"The saved session for {mobile} was rejected (401); logging in again.", "yellow"))
+        self._restored_tokens.discard(stale_token)
+        self._session_drop(mobile)
+        token, _ = await self._otp_login(mobile)
+        if self.auth_token == stale_token:
+            self.auth_token = token
+        for key, cached in list(self._role_token_cache.items()):
+            if cached == stale_token:
+                self._role_token_cache[key] = token
+        return token
+
     async def login(self, mobile_number: str):
+        """Main-role login. Reuses the saved session for this mobile while it is valid; otherwise
+        the OTP login below (and the new token is saved)."""
+        if self.session_cache_enabled:
+            token, user_details = await self._session_token(mobile_number, "Login")
+            self.auth_token = token
+            self._after_login(mobile_number)
+            return
+        await self._login_with_otp(mobile_number)
+
+    def _after_login(self, mobile_number: str) -> None:
+        """What every main login sets up: the logged-in mobile, user id and branch (from the JWT)."""
+        self.logged_in_mobile_number = mobile_number
+        try:
+            decoded_jwt = jwt.decode(self.auth_token, options={"verify_signature": False})
+            self.logged_in_user_id = decoded_jwt.get('id')
+            self._print_json_block("Decoded JWT Payload", decoded_jwt)
+            if not self.internal_branch_id:
+                self.internal_branch_id = str(decoded_jwt.get("internalBranchId") or "")
+            assert self.internal_branch_id, "The login token did not include internalBranchId."
+        except Exception as e:
+            print(f"Error decoding JWT: {e}")
+
+    async def _login_with_otp(self, mobile_number: str):
         # Step 1: Send OTP
         api_path_send_otp = "/api/user-otp/user-send-otp"
         request_body_send_otp = {
@@ -1250,21 +1420,12 @@ class GoldLoanApiTest:
         response_data_verify_login = response_verify_login.json()
         self.auth_token = response_data_verify_login.get('Token')
         self._user_details_by_token[self.auth_token] = response_data_verify_login.get('userDetails') or {}
+        self.logins_fresh += 1
+        self._token_mobile[self.auth_token] = mobile_number
         print(f"Login successful. New auth_token obtained: {self.auth_token[:10]}...") # Added debug print
         assert self.auth_token, f"Auth Token not found in verify-login response: {response_data_verify_login}"
         print("Login successful. Auth token obtained.")
-        self.logged_in_mobile_number = mobile_number # Set the logged-in mobile number
-
-        # Decode JWT and print relevant fields
-        try:
-            decoded_jwt = jwt.decode(self.auth_token, options={"verify_signature": False})
-            self.logged_in_user_id = decoded_jwt.get('id')
-            self._print_json_block("Decoded JWT Payload", decoded_jwt)
-            if not self.internal_branch_id:
-                self.internal_branch_id = str(decoded_jwt.get("internalBranchId") or "")
-            assert self.internal_branch_id, "The login token did not include internalBranchId."
-        except Exception as e:
-            print(f"Error decoding JWT: {e}")
+        self._after_login(mobile_number)
 
     async def _send_otp_verification(self, ref_code: str):
         # The portal's LeadService.verifyOtp: customer-otp/verify-otp-admin (the old
@@ -4159,10 +4320,21 @@ class GoldLoanApiTest:
         print(f"Fetched scheme catalog: {len(self._scheme_catalog_by_id)} scheme(s) across partners.")
         return self._scheme_catalog_by_id
 
+    @staticmethod
+    def scheme_allows_purpose(scheme, purpose_type) -> bool:
+        """A scheme lists the purpose types it may be used for (loanPurposeType, required on the
+        portal's scheme setup). No purpose type, or a scheme that does not say, is not filtered."""
+        allowed = (scheme or {}).get('loanPurposeType')
+        if not purpose_type or not allowed:
+            return True
+        allowed = allowed if isinstance(allowed, (list, tuple)) else [allowed]
+        return str(purpose_type).strip().lower() in {str(a).strip().lower() for a in allowed}
+
     def _scheme_eligibility(self, scheme, ornament_karats, target_amount):
         """Return (eligible: bool, reason: str) for a candidate, using the catalog config merged
         over the candidate's own fields. Checks: scheme active, requested amount within the scheme's
-        amount range, and every ornament karat within the scheme's [minKarat, maxKarat]."""
+        amount range, every ornament karat within the scheme's [minKarat, maxKarat], and the loan's
+        purpose type among the scheme's loanPurposeType."""
         sid = str(scheme.get('id'))
         cat = getattr(self, "_scheme_catalog_by_id", {}).get(sid, {})
 
@@ -4186,6 +4358,10 @@ class GoldLoanApiTest:
                 return False, f"loan {target_amount:.0f} outside amount range {lo:.0f}-{hi:.0f}"
         except (TypeError, ValueError):
             pass
+
+        if not self.scheme_allows_purpose({'loanPurposeType': pick('loanPurposeType')}, self.purpose_type):
+            return False, (f"purpose type '{self.purpose_type}' not allowed "
+                           f"(scheme takes {pick('loanPurposeType')})")
 
         min_k, max_k = pick('minKarat'), pick('maxKarat')
         if ornament_karats and min_k is not None and max_k is not None:
@@ -4311,6 +4487,14 @@ class GoldLoanApiTest:
         # the full candidate list, so a pinned scheme is used even if the catalog pre-check dropped it).
         if self.forced_scheme_id:
             forced = next((c for c in candidates if str(c.get('id')) == self.forced_scheme_id), None)
+            if forced and not self.scheme_allows_purpose(
+                    {'loanPurposeType': forced.get('loanPurposeType') or getattr(
+                        self, "_scheme_catalog_by_id", {}).get(str(forced.get('id')), {}).get('loanPurposeType')},
+                    self.purpose_type):
+                raise RuntimeError(
+                    f"--scheme {self.forced_scheme_id} does not allow the loan's purpose type "
+                    f"'{self.purpose_type}' (scheme takes {forced.get('loanPurposeType')}). Pick a scheme "
+                    "for that type, or change --purpose / --purpose-type.")
             if forced:
                 self._candidate_schemes = [forced] + [c for c in self._candidate_schemes
                                                       if str(c.get('id')) != self.forced_scheme_id]
@@ -4859,6 +5043,72 @@ class GoldLoanApiTest:
             print(f"Could not write loan-calc debug file: {e}")
 
 
+    def _advance_cash_plan(self, base_amount, available_limit, fld, cash_params, master) -> dict:
+        """The portal's ADVANCE CASH on bank details (calculateToBePaidAmount + setValidation('cash')).
+
+        Cash handed over at the branch reduces what the bank transfer pays:
+            actualAppraiserCharges = cash x appraiserChargesPercentage% (when the partner applies it)
+            actualCashGiven        = cash + waiver(0) - actualAppraiserCharges
+            toBePaid               = availableLimit - (actualCashGiven + appraiserCharges)
+        Refused like the portal: over totalLimitForCashDisbursal, over the loan (or top-up) amount,
+        on a Godrej (bank 2) co-lender loan, or split with the bank when multiModeDisbursement is off.
+        """
+        plan = {"advanceCash": 0, "actualCashGiven": 0, "appraiserCharges": 0, "actualAppraiserCharges": 0,
+                "receiptNumber": "", "receiptPaths": [], "receiptUrls": [], "receiptName": ""}
+        choice = self.cash_amount_choice
+        if not choice or choice in ("0", "none", "off"):
+            return plan
+        applied = bool(fld.get('appraiserChargesApplied'))
+        pct = float(fld.get('appraiserChargesPercentage') or fld.get('appraiserCharges') or 0) if applied else 0.0
+        if choice == "full":
+            # Cash covers the whole payout, its own appraiser charge included:
+            # available = cash - cash*pct + cash*pct  ->  cash = available.
+            cash = available_limit
+        else:
+            try:
+                cash = float(choice)
+            except ValueError:
+                raise ValueError(f"--cash-amount must be a number or 'full', not {choice!r}")
+        cash = self._round_double(cash, 2)
+        limit = float(cash_params.get('totalLimitForCashDisbursal') or 0)
+        if limit and cash > limit:
+            raise ValueError(f"Advance cash {cash} is over the cash limit {limit} "
+                             "(getAdvanceCashParameters.totalLimitForCashDisbursal).")
+        if cash > base_amount:
+            raise ValueError(f"Advance cash {cash} is more than the loan amount {base_amount}.")
+        if master.get('isCoLenderSchemeApplied') and master.get('bankId') == 2:
+            raise ValueError("Cash is not allowed on a Godrej co-lender loan (portal: isCoLenderPartnerValidation).")
+        charges = self._round_double(cash * pct / 100, 2) if cash > 0 else 0.0
+        plan.update(advanceCash=cash, actualAppraiserCharges=charges, appraiserCharges=charges,
+                    actualCashGiven=self._round_double(cash - charges, 2))
+        left = available_limit - (plan["actualCashGiven"] + charges)
+        if cash > 0 and left > 0 and not cash_params.get('multiModeDisbursement', True):
+            raise ValueError("Cash + bank split refused: multiModeDisbursement is off for this branch; "
+                             "use --cash-amount full or no cash.")
+        return plan
+
+    async def _issue_cash_receipt(self, plan: dict) -> None:
+        """downloadReceipt + getFileInfo('cashReceipt'): POST loan-process/cash-receipt gives the
+        receipt number; the signed receipt is uploaded (reason loan, masterLoanId) as the advance-cash
+        transaction proof."""
+        receipt = await self._make_authenticated_request('POST', "/api/loan-process/cash-receipt", json_data={
+            "masterLoanId": int(self.master_loan_id),
+            "paymentFor": "Disbursement",
+            "amount": plan["actualCashGiven"] if plan["actualCashGiven"] > 0 else plan["advanceCash"],
+            "type": "Disbursement",
+            "appraiserCharges": plan["appraiserCharges"],
+        })
+        plan["receiptNumber"] = (receipt.json() or {}).get("cashReceiptNumber") or ""
+        content_type = mimetypes.guess_type(self.DUMMY_PDF_PATH)[0] or "application/pdf"
+        with open(self.DUMMY_PDF_PATH, "rb") as fh:
+            uploaded = await self._make_authenticated_request(
+                'POST', f"/api/upload-file?reason=loan&masterLoanId={self.master_loan_id}",
+                files={"avatar": (os.path.basename(self.DUMMY_PDF_PATH), fh, content_type)})
+        upload = (uploaded.json() or {}).get("uploadFile") or {}
+        plan.update(receiptPaths=[upload.get("path")], receiptUrls=[upload.get("URL")],
+                    receiptName=upload.get("originalname") or os.path.basename(self.DUMMY_PDF_PATH))
+        print(f"Cash receipt {plan['receiptNumber'] or '(no number)'} issued and uploaded.")
+
     async def store_bank_details(self):
         api_path = "/api/loan-process/bank-details"
         # ARVOG: the server's stamp duty must be known before toBePaid is computed below.
@@ -4917,12 +5167,37 @@ class GoldLoanApiTest:
         except (TypeError, ValueError):
             stamp_duty = 0.0
         final_amt = num(fld.get('finalLoanAmount'), self.final_loan_amount)    # res.finalLoanAmount
-        # The portal (bank details): available = final - (bTMoney + advanceBankTransfer + stampDuty +
+        # Renewal / top-up loans (masterLoan flags): a loan with a top-up added only pays out the
+        # TOP-UP, not the whole new loan -- the old outstanding is carried over (live TEST, top-up
+        # loan 14300: 545954.52 new loan, 145954.52 top-up). A renewal with a top-up (or with
+        # isLoanAmountToDisbursed) does not take the processing charge / stamp duty out of the
+        # payout either.
+        master = (await self._loan_record()).get('masterLoan') or {}
+        top_up_added = bool(master.get('isTopUpAdded'))
+        renew_payout = bool(master.get('isNewLoanFromRenew')) and (
+            top_up_added or bool(master.get('isLoanAmountToDisbursed')))
+        base_amount = num(master.get('topUpAmount'), 0) if top_up_added else final_amt
+        # The portal (bank details): available = base - (bTMoney + advanceBankTransfer + stampDuty +
         # processingCharge + upfrontInterest); toBePaid = available - (actualCashGiven + appraiserCharges),
         # where actualCashGiven = advanceCash + waiver - actualAppraiserCharges (all 0 here).
-        available_limit = self._round_double(final_amt - (bt_money + 0 + max(stamp_duty, 0) + proc_charge
-                                                          + max(upfront_interest, 0)), 2)
-        to_be_paid = self._round_double(available_limit - (0 + 0), 2)
+        deductions = bt_money + 0 + (0 if renew_payout else max(stamp_duty, 0) + proc_charge)
+        deductions += max(upfront_interest, 0) if not (master.get('isNewLoanFromRenew') and top_up_added) else 0
+        available_limit = self._round_double(base_amount - deductions, 2)
+        cash = self._advance_cash_plan(base_amount, available_limit, fld, cash_params, master)
+        to_be_paid = self._round_double(available_limit - (cash["actualCashGiven"] + cash["appraiserCharges"]), 2)
+        if cash["advanceCash"]:
+            await self._issue_cash_receipt(cash)
+            print(f"Advance cash {cash['advanceCash']} (appraiser charges {cash['appraiserCharges']}); "
+                  f"to be paid by bank {to_be_paid}.")
+        self.cash_given = cash["advanceCash"]
+        self.bank_dummy_details = cash["advanceCash"] > 0 and to_be_paid <= 0
+        if self.bank_dummy_details:
+            # addDummyDetails(): nothing goes by bank, so the portal fills a placeholder account
+            # and no passbook proof.
+            account_number, ifsc_code = "100000000000", "AUGM0000000"
+            bank_name = bank_branch_name = "AUGMONT"
+            account_holder_name = "TO PAID ZERO"
+            passbook_proofs = []
 
         request_body = {
             "paymentType": ["bank"],
@@ -4947,10 +5222,10 @@ class GoldLoanApiTest:
             "internalBranchBlockedBalance": balance.get('branchTotalBlockedBalance'),
             "advanceBankTransfer": 0,
             "advanceBankTransactionId": None,
-            "advanceCash": 0,
-            "advanceCashTransactionId": [],
-            "advanceCashTransactionImage": [],
-            "advanceCashTransactionImageName": "",
+            "advanceCash": cash["advanceCash"],
+            "advanceCashTransactionId": cash["receiptPaths"],
+            "advanceCashTransactionImage": cash["receiptUrls"],
+            "advanceCashTransactionImageName": cash["receiptName"],
             "advanceCashDeclarationId": [],
             "bTMoney": bt_money,
             "actualProcessingCharge": proc_charge,
@@ -4974,21 +5249,21 @@ class GoldLoanApiTest:
             # ops_manual_bank_verification() clears that pending state in the Ops stage.
             "isManuallyVerified": not getattr(self, "bank_account_verified", False),
             "isVerified": True,
-            "isDummyDetails": False,
+            "isDummyDetails": self.bank_dummy_details,
             "manualVerifiedStatus": "" if getattr(self, "bank_account_verified", False) else "verified",
             "wavier": 0,
             "processingCharge": proc_charge,
-            "receiptNumber": "",
+            "receiptNumber": cash["receiptNumber"],
             "signature": self.signature_proof,
             "pendingAmount": "",
             "totalPledgedGoldAmount": "",
             "extraAmountDisbursed": "",
             "advanceAmount": "",
             "modeOfPayment": "",
-            "appraiserCharges": 0,
-            "actualAppraiserCharges": 0,
+            "appraiserCharges": cash["appraiserCharges"],
+            "actualAppraiserCharges": cash["actualAppraiserCharges"],
             "appraiserChargesPercentage": appraiser_pct or 0,  # final-loan-details appraiserCharges
-            "actualCashGiven": 0,
+            "actualCashGiven": cash["actualCashGiven"],
             "availableLimitForDisbuserment": available_limit,
             "wavierAppraiserCharges": 0,
             "stampDutyCharges": stamp_duty,
@@ -5197,6 +5472,12 @@ class GoldLoanApiTest:
         finally:
             self.auth_token = saved_token
 
+    # Stages a loan only reaches once the ops rating is behind it. A renewal / top-up / part-release
+    # loan goes from upload documents straight to "partner approval" (live TEST, renewal loan
+    # 14298), so the ops rating is already settled for it and the server refuses a second one.
+    PAST_OPS_RATING_STAGES = ("partner approval", "co-lender approval", "disbursement pending",
+                              "disbursement initiated", "partner disbursement", "disbursed")
+
     async def submit_ops_rating(self):
         """Ops rating (final approval) must be posted under the Ops login (per env, OTP 1234).
         Swap to an ops role token for just this call, then restore the appraiser session."""
@@ -5207,7 +5488,18 @@ class GoldLoanApiTest:
                 return await self.add_ops_rating()
             finally:
                 self.auth_token = saved_token
-        await self._with_stage_recovery("ops rating", send)
+        stage = str((((await self._loan_record()).get('masterLoan') or {}).get('loanStage') or {})
+                    .get('name') or '').lower()
+        if stage in self.PAST_OPS_RATING_STAGES:
+            print(f"Ops rating not needed: the loan is already at '{stage}'.")
+            return
+        try:
+            await self._with_stage_recovery("ops rating", send)
+        except httpx.HTTPStatusError as e:
+            stage = self._stage_changed_to(e.response.text or "") if e.response.status_code == 400 else ""
+            if stage not in self.PAST_OPS_RATING_STAGES:
+                raise
+            print(f"Ops rating not needed: the loan is already at '{stage}'.")
 
     async def ops_manual_bank_verification(self, force: bool = False, strict: bool = True):
         """MANUAL bank verification by the OPS team -- clears the pending bank-verification state.
@@ -5230,6 +5522,9 @@ class GoldLoanApiTest:
         used when this runs BEFORE bank-details (store_bank_details' fallback), where the bank
         detail record does not exist yet and the retried bank-details call is the real check.
         """
+        if not force and self.bank_dummy_details:
+            print("Manual bank verification skipped: nothing is paid by bank (full cash, dummy details).")
+            return
         if not force and self.bank_manually_verified and not self.bank_for_ops_approval:
             print("Manual bank verification skipped: account is already manually verified.")
             return
@@ -5325,21 +5620,8 @@ class GoldLoanApiTest:
         if cached:
             print(f"{login_type.capitalize()} authenticated (reusing cached role token).")
             return cached
-        r1 = await self._make_authenticated_request(
-            'POST', "/api/user-otp/user-send-otp",
-            json_data={"mobileNumber": mobile, "type": "login", "id": None},
-            headers={'Content-Type': 'application/json'})
-        ref = r1.json().get('referenceCode')
-        assert ref, f"{login_type} send-otp returned no referenceCode: {r1.json()}"
-        r2 = await self._make_authenticated_request(
-            'POST', "/api/auth/verify-login",
-            json_data={"referenceCode": ref, "otp": 1234, "type": "login", "isFromWeb": True},
-            headers={'Content-Type': 'application/json'})
-        token = r2.json().get('Token')
-        assert token, f"{login_type} verify-login returned no Token: {r2.json()}"
+        token, _ = await self._session_token(mobile, login_type.capitalize())
         self._role_token_cache[mobile] = token
-        self._user_details_by_token[token] = r2.json().get('userDetails') or {}
-        print(f"{login_type.capitalize()} authenticated (role token, not persisted).")
         return token
 
     async def _admin_token(self) -> str:
@@ -6077,6 +6359,9 @@ class GoldLoanApiTest:
     async def validate_account(self):
         """Penny-drop the candidate payout accounts and keep the first usable one.
 
+        Skipped for a FULL-cash loan (--cash-amount full): nothing is paid by bank, the portal uses
+        dummy bank details and treats them as verified.
+
         The penny-drop reaches the REAL bank and rejects accounts unpredictably -- on UAT the
         single hard-coded SBI account answers 400 "Something went wrong", which then blocks
         bank-details with "bank details is not verified" -- so walk the list from
@@ -6093,6 +6378,9 @@ class GoldLoanApiTest:
         left on the first candidate and the flags stay false, so store_bank_details' ops manual
         verification fallback still gets its chance.
         """
+        if self.cash_amount_choice == "full":
+            print("Penny-drop skipped: the whole loan is paid in cash (--cash-amount full).")
+            return
         api_path = "/api/loan-process/validate-account"
         # Passbook proof is a cheque IMAGE (PNG), matching the real call; penny-drop verifies by
         # account/IFSC, not the image. Upload it ONCE, not per candidate, and only when needed:
@@ -6667,9 +6955,29 @@ class GoldLoanApiTest:
             detail = await self.fetch_disbursement_bank_detail()
             await self.validate_account()          # HAR re-runs penny-drop before disbursing
             await self._partner_disbursement_status(detail)  # partner APPROVES, then disburses
+            if await self._loan_already_complete("Disbursement"):
+                return
             await self._post_partner_disbursement(detail)
         finally:
             self.auth_token = saved_token
+
+    # A loan at one of these stages is finished (packet in branch / submitted / branch out /
+    # collect packet).
+    COMPLETED_STAGE_IDS = (12, 13, 14, 20)
+
+    async def _loan_already_complete(self, step: str) -> bool:
+        """True when the server already completed the loan, so `step` has nothing left to do.
+
+        A RENEWAL loan moves no money and its packet never leaves the partner branch: the partner
+        approval alone takes it to stage 13 "packet submitted" (live TEST, loan 14298), and
+        partner-wise-disbursement then answers 400 "Packet has already been submitted"."""
+        master = (await self._loan_record()).get('masterLoan') or {}
+        stage_id = master.get('loanStageId')
+        if master.get('isLoanCompleted') or stage_id in self.COMPLETED_STAGE_IDS:
+            stage = (master.get('loanStage') or {}).get('name') or stage_id
+            print(f"{step} not needed: the server already completed this loan (stage {stage}).")
+            return True
+        return False
 
     async def _partner_disbursement_status(self, detail: dict):
         """Partner APPROVAL, immediately before disbursement (POST /api/loan-process/partner-
@@ -6712,31 +7020,54 @@ class GoldLoanApiTest:
 
     @staticmethod
     def _apply_portal_disbursement_amounts(body: dict) -> None:
-        """The portal's calcfinalLoanAmount for a fresh loan (not renew / top-up):
-            finalAmount = +((fullSecuredAmount + fullUnsecuredAmount) - (processingCharge +
-                           totalManualCharges + upfrontInterestAmount + advanceBankTransfer +
-                           actualCashGiven + appraiserCharges + stampDutyCharges + bTMoney)).toFixed(2)
-            fullAmount  = fullSecuredAmount + fullUnsecuredAmount + processingCharge +
-                          appraiserCharges + stampDutyCharges + totalManualCharges + upfrontInterestAmount
-        i.e. finalAmount is the NET amount paid out and fullAmount the gross with charges."""
+        """The portal's calcfinalLoanAmount: finalAmount is the NET amount paid out, fullAmount the
+        gross with charges.
+
+            finalAmount = principal - (processingCharge* + totalManualCharges + upfrontInterest** +
+                          advanceBankTransfer + actualCashGiven + appraiserCharges + stampDuty*** + bTMoney)
+            fullAmount  = fullSecuredAmount + fullUnsecuredAmount + processingCharge* + appraiserCharges
+                          + stampDutyCharges + totalManualCharges + upfrontInterestAmount
+
+        principal = the TOP-UP (fullSecuredTopUpAmount + fullUnsecuredTopUpAmount) when isTopUpAdded,
+        else the loan (fullSecuredAmount + fullUnsecuredAmount).
+          *   not on a renewal loan with a top-up / isLoanAmountToDisbursed
+          **  not on a renewal loan that adds a top-up
+          *** not on any renewal loan
+        """
         def n(key):
             try:
                 return float(body.get(key) or 0)
             except (TypeError, ValueError):
                 return 0.0
-        principal = n("fullSecuredAmount") + n("fullUnsecuredAmount")
-        deductions = (n("processingCharge") + n("totalManualCharges") + n("upfrontInterestAmount")
-                      + n("advanceBankTransfer") + n("actualCashGiven") + n("appraiserCharges")
-                      + n("stampDutyCharges") + n("bTMoney"))
+        top_up = bool(body.get("isTopUpAdded"))
+        renew = bool(body.get("isNewLoanFromRenew"))
+        renew_payout = renew and (top_up or bool(body.get("isLoanAmountToDisbursed")))
+        if top_up:
+            principal = n("fullSecuredTopUpAmount") + n("fullUnsecuredTopUpAmount")
+        else:
+            principal = n("fullSecuredAmount") + n("fullUnsecuredAmount")
+        processing = 0.0 if renew_payout else n("processingCharge")
+        upfront = 0.0 if (renew and top_up) else n("upfrontInterestAmount")
+        stamp = 0.0 if renew else n("stampDutyCharges")
+        deductions = (processing + n("totalManualCharges") + upfront + n("advanceBankTransfer")
+                      + n("actualCashGiven") + n("appraiserCharges") + stamp + n("bTMoney"))
         body["finalAmount"] = round(principal - deductions + 1e-9, 2)
-        body["fullAmount"] = principal + n("processingCharge") + n("appraiserCharges") + \
-            n("stampDutyCharges") + n("totalManualCharges") + n("upfrontInterestAmount")
+        body["fullAmount"] = (n("fullSecuredAmount") + n("fullUnsecuredAmount") + processing
+                              + n("appraiserCharges") + n("stampDutyCharges") + n("totalManualCharges") + n("upfrontInterestAmount"))
 
     async def _post_partner_disbursement(self, detail: dict):
         api_path = "/api/loan-process/partner-wise-disbursement"
         ubd = detail.get("userBankDetail", {}) if isinstance(detail, dict) else {}
         secured_amount = detail.get("securedLoanAmount") or f"{float(self.final_loan_amount):.2f}"
         final_amount = detail.get("finalLoanAmount") or float(self.final_loan_amount or 0)
+        # A top-up loan pays out only the top-up (securedTopUpAmount, net of charges), as the
+        # portal's disburse form: isLoanAmountToDisbursed ? securedLoanAmount
+        # : isTopUpAdded ? securedTopUpAmount : securedLoanAmount. Sending the whole loan made the
+        # server fail (live TEST, top-up loan 14300).
+        paid_out = secured_amount
+        if (detail.get("isTopUpAdded") and not detail.get("isLoanAmountToDisbursed")
+                and detail.get("securedTopUpAmount") is not None):
+            paid_out = f"{float(detail['securedTopUpAmount']):.2f}"
         # Manually-entered bank UTR/reference (a random numeric string in the HAR).
         bank_txn_id = str(self.random.randint(10**14, 10**15 - 1))
         # penalInterest comes from single-loan (data.penalInterest), as in the web app -- NOT the
@@ -6786,7 +7117,7 @@ class GoldLoanApiTest:
             "securedCashTransactionId": None,
             "securedBankTransactionId": bank_txn_id,
             "securedAmountDisbursedByCash": None,
-            "securedAmountDisbursedByBank": secured_amount,
+            "securedAmountDisbursedByBank": paid_out,
             "securedCashReceiptImage": None, "unsecuredCashReceiptImage": None,
             "securedCashReceiptPath": None, "unsecuredCashReceiptPath": None,
             "unsecuredCashTransactionId": None, "unsecuredBankTransactionId": None,
@@ -6834,6 +7165,15 @@ class GoldLoanApiTest:
             "loanType": self.loan_type or "Fresh Loan",
         }
         self._apply_portal_disbursement_amounts(request_body)
+        if float(request_body.get("finalAmount") or 0) <= 0:
+            # Fully paid in cash (--cash-amount full): nothing goes by bank. The loan's payment mode
+            # stays ["bank"], so the portal still requires a transfer type (NEFT by default) and
+            # lower-cases it on submit -- but the UTR is only required when finalAmount > 0, and no
+            # payment gateway is pre-selected at toBePaid 0. So: mode kept, no UTR, no gateway.
+            request_body["securedBankTransactionId"] = None
+            request_body["paymentGatewayId"] = None
+            print(f"Nothing to pay by bank (full cash): transfer type "
+                  f"{request_body['bankTransferType'].upper()} kept, no UTR, no payment gateway.")
         self.disbursement_summary = {"net": request_body.get("finalAmount"),
                                      "mode": request_body.get("bankTransferType"),
                                      "utr": request_body.get("securedBankTransactionId")}
@@ -6850,12 +7190,97 @@ class GoldLoanApiTest:
     PACKET_LOCATION_ID = "4"          # fallback: "partner branch in" on test
     PARTNER_BRANCH_ID = "146"         # fallback: Roshan / Nerul Navi Mumbai on test
 
+    async def partner_branch_users(self, partner_id) -> dict:
+        """branchId -> [active user mobiles] for one partner, from the admin "Partner Branch User"
+        screen (GET partner-branch-user?search=&from&to&partnerType=partner, rows under `Data`).
+        Every partner branch has its own users; this is where the portal's admin sees them.
+        Read as admin. Returns {} if the list cannot be read (the caller falls back)."""
+        saved = self.auth_token
+        try:
+            self.auth_token = await self._role_token("admin")
+            by_branch, start, size = {}, 1, 100
+            for _ in range(10):
+                answer = await self._make_authenticated_request(
+                    'GET', f"/api/partner-branch-user?search=&from={start}&to={start + size - 1}"
+                           "&partnerType=partner")
+                body = answer.json() if isinstance(answer.json(), dict) else {}
+                rows = body.get("Data") or body.get("data") or []
+                for row in rows:
+                    if not isinstance(row, dict) or row.get("isActive") is False:
+                        continue
+                    if str((row.get("partner") or {}).get("id") or row.get("partnerId")) != str(partner_id):
+                        continue
+                    branch = (row.get("partnerBranch") or {}).get("id") or row.get("partnerBranchId")
+                    if branch and row.get("mobileNumber"):
+                        by_branch.setdefault(str(branch), []).append(str(row["mobileNumber"]))
+                if len(rows) < size:
+                    break
+                start += size
+            return by_branch
+        except (httpx.HTTPStatusError, httpx.TransportError) as e:
+            print(f"Partner branch user list unavailable ({e}); trying the configured partner user.")
+            return {}
+        finally:
+            self.auth_token = saved
+
+    async def resolve_packet_receiver(self, partner_id, branch_ids, preferred_mobile):
+        """The partner-branch user who receives the packet: (branchId, user, receiverType, mobile).
+
+        Branches are tried in order (the loan's own partner branch first, when known); in each, the
+        configured mobile first IF it belongs to that branch, then the branch's other active users,
+        each confirmed with packet-tracking/user-name as the portal does. Without the admin list,
+        falls back to the configured mobile across every branch."""
+        users = await self.partner_branch_users(partner_id)
+        for branch_id in branch_ids:
+            mobiles = users.get(str(branch_id)) or []
+            ordered = ([preferred_mobile] if preferred_mobile in mobiles else []) + \
+                [m for m in mobiles if m != preferred_mobile]
+            for mobile in ordered:
+                branch, user, kind = await self.find_partner_branch_user(mobile, [branch_id])
+                if user:
+                    if mobile != preferred_mobile:
+                        print(f"Packet receiver: {mobile} (a user of partner branch {branch_id}; the "
+                              f"configured {preferred_mobile} is not in that branch).")
+                    return branch, user, kind, mobile
+        branch, user, kind = await self.find_partner_branch_user(preferred_mobile, branch_ids)
+        return branch, user, kind, preferred_mobile
+
+    async def find_partner_branch_user(self, mobile: str, branch_ids):
+        """(branchId, user, receiverType) for the partner-branch user `mobile`. The portal makes you
+        pick the partner branch; a user only resolves under the branch they belong to, and every
+        other branch answers 404 "Partner user not found!" (live UAT, Arvog: user 8888888880 is in
+        branch 'Test', not the first listed branch 66). So every branch is tried, and a 404 just
+        means "not this one". Returns (first branch, {}, 'PartnerUser') when none matches."""
+        tried = []
+        for branch_id in branch_ids:
+            try:
+                answer = await self._make_authenticated_request(
+                    'GET', f"/api/packet-tracking/user-name?mobileNumber={mobile}"
+                           f"&receiverType=PartnerUser&partnerBranchId={branch_id}"
+                           f"&masterLoanId={self.master_loan_id}&allUsers=1")
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code != 404:
+                    raise
+                tried.append(str(branch_id))
+                continue
+            body = answer.json() if isinstance(answer.json(), dict) else {}
+            user = body.get("data")
+            if isinstance(user, dict) and user.get("id"):
+                if tried:
+                    print(f"Partner user {mobile} found in branch {branch_id} "
+                          f"(not in branch(es) {', '.join(tried)}).")
+                return str(branch_id), user, body.get("receiverType") or "PartnerUser"
+            tried.append(str(branch_id))
+        return (str(branch_ids[0]) if branch_ids else ""), {}, "PartnerUser"
+
     async def submit_packet(self):
         """Hand the sealed packet to the partner branch to complete the loan. Runs as the appraiser:
         view packets -> resolve partner location/user -> partner-user OTP (1234) -> submit-packet-
         location. The collection point is resolved from the API for the running environment: the
         "partner branch in" packet location, the selected partner's branch, and that partner's
         branch user (per-environment mobile)."""
+        if await self._loan_already_complete("Submit packet"):
+            return
         await self.update_loan_lock()
 
         # 1. The sealed packet(s) for this loan -> barcode + packetUniqueId for submit-packet-location.
@@ -6896,19 +7321,12 @@ class GoldLoanApiTest:
         else:
             branch_candidates = [str(b.get("id")) for b in (loc_data.get("partnerBranch") or [])
                                  if b.get("id")] or [self.PARTNER_BRANCH_ID]
-        partner_branch_id, un_data = branch_candidates[0], {}
-        receiver_type = "PartnerUser"
-        for candidate in branch_candidates:
-            un = await self._make_authenticated_request(
-                'GET', f"/api/packet-tracking/user-name?mobileNumber={partner_user_mobile}"
-                       f"&receiverType=PartnerUser&partnerBranchId={candidate}"
-                       f"&masterLoanId={self.master_loan_id}&allUsers=1")
-            un_json = un.json() if isinstance(un.json(), dict) else {}
-            data = un_json.get("data")
-            if isinstance(data, dict) and data.get("id"):
-                partner_branch_id, un_data = candidate, data
-                receiver_type = un_json.get("receiverType") or "PartnerUser"
-                break
+            # The loan's own partner branch first (the branch the packet belongs to), when known.
+            loan_branch = str(((await self._loan_record()).get('masterLoan') or {}).get('partnerBranchId') or "")
+            if loan_branch in branch_candidates:
+                branch_candidates = [loan_branch] + [b for b in branch_candidates if b != loan_branch]
+        partner_branch_id, un_data, receiver_type, partner_user_mobile = await self.resolve_packet_receiver(
+            partner_id, branch_candidates, partner_user_mobile)
         partner_receiver_id = un_data.get("id")
         user_full = f"{un_data.get('firstName','')} {un_data.get('lastName','')}".strip()
         print(f"Packet handover -> location {packet_location_id} ({self.PACKET_LOCATION_NAME}), "
@@ -7083,8 +7501,10 @@ class GoldLoanApiTest:
             "Interest Rate": f"{self.interest_rate}%" if self.interest_rate not in (None, "") else "-",
             "Processing Charge": fld.get("actualProcessingCharge", self.secured_processing_charge),
             "Stamp Duty": self.stamp_duty_charges,
-            "Net Disbursed": (f"{disb.get('net')} via {str(disb.get('mode') or '').upper()} (UTR {disb.get('utr')})"
-                              if disb else "-"),
+            "Net Disbursed": ("-" if not disb else
+                              f"0 by bank (cash {self.cash_given})" if float(disb.get('net') or 0) <= 0 else
+                              f"{disb.get('net')} via {str(disb.get('mode') or '').upper()} (UTR {disb.get('utr')})"
+                              + (f" + cash {self.cash_given}" if self.cash_given else "")),
             "Packet": getattr(self, "_created_packet_unique", None) or "-",
             "LIP Assessment": lip,
         }
@@ -7165,7 +7585,7 @@ class GoldLoanApiTest:
         "secured_exposure", "secured_rebate_interest", "loan_start_date", "loan_end_date",
         "max_loan_limit", "min_loan_amount", "max_loan_amount", "purpose_id", "purpose_type",
         "nominee_relation_id", "ornament_type_id", "karat_id", "reference_code",
-        "lead_converter_id",
+        "lead_converter_id", "cash_given", "bank_dummy_details",
     )
 
     def _reset_for_next_loan(self) -> None:
@@ -7315,9 +7735,10 @@ class GoldLoanApiTest:
                 assert self.internal_branch_id, "Supplied token did not include internalBranchId."
                 print("Using supplied authentication token.")
             else:
-                # Always a fresh login (the backend invalidates old sessions, so there is nothing to
-                # reuse). Static OTP 1234.
-                print("Performing fresh login.")
+                # Login: the saved session for this mobile while it is valid, else OTP (the backend
+                # invalidates a session when the same mobile logs in elsewhere -- a 401 then re-logs in).
+                # Static OTP 1234.
+                print("Logging in (saved session or OTP).")
                 await self.login(self._get_mobile_number_for_login_type(login_type))
                 assert self.auth_token, "Login failed: auth_token is empty after login attempt."
 
@@ -7465,6 +7886,8 @@ class GoldLoanApiTest:
             f"  API calls: {self._c(total, 'bold')}   {ok_txt}   {fail_txt}   "
             f"{self._G['pipe']}  verdict: {verdict}"
         )
+        print(f"  Logins: {self.logins_fresh} with OTP, {self.logins_reused} reused from saved sessions"
+              + ("" if self.session_cache_enabled else " (session cache off)"))
         print(self._c(rule, "gray"))
 
         # List every failed endpoint so failures are visible at a glance at the end of the run.
@@ -7582,6 +8005,13 @@ def main():
                         help="Disbursement bank transfer mode (default: %(default)s): the portal's "
                              "manual OFFLINE options NEFT / IMPS / RTGS, with a UTR. ICICI / RazorpayX "
                              "payouts are not used.")
+    parser.add_argument("--fresh-login", action="store_true",
+                        help="Ignore the saved login sessions (config/session_tokens.json) and log every "
+                             "role in with OTP. Default: reuse a role's saved token until it expires.")
+    parser.add_argument("--cash-amount", metavar="N|full",
+                        help="Hand part of the loan over in CASH at bank details (the portal's advance "
+                             "cash; a 2%% appraiser charge may apply) and pay the rest by bank. 'full' = "
+                             "everything in cash. Default: the whole amount by bank transfer.")
     parser.add_argument("--release-kyc-docs", action="store_true",
                         help="TEST/UAT only: before KYC, free the identity profile's REAL PAN (and full "
                              "Aadhaar) from the KYC records (POST /api/e-kyc/remove), so --kyc auto can "
@@ -7621,6 +8051,10 @@ def main():
         os.environ["GOLD_LOAN_FRESH_APPRAISER_REQUEST"] = "true"
     os.environ["GOLD_LOAN_PURPOSE_TYPE"] = args.purpose_type
     os.environ["GOLD_LOAN_TRANSFER_MODE"] = args.transfer_mode
+    if args.cash_amount:
+        os.environ["GOLD_LOAN_CASH_AMOUNT"] = args.cash_amount
+    if args.fresh_login:
+        os.environ["GOLD_LOAN_SESSION_CACHE"] = "false"
     if args.record_har:
         os.environ["GOLD_LOAN_HAR_PATH"] = args.record_har
     if args.release_kyc_docs:
