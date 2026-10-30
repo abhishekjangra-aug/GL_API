@@ -3449,6 +3449,11 @@ class GoldLoanApiTest:
         def describe(items):
             return "; ".join(f"{p['name']} ({p['purposeType']})" for p in items)
 
+        if self.purpose_choice and self.purpose_choice.strip().lower() in tuple(self.PURPOSE_TYPES) + ("any",):
+            # `--purpose cb|igl|any` is a TYPE, not a purpose name: treat it as --purpose-type.
+            print(f"--purpose {self.purpose_choice!r} is a purpose TYPE; using it as --purpose-type.")
+            self.purpose_type_choice = self.purpose_choice.strip().lower()
+            self.purpose_choice = ""
         if self.purpose_choice:
             wanted = self.purpose_choice.lower()
             matches = ([p for p in purposes if p['name'].strip().lower() == wanted]

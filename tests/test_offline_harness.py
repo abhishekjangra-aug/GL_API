@@ -2671,6 +2671,13 @@ def _():
     close(s)
     eq(got, ("Agricultural Purposes", "Income Generating"), "pinned purpose")
 
+@test("purpose: --purpose cb / igl is understood as a purpose TYPE")
+def _():
+    s = purpose_suite(GOLD_LOAN_PURPOSE="cb")
+    seen = {pick_purpose(s)[1] for _ in range(10)}
+    close(s)
+    eq(seen, {"Consumption Based"}, "--purpose cb picks a Consumption Based purpose")
+
 @test("purpose: an unknown purpose name fails and lists what is available")
 def _():
     s = purpose_suite(GOLD_LOAN_PURPOSE="No Such Purpose")
