@@ -3396,6 +3396,29 @@ def _():
         raise Fail("a pinned scheme outside its range must not be used")
     close(s)
 
+@test("repayment: --top-up-amount takes that top-up, within netTopUp, the minimum and the scheme range")
+def _():
+    schemes = [{"id": 1, "netTopUp": "100000", "totalOutstanding": 400000,
+                "schemeAmountStart": "0", "schemeAmountEnd": "1500000"},
+               {"id": 2, "netTopUp": "177776.18", "totalOutstanding": 400000,
+                "schemeAmountStart": "0", "schemeAmountEnd": "1500000"}]
+    for scenario in ("topup", "renewal-topup"):
+        s, r, _ = repayment(scenario)
+        r.top_up_choice = 150000.0
+        scheme, top_up = r._pick_top_up_scheme(schemes, minimum_top_up=0)
+        eq((scheme["id"], top_up), (2, 150000.0), f"{scenario}: scheme 1 (only 100000 eligible) skipped")
+        r.top_up_choice = None
+        eq(r._pick_top_up_scheme(schemes, 0)[1], 100000.0, "no flag: the whole eligible top-up")
+        for bad, minimum, word in ((500, 1000, "minimum"), (900000, 0, "Eligible top-ups")):
+            r.top_up_choice = bad
+            try:
+                r._pick_top_up_scheme(schemes, minimum)
+            except RepaymentScenarioError as e:
+                ok(word in str(e), f"{bad}: {e}")
+            else:
+                raise Fail(f"top-up {bad} must be refused")
+        close(s)
+
 @test("repayment: due interest is quick-paid with deCryptedAmount, then the deposit is confirmed")
 def _():
     state = {"paid": False}

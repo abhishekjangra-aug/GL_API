@@ -533,7 +533,9 @@ first when no `--loan/--master-loan-id` is given, then drives any NEW loan with
   still due) until `POST quick-pay/confirm-payment {transactionId:<deposit row id>, status:'Completed',
   paymentReceivedDate, masterLoanId, depositAmount:transactionAmont, receivedAmountForBranchId}`.
   Then `get-top-up-scheme?schemeFor=topup` (skip netTopUp <= 0 or <= minimumTopUpAmount; new
-  amount must sit in the scheme range) -> `loan-process/re-calculate` -> consent ->
+  amount must sit in the scheme range; `--top-up-amount`/GOLD_LOAN_TOP_UP_AMOUNT = top_up_choice: only
+  schemes with netTopUp >= it, refused if <= 0 or < minimumTopUpAmount; default = netTopUp) ->
+  `loan-process/re-calculate` -> consent ->
   `top-up/loan-preview` -> `top-up/create-new-loan` -> **POST final-loan-details with the server's
   `req` verbatim** -> resume at **bank** (`resume_point`). Re-running ornaments/scheme on a top-up
   loan recomputes it as a fresh loan (toBePaid 400, and it left loan 14300 unable to disburse:

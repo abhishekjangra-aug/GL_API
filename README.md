@@ -426,6 +426,7 @@ session, so every role logs in once.
 python flows/e2e_repayment.py --scenario renewal                       # new loan, then renew it
 python flows/e2e_repayment.py --scenario renewal-topup --loan AUGM-71513
 python flows/e2e_repayment.py --scenario topup --master-loan-id 12282
+python flows/e2e_repayment.py --scenario topup --master-loan-id 12282 --top-up-amount 50000
 python flows/e2e_repayment.py --scenario part-release --loan AUGM-16432
 python flows/e2e_repayment.py --scenario full-release --loan AUGM-76668 --transfer-mode imps
 ```
@@ -694,6 +695,7 @@ and `flows/e2e_stop_before_disbursement.py` (stops after ops rating), which reus
 | `--transfer-mode` | `neft` \| `imps` \| `rtgs` | `neft` | Offline payment mode for the repayment and the new loan's disbursement. |
 | `--cash-amount` | rupees \| `full` | *(off)* | Pay part / all of the NEW loan in cash at bank details. |
 | `--purpose-type` / `--purpose` | as the full-loan flow | `cb` | Purpose of the new loan (limited to the new scheme's purpose types). |
+| `--top-up-amount` | rupees | *(whole eligible top-up)* | `topup` / `renewal-topup` only: the top-up to take. Must be above `minimumTopUpAmount` and within the scheme's eligible top-up (`netTopUp`); schemes that cannot give it are skipped; the new loan = outstanding + this. |
 | `--new-scheme` | scheme id | *(first that fits)* | Pin the scheme the renewal / top-up / part-release loan moves to. |
 | `--approver` | `ops` \| `admin` | `ops` | Who approves the payment and assigns the appraiser; admin is used automatically when ops cannot see the branch's request. |
 | `--customer`, `--amount`, `--scheme` | as the full-loan flow | — | Only when the loan is created first. |

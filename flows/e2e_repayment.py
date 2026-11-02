@@ -62,6 +62,10 @@ def build_parser():
     parser.add_argument("--purpose-type", choices=sorted(GoldLoanApiTest.PURPOSE_TYPES) + ["any"],
                         default="cb", help="Purpose type for the new loan (default: cb).")
     parser.add_argument("--purpose", metavar="NAME", help="Pin the new loan's purpose by name.")
+    parser.add_argument("--top-up-amount", type=float, metavar="N",
+                        help="topup / renewal-topup: the top-up to take (default: the scheme's whole "
+                             "eligible top-up). Must be above the minimum top-up and within what the "
+                             "scheme allows (netTopUp); the new loan = outstanding + this.")
     parser.add_argument("--new-scheme", metavar="SCHEME_ID",
                         help="Pin the scheme the renewal / top-up / part-release loan moves to.")
     parser.add_argument("--fresh-login", action="store_true",
@@ -185,6 +189,10 @@ def main():
     if args.fresh_login:
         os.environ["GOLD_LOAN_SESSION_CACHE"] = "false"
     os.environ["GOLD_LOAN_PURPOSE_TYPE"] = args.purpose_type
+    if args.top_up_amount is not None:
+        if args.scenario not in ("topup", "renewal-topup"):
+            build_parser().error("--top-up-amount only applies to --scenario topup / renewal-topup")
+        os.environ["GOLD_LOAN_TOP_UP_AMOUNT"] = str(args.top_up_amount)
     if args.cash_amount:
         os.environ["GOLD_LOAN_CASH_AMOUNT"] = args.cash_amount
     if args.igl_docs:

@@ -80,6 +80,10 @@ class RepaymentScenarios:
         self.release_info = {}     # the whole jewellery-release/<id> answer (isPayableAmount, ...)
         self.purposes = {}         # /api/purpose, grouped by purpose type
         self.wanted_purpose_type = None   # the new loan's purpose type (None = any)
+        # --top-up-amount / GOLD_LOAN_TOP_UP_AMOUNT: the top-up to take (topup / renewal-topup);
+        # None = the scheme's whole eligible top-up (netTopUp), the portal's pre-filled value.
+        raw_top_up = (os.getenv("GOLD_LOAN_TOP_UP_AMOUNT") or "").strip()
+        self.top_up_choice = round(float(raw_top_up), 2) if raw_top_up else None
         self.scheme = {}           # the chosen scheme (top-up list entry or partner scheme)
         self.summary = {}          # renewal/amount or jewellery-release answer (loanInfo, calculationData, ...)
         self.loan_consent = {}
@@ -594,8 +598,14 @@ class RepaymentScenarios:
 
     def _pick_top_up_scheme(self, schemes, minimum_top_up):
         """The first scheme whose new loan amount lands inside its own range (selectSchemeForToup's
-        check), with a usable net top-up when the scenario adds one."""
+        check), with a usable net top-up when the scenario adds one. With --top-up-amount, only
+        schemes whose netTopUp covers it; the amount must be > 0 and over minimumTopUpAmount
+        (scheme(): 'min' error) -- the portal's limits on the editable top-up field."""
         forced = str(self.suite.forced_scheme_id or "")
+        if self.top_up_choice is not None and self.scenario in ("topup", "renewal-topup") and                 (self.top_up_choice <= 0 or self.top_up_choice < minimum_top_up):
+            raise RepaymentScenarioError(
+                f"--top-up-amount {self.top_up_choice} is below the minimum top-up "
+                f"({minimum_top_up}, global setting minimumTopUpAmount) or not above 0.")
         for scheme in schemes:
             if forced and str(scheme.get("id")) != forced:
                 continue
@@ -608,6 +618,10 @@ class RepaymentScenarios:
             if adds_top_up and (net <= 0 or net <= minimum_top_up):
                 continue
             top_up = net if adds_top_up else 0
+            if adds_top_up and self.top_up_choice is not None:
+                if self.top_up_choice > net:
+                    continue          # portal: topUp error -- more than this scheme's eligible top-up
+                top_up = self.top_up_choice
             new_amount = self._num(scheme.get("totalOutstanding")) + top_up
             if self._num(scheme.get("schemeAmountStart")) <= new_amount <= \
                     self._num(scheme.get("schemeAmountEnd"), float("inf")):
@@ -616,8 +630,11 @@ class RepaymentScenarios:
             f"None of the {len(schemes)} {self.SCHEME_FOR[self.scenario]} schemes fits"
             + (f" (scheme {forced} pinned)" if forced else "")
             + (f" for purpose type {self.wanted_purpose_type!r}" if self.wanted_purpose_type else "")
+            + (f" for a top-up of {self.top_up_choice}" if self.top_up_choice is not None else "")
             + " - the scheme does not take that purpose type, the new loan amount is outside its range,"
-              " or the net top-up is too small.")
+              " or the net top-up is too small"
+            + (". Eligible top-ups: " + ", ".join(f"scheme {s.get('id')}: {s.get('netTopUp')}" for s in schemes[:10])
+               if self.top_up_choice is not None else "") + ".")
 
     @property
     def _ornament_ids(self):
