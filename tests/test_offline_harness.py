@@ -3154,6 +3154,35 @@ def _():
     finally:
         del os.environ["GOLD_LOAN_IGL_DOC_FILES"]
 
+@test("upload-docs: the IGL document name is the file's name, never UAT's storage path")
+def _():
+    uat = {"filename": "public/uploads/customerIncomeGeneratingDocument/1793594209908.pdf",
+           "originalname": "CPV.pdf",
+           "path": "public/uploads/customerIncomeGeneratingDocument/1793594209908.pdf"}
+    eq(G._upload_display_name(uat), "CPV.pdf", "UAT (S3): the uploaded file's own name")
+    eq(G._upload_display_name({"filename": "1793278135390.pdf",
+                               "path": "uploads/customerIncomeGeneratingDocument/1793278135390.pdf"}),
+       "1793278135390.pdf", "TEST without originalname: the bare file name")
+    eq(G._upload_display_name({"path": "public/uploads/x/9.pdf"}), "9.pdf", "only a path: its last part")
+
+@test("upload-docs: uploads pick random assets/ files; identity / bank images and packet photos stay fixed")
+def _():
+    s = suite()
+    pdfs = {os.path.basename(p) for p in s.asset_pool("pdf")}
+    images = {os.path.basename(p).lower() for p in s.asset_pool("image")}
+    packets = {os.path.basename(p).lower() for p in s.asset_pool("packet")}
+    ok(pdfs and all(n.lower().endswith(".pdf") for n in pdfs), "every PDF in assets/ is a candidate")
+    ok(not images & G.RESERVED_ASSETS, "Aadhaar / PAN / Voter ID / cheque never used at random")
+    ok(packets and all(any(m in n for m in G.PACKET_ASSET_MARKERS) for n in packets),
+       "packet photos are the pouch / packet images")
+    ok(not images & packets, "packet photos are not used for other uploads")
+    picks = {os.path.basename(s.random_asset("pdf")) for _ in range(60)}
+    ok(len(picks) > 1, f"random across the pool, not one fixed file ({picks})")
+    s.ASSETS_DIR = os.path.join(ROOT, "__no_assets__")
+    eq((s.random_asset("pdf"), s.random_asset("image")), (s.DUMMY_PDF_PATH, s.DUMMY_IMAGE_PATH),
+       "no assets folder: the built-in dummies")
+    close(s)
+
 @test("upload-docs: a stamp-paper stamp duty sends the stamp paper copy")
 def _():
     body = run_loan_documents(single_loan(stampDutyDefinitionType="stampPaper"))

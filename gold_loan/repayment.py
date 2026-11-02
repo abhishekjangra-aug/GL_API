@@ -1001,7 +1001,7 @@ class RepaymentScenarios:
             "otp": suite.CUSTOMER_OTP, "referenceCode": reference, "type": "updateLocationCollect"})
         noc = await self._get("/api/jewellery-release/noc", masterLoanId=self.master_loan_id,
                               type="", documentFrom="NOC")
-        hand_over = await self._upload({"reason": "user"}, suite.DUMMY_IMAGE_PATH)
+        hand_over = await self._upload({"reason": "user"}, suite.random_asset("image"))
         home_in = self._location_form(self.CUSTOMER_HOME_LOCATION_ID, packets, loan_id)
         home_in.update({
             "id": customer.get("id"), "receiverType": customer.get("receiverType") or "Customer",
@@ -1081,10 +1081,10 @@ class RepaymentScenarios:
         id_key = "partReleaseId" if part else "fullReleaseId"
         reason = "partRelease" if part else "fullRelease"
         params = {"reason": reason, id_key: self.request_id}
-        acknowledgement = await self._upload(params, self.suite.DUMMY_PDF_PATH, full=True)
+        acknowledgement = await self._upload(params, self.suite.random_asset("pdf"), full=True)
         # The form marks only the acknowledgement required, but the server also demands the
         # customer hand-over photo (400 "customerHandOver is required", live TEST).
-        hand_over = await self._upload(params, self.suite.DUMMY_IMAGE_PATH, full=True)
+        hand_over = await self._upload(params, self.suite.random_asset("image"), full=True)
         body = {"partReleaseId": self.request_id if part else None,
                 "fullReleaseId": None if part else self.request_id,
                 "documents": [acknowledgement["path"]], "documentsName": acknowledgement["originalname"],

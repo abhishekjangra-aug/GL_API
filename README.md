@@ -550,12 +550,19 @@ A pass means "the requests we build match the ones the browser sent, and the con
 │   ├── offline_aadhar.xml        UIDAI offline e-KYC XML (--kyc auto).
 │   └── form-97.pdf               Form 97 upload (--kyc ovd).
 ├── assets/                       Files uploaded during the flow (resolved relative to the project root).
-│   ├── AADHAR.png                Real aadhaar image (required for the KYC identity-proof upload).
-│   ├── PAN.png                   PAN card image.
-│   ├── scale.jpg                 Ornament image (gold on a scale).
-│   ├── cancelled-cheque-1.png    Cancelled cheque (bank-details proof).
-│   ├── CPV.pdf                   PDF used for document uploads (loan docs, income, CPV).
-│   └── dummy_image.png           Generic image placeholder for uploads.
+│   │                             Every generic upload picks a RANDOM file of the right type from here
+│   │                             (read each run, so new files are used automatically):
+│   │                               PDF uploads (loan docs, IGL income docs, cash receipt, release docs)
+│   │                               -> any *.pdf; image uploads (ornament photo, hand-over photo, ...)
+│   │                               -> any image except the fixed ones below; packet photos -> files with
+│   │                               "pouch" / "packet" in the name.
+│   ├── AADHAR.png                FIXED: real aadhaar image (the KYC identity-proof upload is checked).
+│   ├── PAN.png                   FIXED: PAN card image.
+│   ├── voter-card.jpg            FIXED: voter ID image.
+│   ├── cancelled-cheque-1.png    FIXED: cancelled cheque (bank-details proof).
+│   ├── high-security-gold-loan-pouch.jpg   Packet photos (the four sealed-packet images).
+│   ├── scale.jpg, dummy_image.png          Generic images.
+│   └── *.pdf                     CPV, pawn ticket, Form 60, LIP, sample ... - generic PDFs.
 ├── reference/
 │   ├── gold-loan-e2e-flow.har    Consolidated HAR of the complete flow (API-only) — the ground-truth
 │   │                             reference for request/response shapes. Each entry's `comment` tags

@@ -160,6 +160,7 @@ class GoldLoanApiTest:
         self.PAN_IMAGE_PATH = os.path.join(_assets, "PAN.png")                   # KYC PAN card
         self.ORNAMENT_IMAGE_PATH = os.path.join(_assets, "scale.jpg")           # loan ornament image (gold on scale)
         self.CHEQUE_IMAGE_PATH = os.path.join(_assets, "cancelled-cheque-1.png")  # bank details (cancelled cheque)
+        self.ASSETS_DIR = _assets
         # Candidate customer payout accounts for the penny-drop (see _load_bank_accounts).
         self.BANK_ACCOUNTS_PATH = os.path.join("reference", "bank_accounts.json")
         self.DEFAULT_BANK_ACCOUNT = {"label": "SBI - LIC MUTUAL FUND POOL A/C.",
@@ -1520,6 +1521,41 @@ class GoldLoanApiTest:
         print(f'Fetched status_id for "confirm": {self.status_id}')
 
 
+    # assets/ files that stand for one specific document and are never picked at random: the server
+    # checks the Aadhaar image, and PAN / Voter ID / cheque are what their uploads claim to be.
+    RESERVED_ASSETS = {"aadhar.png", "pan.png", "voter-card.jpg", "cancelled-cheque-1.png"}
+    PACKET_ASSET_MARKERS = ("pouch", "packet")      # packet photos (sealed-packet images)
+    IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg")
+
+    def asset_pool(self, kind: str) -> list:
+        """Files in assets/ usable for an upload of `kind`, read fresh each time so new files are
+        picked up: 'pdf' = every PDF; 'image' = every image except the reserved identity / bank
+        images and the packet photos; 'packet' = the packet photos (falls back to 'image')."""
+        try:
+            names = sorted(os.listdir(self.ASSETS_DIR))
+        except OSError:
+            names = []
+        def full(n):
+            return os.path.join(self.ASSETS_DIR, n)
+        if kind == "pdf":
+            pool = [full(n) for n in names if n.lower().endswith(".pdf")]
+        else:
+            images = [n for n in names if n.lower().endswith(self.IMAGE_EXTENSIONS)
+                      and n.lower() not in self.RESERVED_ASSETS]
+            packets = [n for n in images if any(m in n.lower() for m in self.PACKET_ASSET_MARKERS)]
+            if kind == "packet" and packets:
+                pool = [full(n) for n in packets]
+            else:
+                pool = [full(n) for n in images if n not in packets]
+        return [p for p in pool if os.path.isfile(p)]
+
+    def random_asset(self, kind: str) -> str:
+        """A random assets/ file for an upload ('pdf', 'image' or 'packet'), else the built-in dummy."""
+        pool = self.asset_pool(kind)
+        if pool:
+            return self.random.choice(pool)
+        return self.DUMMY_PDF_PATH if kind == "pdf" else self.DUMMY_IMAGE_PATH
+
     async def _upload_file(self, reason: str, file_type: str = "image", document_type: str = None,
                            is_mask: bool = False, file_path_override: str = None):
         if file_path_override:
@@ -1528,7 +1564,7 @@ class GoldLoanApiTest:
                 f"Upload file not found: {file_path_on_disk}"
             )
         else:
-            file_path_on_disk = self.DUMMY_IMAGE_PATH if file_type == "image" else self.DUMMY_PDF_PATH
+            file_path_on_disk = self.random_asset(file_type)
 
         if not file_path_override and not os.path.exists(file_path_on_disk):
             if file_type == "image":
@@ -4164,7 +4200,7 @@ class GoldLoanApiTest:
             net_wt_after_purity = self._round_half_up(net_weight * float(ltv_percent) / 100, 2)
 
             ornament_image_response = await self._upload_file(
-                "loan", file_type="image", file_path_override=self.ORNAMENT_IMAGE_PATH)
+                "loan", file_type="image", file_path_override=self.random_asset("image"))
             ornament_image = ornament_image_response['uploadFile']['path']
 
             ornament = {
@@ -5109,14 +5145,15 @@ class GoldLoanApiTest:
             "appraiserCharges": plan["appraiserCharges"],
         })
         plan["receiptNumber"] = (receipt.json() or {}).get("cashReceiptNumber") or ""
-        content_type = mimetypes.guess_type(self.DUMMY_PDF_PATH)[0] or "application/pdf"
-        with open(self.DUMMY_PDF_PATH, "rb") as fh:
+        receipt_file = self.random_asset("pdf")
+        content_type = mimetypes.guess_type(receipt_file)[0] or "application/pdf"
+        with open(receipt_file, "rb") as fh:
             uploaded = await self._make_authenticated_request(
                 'POST', f"/api/upload-file?reason=loan&masterLoanId={self.master_loan_id}",
-                files={"avatar": (os.path.basename(self.DUMMY_PDF_PATH), fh, content_type)})
+                files={"avatar": (os.path.basename(receipt_file), fh, content_type)})
         upload = (uploaded.json() or {}).get("uploadFile") or {}
         plan.update(receiptPaths=[upload.get("path")], receiptUrls=[upload.get("URL")],
-                    receiptName=upload.get("originalname") or os.path.basename(self.DUMMY_PDF_PATH))
+                    receiptName=upload.get("originalname") or os.path.basename(receipt_file))
         print(f"Cash receipt {plan['receiptNumber'] or '(no number)'} issued and uploaded.")
 
     async def store_bank_details(self):
@@ -5598,9 +5635,10 @@ class GoldLoanApiTest:
 
 
     async def _upload_file_base(self, file_type: str = "image") -> str:
-        """Upload a base64-encoded image via /api/upload-file/base (used for packet images)."""
+        """Upload a base64-encoded image via /api/upload-file/base (used for packet images).
+        file_type 'packet' = a packet photo (assets/*pouch* / *packet*)."""
         import base64
-        file_path_on_disk = self.DUMMY_IMAGE_PATH if file_type == "image" else self.DUMMY_PDF_PATH
+        file_path_on_disk = self.random_asset(file_type)
         mime = mimetypes.guess_type(file_path_on_disk)[0] or "image/jpeg"
         with open(file_path_on_disk, "rb") as fh:
             encoded = base64.b64encode(fh.read()).decode("ascii")
@@ -5770,10 +5808,10 @@ class GoldLoanApiTest:
         await self.fetch_single_loan()
 
         api_path = "/api/loan-process/add-packet-images"
-        empty_packet_image = await self._upload_file_base(file_type="image")
-        sealing_packet_with_weight_image = await self._upload_file_base(file_type="image")
-        sealing_packet_with_customer_image = await self._upload_file_base(file_type="image")
-        sealed_packet_image = await self._upload_file_base(file_type="image")
+        empty_packet_image = await self._upload_file_base(file_type="packet")
+        sealing_packet_with_weight_image = await self._upload_file_base(file_type="packet")
+        sealing_packet_with_customer_image = await self._upload_file_base(file_type="packet")
+        sealed_packet_image = await self._upload_file_base(file_type="packet")
 
         # Build the packet-ornament mapping from the fetched packet and the stored ornaments.
         packet = self.available_packet if isinstance(self.available_packet, dict) else {}
@@ -6560,15 +6598,26 @@ class GoldLoanApiTest:
         with the reason the web app uses. Returns the server's uploadFile record."""
         api_path = f"/api/upload-file?reason=customerIncomeGeneratingDocument&customerId={self.customer_id}"
         headers = {}
-        content_type = mimetypes.guess_type(self.DUMMY_PDF_PATH)[0] or "application/octet-stream"
-        with open(self.DUMMY_PDF_PATH, "rb") as upload_file:
-            files = {"avatar": (os.path.basename(self.DUMMY_PDF_PATH), upload_file, content_type)}
+        document = self.random_asset("pdf")
+        content_type = mimetypes.guess_type(document)[0] or "application/octet-stream"
+        with open(document, "rb") as upload_file:
+            files = {"avatar": (os.path.basename(document), upload_file, content_type)}
             response = await self._make_authenticated_request('POST', api_path, files=files, headers=headers)
         upload = response.json()['uploadFile']
         print(f"Income-generating document uploaded. Path: {upload['path']}")
         return upload
 
     IGL_MAX_FILES_PER_DOC = 10   # UploadDocumentsComponent: 'You can upload a maximum of 10 files.'
+
+    @staticmethod
+    def _upload_display_name(upload: dict) -> str:
+        """The name shown for an uploaded file on the loan screens ("<name> (<document type>)").
+        The portal sends uploadFile.filename, which is a bare file name on TEST but the FULL storage
+        key on UAT's S3 storage ("public/uploads/customerIncomeGeneratingDocument/<id>.pdf"), so the
+        loan showed a path as the document's name. Use the uploaded file's own name, else the last
+        part of whatever the server gave."""
+        name = upload.get('originalname') or upload.get('filename') or upload.get('path') or ""
+        return os.path.basename(str(name).replace("\\", "/"))
 
     async def _igl_income_documents(self, names: list) -> dict:
         """incomeGeneratingDocuments for the loan-documents body: `--igl-docs` of the purpose's visible
@@ -6584,8 +6633,7 @@ class GoldLoanApiTest:
             entry = documents.setdefault(doc_name, {"name": [], "path": []})
             for _ in range(self.igl_doc_files):
                 upload = await self.upload_income_document()
-                entry["name"].append(upload.get('filename') or upload.get('originalname')
-                                     or os.path.basename(upload['path']))
+                entry["name"].append(self._upload_display_name(upload))
                 entry["path"].append(upload['path'])
         print(f"IGL income documents: {len(chosen)} type(s) x {self.igl_doc_files} file(s) -> "
               + ", ".join(repr(n) for n in chosen))
