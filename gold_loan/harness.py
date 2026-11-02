@@ -1549,6 +1549,17 @@ class GoldLoanApiTest:
                 pool = [full(n) for n in images if n not in packets]
         return [p for p in pool if os.path.isfile(p)]
 
+    def asset_deck(self, kind: str, count: int) -> list:
+        """`count` assets/ files for one loan, all DIFFERENT while the pool lasts (shuffled, then
+        reshuffled and reused only when more are needed than assets/ holds)."""
+        pool = self.asset_pool(kind) or [self.DUMMY_PDF_PATH if kind == "pdf" else self.DUMMY_IMAGE_PATH]
+        deck = []
+        while len(deck) < count:
+            batch = list(pool)
+            self.random.shuffle(batch)
+            deck.extend(batch)
+        return deck[:count]
+
     def random_asset(self, kind: str) -> str:
         """A random assets/ file for an upload ('pdf', 'image' or 'packet'), else the built-in dummy."""
         pool = self.asset_pool(kind)
@@ -6593,12 +6604,13 @@ class GoldLoanApiTest:
                           f"{request_body.get('accountHolderName')!r}); it needs the OPS manual "
                           "verification step.", "yellow"))
 
-    async def upload_income_document(self) -> dict:
+    async def upload_income_document(self, document: str = None) -> dict:
         """Upload one income-generating document (a PDF -- the only type the upload page accepts)
-        with the reason the web app uses. Returns the server's uploadFile record."""
+        with the reason the web app uses. `document` = the file; default a random assets/ PDF.
+        Returns the server's uploadFile record."""
         api_path = f"/api/upload-file?reason=customerIncomeGeneratingDocument&customerId={self.customer_id}"
         headers = {}
-        document = self.random_asset("pdf")
+        document = document or self.random_asset("pdf")
         content_type = mimetypes.guess_type(document)[0] or "application/octet-stream"
         with open(document, "rb") as upload_file:
             files = {"avatar": (os.path.basename(document), upload_file, content_type)}
@@ -6628,11 +6640,12 @@ class GoldLoanApiTest:
             print(f"--igl-docs {count}: the purpose offers only {len(names)} document type(s); using all of them.")
             count = len(names)
         chosen = self.random.sample(names, count)
+        files = self.asset_deck("pdf", count * self.igl_doc_files)
         documents = {}
         for doc_name in chosen:
             entry = documents.setdefault(doc_name, {"name": [], "path": []})
             for _ in range(self.igl_doc_files):
-                upload = await self.upload_income_document()
+                upload = await self.upload_income_document(files.pop())
                 entry["name"].append(self._upload_display_name(upload))
                 entry["path"].append(upload['path'])
         print(f"IGL income documents: {len(chosen)} type(s) x {self.igl_doc_files} file(s) -> "

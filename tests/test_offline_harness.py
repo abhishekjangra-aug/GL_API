@@ -3178,6 +3178,10 @@ def _():
     ok(not images & packets, "packet photos are not used for other uploads")
     picks = {os.path.basename(s.random_asset("pdf")) for _ in range(60)}
     ok(len(picks) > 1, f"random across the pool, not one fixed file ({picks})")
+    pool = s.asset_pool("pdf")
+    deck = s.asset_deck("pdf", len(pool))
+    eq(sorted(deck), sorted(pool), "one loan's documents are all different while the pool lasts")
+    eq(len(s.asset_deck("pdf", len(pool) + 3)), len(pool) + 3, "reused only beyond the pool size")
     s.ASSETS_DIR = os.path.join(ROOT, "__no_assets__")
     eq((s.random_asset("pdf"), s.random_asset("image")), (s.DUMMY_PDF_PATH, s.DUMMY_IMAGE_PATH),
        "no assets folder: the built-in dummies")
