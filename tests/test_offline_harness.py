@@ -849,12 +849,29 @@ def _():
 def _():
     s = _appraiser_suite(GOLD_LOAN_FRESH_APPRAISER_REQUEST="true")
     eq(s.reuse_existing_request, False, "the env var disables reuse")
-    state = _stub_api(s, {"appraiser": [_request_item(master_loan={"id": 10930, "isLoanCompleted": False})]},
-                      create_ok=True)
+    state = _stub_api(s, {"appraiser": [_request_item(master_loan={
+        "id": 10930, "isLoanCompleted": False, "customerLoan": [{"id": 12952}]})]}, create_ok=True)
     _r, out = quiet(lambda: asyncio.run(s.create_appraiser_request()))
     eq(state["cancels"], 1, "cancelled despite the loan being in progress")
     eq(state["posts"], 2, "created a fresh request")
     ok("--fresh-request" in out, "explained why it did not reuse")
+    close(s)
+
+@test("appraiser: the master loan id is never used as the customer-loan id")
+def _():
+    s = suite()
+    eq(s._extract_master_loan_ids({"id": 10718}), True, "a master loan is there")
+    eq((s.master_loan_id, s.loan_id), ("10718", ""), "loan id left unknown, not set to 10718")
+    seen = []
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        seen.append(path)
+        class R:
+            def json(self_inner): return {"loanId": 12093, "masterLoanId": 10718, "loanCurrentStage": "1"}
+        return R()
+    s._make_authenticated_request = fake
+    eq(asyncio.run(quiet_async(s._complete_loan_ids, 15200)), True, "completed from customer-loan-details")
+    eq((s.loan_id, s.master_loan_id, seen), ("12093", "10718",
+       ["/api/loan-process/customer-loan-details/15200"]), "the portal's loan-form call")
     close(s)
 
 @test("appraiser: a request owned by ANOTHER appraiser is recreated in another branch")
@@ -3419,6 +3436,57 @@ def _():
                 raise Fail(f"top-up {bad} must be refused")
         close(s)
 
+@test("repayment: an environment without the loan-consent OTP type (UAT) continues without it")
+def _():
+    def respond(method, path, token, body):
+        if path == "/api/customer-otp/send-otp":
+            raise http_error(400, {"message": "Invalid value for type"}, path)
+        return {}
+    s, r, calls = repayment("renewal", responder=respond)
+    got = asyncio.run(quiet_async(r.loan_consent_otp, {"transactionType": "Renewal", "masterLoanId": "10704",
+                                                       "newLoanAmount": 79780, "interestRate": 3,
+                                                       "tenure": 360, "schemeId": 1}))
+    eq(got, {}, "no consent recorded, no failure")
+    ok(not any(c[1].endswith("verify-otp-admin") for c in calls), "no verify after the unknown type")
+    def other(method, path, token, body):
+        raise http_error(400, {"message": "OTP limit reached"}, path)
+    s2, r2, _ = repayment("renewal", responder=other)
+    try:
+        asyncio.run(quiet_async(r2.loan_consent_otp, {"transactionType": "Renewal", "masterLoanId": "1",
+                                                      "newLoanAmount": 1, "interestRate": 1, "tenure": 1,
+                                                      "schemeId": 1}))
+    except httpx.HTTPStatusError:
+        pass
+    else:
+        raise Fail("any other consent refusal must still stop the run")
+    close(s); close(s2)
+
+@test("repayment: part release opens its new loan from the hand-over answer; apply-loan is the fallback")
+def _():
+    s, r, calls = repayment("part-release")
+    r._take_new_loan({"masterLoanId": 12300, "loanId": 14305, "loanCurrentStage": "1",
+                      "appraiserRequestId": 15106}, "packet-release-home-in")
+    eq((r.new_loan["loanId"], r.new_loan["masterLoanId"]), ("14305", "12300"), "ids from the hand-over")
+    close(s)
+
+    def respond(method, path, token, body):
+        if path.startswith("/api/jewellery-release/apply-loan/"):
+            raise http_error(500, {"message": 'WHERE parameter "appraiser_id" has invalid "undefined" value'}, path)
+        return {}
+    s, r, calls = repayment("part-release", responder=respond)
+    r.request_id, s.customer_unique_id = 1535, "MVZ90LXE"
+    async def use_customer():
+        return None
+    async def find_request(required=True):
+        s.master_loan_id, s.loan_id = "10720", "12093"
+        return True
+    s._use_existing_customer = use_customer
+    s._fetch_existing_appraiser_request = find_request
+    got = asyncio.run(quiet_async(r._open_part_release_loan))
+    eq((got["loanId"], got["masterLoanId"]), ("12093", "10720"),
+       "UAT's failing apply-loan -> the customer's open appraiser request")
+    close(s)
+
 @test("repayment: due interest is quick-paid with deCryptedAmount, then the deposit is confirmed")
 def _():
     state = {"paid": False}
@@ -3879,6 +3947,16 @@ def _():
     saved = json.load(open(path))
     eq(next(iter(saved.values()))["8880008881"]["token"], s.auth_token, "the new token is saved")
     close(s)
+
+@test("session: what counts as a dead saved session (re-login) and what does not")
+def _():
+    def r(status, body):
+        return httpx.Response(status, json=body, request=httpx.Request("GET", "http://h/x"))
+    eq(G._session_rejected(r(401, {"message": "Please login first"})), True, "401")
+    eq(G._session_rejected(r(403, {"message": "Session expired, login again"})), True, "403 about the session")
+    eq(G._session_rejected(r(403, {"message": "You are not allowed to cencel this loan."})), False,
+       "a permission refusal is not a session problem")
+    eq(G._session_rejected(r(400, {"message": "Invalid value for type"})), False, "a business 400 is not")
 
 @test("session: --fresh-login (cache off) always uses OTP and saves nothing")
 def _():

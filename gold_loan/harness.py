@@ -1183,9 +1183,9 @@ class GoldLoanApiTest:
 
         response = await self._send_with_gateway_retry(verb, api_path, send_once)
 
-        if response.status_code == 401 and headers.get('Authorization', '').startswith('Bearer '):
-            # A saved session the server dropped: log that mobile in again and retry ONCE. A 401 is
-            # refused before anything is processed, so re-sending (even a write) is safe.
+        if self._session_rejected(response) and headers.get('Authorization', '').startswith('Bearer '):
+            # A saved session the server dropped: log that mobile in with OTP again and retry ONCE.
+            # Such a refusal comes before anything is processed, so re-sending (even a write) is safe.
             fresh = await self._relogin_after_401(headers['Authorization'][7:])
             if fresh:
                 headers['Authorization'] = f'Bearer {fresh}'
@@ -1349,6 +1349,24 @@ class GoldLoanApiTest:
         print(f"{label}: logging in {mobile} with OTP...")
         return await self._otp_login(mobile)
 
+    SESSION_REJECTION_MARKERS = ("please login", "login first", "auth failed", "token", "session",
+                                 "expired", "unauthor")
+
+    @classmethod
+    def _session_rejected(cls, response) -> bool:
+        """The server refused the login itself (not the request): every 401, and a 403 / 419 / 440
+        whose message is about the login / token / session. A permission refusal ("You are not
+        allowed to ...") is not one."""
+        if response.status_code == 401:
+            return True
+        if response.status_code not in (403, 419, 440):
+            return False
+        try:
+            text = (response.text or "").lower()
+        except Exception:
+            return False
+        return any(marker in text for marker in cls.SESSION_REJECTION_MARKERS)
+
     async def _relogin_after_401(self, stale_token: str):
         """A saved session the server no longer accepts (someone logged in elsewhere with that
         mobile, or an auth failure ended it): drop it, log that mobile in again, and swap the new
@@ -1356,7 +1374,7 @@ class GoldLoanApiTest:
         mobile = self._token_mobile.get(stale_token)
         if not mobile or stale_token not in self._restored_tokens:
             return None
-        print(self._c(f"The saved session for {mobile} was rejected (401); logging in again.", "yellow"))
+        print(self._c(f"The saved session for {mobile} was rejected; logging in again with OTP.", "yellow"))
         self._restored_tokens.discard(stale_token)
         self._session_drop(mobile)
         token, _ = await self._otp_login(mobile)
@@ -3270,8 +3288,32 @@ class GoldLoanApiTest:
         elif isinstance(candidate, dict):
             loan_id = candidate.get("id") or candidate.get("customerLoanId")
         loan_id = loan_id or master_loan.get("customerLoanId") or master_loan.get("loanId")
-        self.loan_id = str(loan_id or master_loan.get("id"))
+        # NEVER fall back to the master loan id: it is a different id space, and single-loan with it
+        # returns SOMEONE ELSE's loan (live UAT: master 10718 used as customerLoanId -> another
+        # customer's AUGM-91112). Left empty here; _complete_loan_ids asks the server.
+        self.loan_id = str(loan_id) if loan_id else ""
         return True
+
+    async def _complete_loan_ids(self, appraiser_request_id) -> bool:
+        """Fill a missing customer-loan id from customer-loan-details/<appraiserRequestId> -- the call
+        the portal's loan form makes (BasicDetailsComponent.getCustomerDetails reads loanId /
+        masterLoanId from it). True when both ids are known afterwards."""
+        if self.loan_id or not appraiser_request_id:
+            return bool(self.loan_id)
+        try:
+            response = await self._make_authenticated_request(
+                'GET', f"/api/loan-process/customer-loan-details/{appraiser_request_id}")
+        except httpx.HTTPStatusError as e:
+            print(f"customer-loan-details/{appraiser_request_id} failed ({e.response.status_code}); "
+                  "the loan id stays unknown.")
+            return False
+        payload = response.json() if isinstance(response.json(), dict) else {}
+        loan_id, master_id = payload.get("loanId"), payload.get("masterLoanId")
+        if loan_id and (not self.master_loan_id or str(master_id) == str(self.master_loan_id)):
+            self.loan_id = str(loan_id)
+            self.master_loan_id = str(master_id or self.master_loan_id)
+            return True
+        return False
 
     async def _list_appraiser_requests(self, search: str = "", max_pages: int = 8, page_size: int = 25):
         """Page through /appraiser-request/view-all and return every item.
@@ -3381,6 +3423,8 @@ class GoldLoanApiTest:
         self._existing_loan_completed = bool(ml.get("isLoanCompleted"))
         # If a loan was already initiated for this request, capture its ids so we can skip re-init.
         captured = self._extract_master_loan_ids(match.get("masterLoan"))
+        if captured and not self.loan_id:
+            await self._complete_loan_ids(self.appraiser_request_id)   # the master loan exists either way
         print(
             f"Using existing appraiser request {self.appraiser_request_id} "
             f"(status={self._existing_request_status or 'unknown'}, "
@@ -3724,7 +3768,7 @@ class GoldLoanApiTest:
             for search in (str(self.customer_unique_id or ''), str(self.mobile_number or ''), ''):
                 items = await self._list_appraiser_requests(search=search)
                 item = self._match_appraiser_request(items)
-                if item and self._extract_master_loan_ids(item.get("masterLoan")):
+                if item and self._extract_master_loan_ids(item.get("masterLoan")) and                         await self._complete_loan_ids(item.get("id")):
                     print(f"Successfully retrieved existing loan IDs from appraiser request list: Loan ID={self.loan_id}, Master Loan ID={self.master_loan_id}")
                     return
                 if item:
@@ -5388,15 +5432,26 @@ class GoldLoanApiTest:
 
     async def add_bm_rating(self):
         api_path = "/api/loan-process/bm-rating"
-        request_body = {
-            "loanId": int(self.loan_id) if self.loan_id else None,
-            "masterLoanId": int(self.master_loan_id) if self.master_loan_id else None,
+        # The portal (ApprovalComponent, stage 2 -> bmRating): the approval form patched from
+        # masterLoan + the BM's own three choices + checkPointers, and partRelease =
+        # isNewLoanFromPartRelease (a boolean), exactly like the ops rating.
+        loan = await self._loan_record()
+        master = loan.get('masterLoan') or {}
+        request_body = self._rating_base(loan, defaults={
+            "applicationFormForAppraiser": True, "goldValuationForAppraiser": True,
+            "loanStatusForAppraiser": "approved", "commentByAppraiser": None,
+            "applicationFormForOperatinalTeam": False, "goldValuationForOperatinalTeam": False,
+            "loanStatusForOperatinalTeam": "pending",
+            "applicationFormForPartner": False, "goldValuationForPartner": False,
+            "loanStatusForPartner": "pending",
+        })
+        request_body.update({
             "applicationFormForBM": True,
             "goldValuationForBM": True,
             "loanStatusForBM": "approved",
             "commentByBM": None,
-            "partRelease": None,
-        }
+            "partRelease": bool(master.get('isNewLoanFromPartRelease')),
+        })
         response = await self._make_authenticated_request(
             'POST',
             api_path,
@@ -5525,7 +5580,24 @@ class GoldLoanApiTest:
         saved_token = self.auth_token
         try:
             self.auth_token = await self._role_token("bm")
-            await self.add_bm_rating()
+            try:
+                await self.add_bm_rating()
+            except httpx.HTTPStatusError as e:
+                if "cannot change status" not in (e.response.text or "").lower():
+                    raise
+                master = (await self._loan_record()).get('masterLoan') or {}
+                try:
+                    bm_user = jwt.decode(self.auth_token, options={"verify_signature": False}).get("id")
+                except Exception:
+                    bm_user = "?"
+                raise RuntimeError(
+                    f"BM rating refused: {e.response.text.strip()}. The loan already carries a BM decision "
+                    f"(loanStatusForBM={master.get('loanStatusForBM')!r}, commentByBM="
+                    f"{master.get('commentByBM')!r}, bmId={master.get('bmId')}) and the server only lets "
+                    f"that BM change it -- this BM login is user {bm_user}. Seen on UAT top-up loans: the "
+                    "parent's 'auto approved' BM decision (bmId 1) is carried over while the loan still waits "
+                    "at the 'bm rating' stage, so no BM login can move it; it needs a backend fix (or the "
+                    "BM decision reset) for this loan.") from e
             self.bm_rating_submitted = True
         finally:
             self.auth_token = saved_token

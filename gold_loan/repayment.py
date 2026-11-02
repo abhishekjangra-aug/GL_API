@@ -323,11 +323,22 @@ class RepaymentScenarios:
         """LoanConsentDialogComponent: customer-otp/send-otp {type:'loanConsent', ...} then
         verify-otp-admin with the 6-digit OTP and the consentInfo the confirm step audits."""
         self._log(f"Loan consent OTP ({consent['transactionType']})")
-        sent = await self._post("/api/customer-otp/send-otp", {
-            "type": "loanConsent", "masterLoanId": consent["masterLoanId"],
-            "transactionType": consent["transactionType"], "newLoanAmount": consent["newLoanAmount"],
-            "interestRate": consent["interestRate"], "tenure": consent["tenure"],
-        })
+        try:
+            sent = await self._post("/api/customer-otp/send-otp", {
+                "type": "loanConsent", "masterLoanId": consent["masterLoanId"],
+                "transactionType": consent["transactionType"], "newLoanAmount": consent["newLoanAmount"],
+                "interestRate": consent["interestRate"], "tenure": consent["tenure"],
+            })
+        except httpx.HTTPStatusError as e:
+            # An environment whose portal has no consent dialog yet (UAT, 2 Nov 2026) does not know the
+            # OTP type at all: 400 "Invalid value for type". Its portal places the renewal / top-up
+            # without consent, so carry on the same way; any other refusal still stops the run.
+            if e.response.status_code == 400 and "invalid value for type" in (e.response.text or "").lower():
+                print(f"No loan-consent step on {self.suite.env_name.upper()} (the server does not know OTP "
+                      "type 'loanConsent'); continuing without it, as that portal does.")
+                self.loan_consent = {}
+                return self.loan_consent
+            raise
         reference = sent.get("referenceCode")
         if not reference:
             raise RepaymentScenarioError(f"Consent send-otp returned no referenceCode: {sent}")
@@ -862,10 +873,36 @@ class RepaymentScenarios:
             await self.set_release_status()
             await self.upload_release_document()
 
-        self._log("Open the new loan on the remaining ornaments (GET jewellery-release/apply-loan)")
-        opened = await self._get(f"/api/jewellery-release/apply-loan/{await self._customer_unique_id()}",
-                                 partReleaseId=self.request_id)
-        return self._take_new_loan(opened, "jewellery-release/apply-loan")
+        if self.new_loan.get("loanId"):
+            return self.new_loan          # opened by the customer hand-over just now
+        return await self._open_part_release_loan()
+
+    async def _open_part_release_loan(self):
+        """The new loan of a part release whose hand-over happened in an EARLIER run: apply-loan
+        (UploadDocumentComponent.newLoan), else -- when the server fails it (UAT: 500 'WHERE parameter
+        "appraiser_id" has invalid "undefined" value') -- the customer's open appraiser request,
+        which is where the hand-over put the new loan."""
+        self._log("Open the new loan on the remaining ornaments")
+        uid = await self._customer_unique_id()
+        try:
+            opened = await self._get(f"/api/jewellery-release/apply-loan/{uid}", partReleaseId=self.request_id)
+            return self._take_new_loan(opened, "jewellery-release/apply-loan")
+        except (httpx.HTTPStatusError, RepaymentScenarioError) as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            print(f"apply-loan did not open the new loan ({status or e}); looking it up through the "
+                  f"customer's appraiser request instead.")
+        suite = self.suite
+        suite.existing_customer_unique_id = uid
+        await suite._use_existing_customer()
+        found = await suite._fetch_existing_appraiser_request(required=False)
+        expected = str(self.request_row.get("newLoanId") or "")
+        if not found or not suite.loan_id or str(suite.master_loan_id) == self.master_loan_id                 or (expected and str(suite.master_loan_id) != expected):
+            raise RepaymentScenarioError(
+                f"Could not find the part release's new loan for customer {uid} (request "
+                f"{self.request_id}, expected master loan {self.request_row.get('newLoanId') or '?'}). "
+                "Open it from the portal, then finish it with flows/resume_loan.py.")
+        return self._take_new_loan({"loanId": suite.loan_id, "masterLoanId": suite.master_loan_id},
+                                   "customer's appraiser request")
 
     async def _place_part_release(self):
         ornaments = self.loan["loanOrnamentsDetail"]
@@ -1032,8 +1069,12 @@ class RepaymentScenarios:
         })
         answer = await self._post("/api/packet-tracking/packet-release-home-in", home_in)
         print(f"Packet handed over to the customer: {answer.get('message', answer)}")
-        if isinstance(answer, dict) and answer.get("appraiserRequestId"):
-            self.new_loan["appraiserRequestId"] = answer["appraiserRequestId"]
+        if isinstance(answer, dict) and answer.get("loanId") and is_part_release:
+            # The hand-over answers with the part-release's NEW loan (loanId, masterLoanId,
+            # loanCurrentStage, appraiserRequestId): the portal closes the dialog with it and opens
+            # that loan directly -- no apply-loan call (live TEST, request 1823 -> loan 14305).
+            self._take_new_loan(answer, "packet-release-home-in")
+            self.new_loan["appraiserRequestId"] = answer.get("appraiserRequestId")
 
     def _location_form(self, location_id, packets, loan_id):
         """UpdateLocationComponent's locationForm.getRawValue(), every control present."""

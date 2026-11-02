@@ -267,8 +267,9 @@ python flows/e2e_full_loan.py --customer MS35QNJP --amount 550000
 (git-ignored, per environment and mobile) and reused by every runner until it is within 10 minutes of
 expiring (tokens last 24 h), so a run normally sends **no OTP at all** and the backend's hourly login
 cap is not spent. Only tokens are saved — never customer / loan / KYC state. If the server rejects a
-saved token (someone logged into the portal with that mobile, or an earlier auth failure ended it),
-the request gets one automatic re-login and is retried. `--fresh-login` (any runner) or
+saved token (someone logged into the portal with that mobile, or an earlier auth failure ended it) —
+any 401, or a 403 / 419 / 440 about the login, token or session — that mobile is logged in again with
+OTP and the request is retried once. Business errors (400s) and permission refusals are not retried. `--fresh-login` (any runner) or
 `GOLD_LOAN_SESSION_CACHE=false` logs every role in with OTP; deleting the file has the same effect once.
 The run summary says how many logins used OTP and how many were reused.
 
@@ -461,7 +462,9 @@ How the server treats these loans (found on TEST, mirrored by the harness):
   own type) or `--purpose-type` (`cb` default, `igl`, `any`) and is resolved *before* the scheme: only
   schemes whose `loanPurposeType` takes it are considered, and the purpose is picked inside that type
   (IGL prefers `Agro`). If no scheme takes the type, the run stops and says so — it never switches type.
-- The consent OTP is the 6-digit admin OTP `123456` (`GOLD_LOAN_CONSENT_OTP`).
+- The consent OTP is the 6-digit admin OTP `123456` (`GOLD_LOAN_CONSENT_OTP`). UAT has no consent step yet
+  (its server answers `Invalid value for type` for `loanConsent`); the run notes it and continues, as
+  UAT's portal does.
 - **One scenario per parent loan.** Before anything is paid the run reads the loan's history (renewal,
   part-release and full-release lists, as admin) and refuses a parent that already went through any
   scenario, has an open request of a *different* scenario, or has nothing outstanding (closed, or

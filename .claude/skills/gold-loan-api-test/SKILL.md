@@ -202,7 +202,8 @@ The harness runs against **either environment**, chosen with `--env {test|uat}` 
 
 **`_make_authenticated_request(method, api_path, json_data, params, files, headers)`** is the one gateway every endpoint routes through. It:
 - Adds the HMAC signature + auth headers.
-- **One re-login on a 401, for SAVED tokens only.** If the bearer came from the saved sessions
+- **One re-login on a dead SAVED token** (`_session_rejected`: any 401, or 403/419/440 whose body mentions
+  login/token/session/expired/unauthor; "not allowed" permission refusals and 400s are NOT). If the bearer came from the saved sessions
   (`_restored_tokens`), `_relogin_after_401` drops it, OTP-logs that mobile in, swaps the new token into
   `auth_token` / `_role_token_cache`, saves it, and the request is re-sent once (a 401 is refused before
   processing, so even a write is safe). A token from this run's own OTP login still just raises.
@@ -442,6 +443,12 @@ The GL flow hands the loan between roles. Static OTP **1234** for all; each role
 - **Appraiser rating** (`add_appraiser_rating`, `/api/loan-process/appraiser-rating`) — the appraiser's own submission, runs on the appraiser token; no swap.
 - **"Loan Stage has been changed to: X, please re-visit the applied loan page" is an INSTRUCTION, not a failure.** The server refuses any loan-process call whose stage has moved on and names the stage it is waiting for. `_stage_changed_to(text)` parses that name; `_settle_pending_stage` does the step it names (currently `bm rating` → `_submit_bm_rating`) and returns whether the caller should retry; `_with_stage_recovery(description, send)` wraps a call and retries **exactly once** — a stage that keeps moving must surface, not loop. `submit_ops_rating` and `store_loan_documents` both route through it (a test asserts they do). Anything other than a 400 carrying that marker is re-raised untouched, and an already-submitted BM rating is never submitted twice (`bm_rating_submitted`).
 - **BM rating is CONDITIONAL: at or over 5L — the threshold is INCLUSIVE.** (`BM_RATING_THRESHOLD = 500000`). `submit_bm_rating_if_required` checks `final_loan_amount`, and at **`>=`** the threshold calls `_submit_bm_rating` (swaps to the **bm** token, `add_bm_rating` → `/api/loan-process/bm-rating`, sets `bm_rating_submitted`). Below 5L it's skipped. **A strict `>` here was a real bug:** a loan of exactly `500000.00` IS moved to the "bm rating" stage by the server, so skipping it deadlocked the run — `loan-documents` and `ops-rating` both 400'd with *"Loan Stage has been changed to: bm rating"* (confirmed on UAT).
+- **BM rating body = portal ApprovalComponent** (`_rating_base` + BM's 3 fields + `partRelease` =
+  masterLoan.isNewLoanFromPartRelease bool), like ops. **UAT top-up loans can be stuck at stage 2**: loan
+  12085/10712 (95000) waits at "bm rating" while masterLoan already has loanStatusForBM 'approved',
+  commentByBM 'auto approved', bmId 1 (system Augmont Admin, carried from the parent); bm-rating by the
+  BM login (3181) -> 400 "You cannot change status for this customer" (portal-shaped body too). Only a
+  backend fix / BM reset unblocks it; `_submit_bm_rating` raises that diagnosis.
 - **Ops rating** (`submit_ops_rating` → `add_ops_rating`, `/api/loan-process/ops-rating`) — final approval, always runs under the **ops** token. `loanAmountDigi` uses the real `final_loan_amount`.
 
 ## Upload documents (`store_loan_documents`)
@@ -511,6 +518,8 @@ first when no `--loan/--master-loan-id` is given, then drives any NEW loan with
 - **payObject** (`_pay_object`, PartReleaseComponent.apiCall): summary dues (`loanInfo`), new-scheme
   charges (`actualProcessingCharge` is a 2dp STRING — `toFixed`), stamp duty, `coLenderBankId` (only
   banks 2/4 are carried), purpose; then `Object.assign(payment, summary.ornamentWeight)` — order matters.
+- **UAT has no loan consent yet**: send-otp `type:'loanConsent'` -> 400 "Invalid value for type"; that exact
+  answer -> `loan_consent_otp` returns {} and the scenario continues (UAT portal has no dialog).
 - **Consent OTP** (renewal / top-up): `customer-otp/send-otp {type:'loanConsent', masterLoanId,
   transactionType, newLoanAmount, interestRate (LAST schemeInterest rate), tenure}` ->
   `verify-otp-admin {…, otp:'123456', consentInfo}` (`GOLD_LOAN_CONSENT_OTP`). Live-verified.
@@ -550,7 +559,11 @@ first when no `--loan/--master-loan-id` is given, then drives any NEW loan with
   newSchemeId, wavier, coLenderBankId}` -> `jewellery-release/part-release` -> amount-status
   (`partReleaseId`, lock 'partRelease') -> `jewellery-release/assign-appraiser` -> packet release ->
   `PUT jewellery-release/appraiser-status {partReleaseId, partReleaseStatus:'released'}` ->
-  `jewellery-release/document` -> `GET jewellery-release/apply-loan/<uid>?partReleaseId=`.
+  `jewellery-release/document`. **The new loan comes from the packet-release-home-in ANSWER**
+  (`loanId`, `masterLoanId`, `loanCurrentStage`, `appraiserRequestId` — the portal opens the loan form
+  from it); only a re-run after the hand-over uses `GET jewellery-release/apply-loan/<uid>?partReleaseId=`,
+  and when that 500s (UAT: 'WHERE parameter "appraiser_id" has invalid "undefined" value') the
+  customer's open appraiser request (`_fetch_existing_appraiser_request`) gives the ids.
 - **Full release** (not yet live): `POST jewellery-release` (all ornaments, newSchemeId null) ->
   `jewellery-release/full-release` -> `PUT jewellery-release/full-release/amount-status`
   (`fullReleaseId`, lock 'fullRelease') -> `assign-releaser` (appraiser stands in: `userType:'appraiser'`,
