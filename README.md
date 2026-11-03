@@ -269,18 +269,32 @@ python flows/e2e_full_loan.py --customer MS35QNJP --amount 550000
 from `config/login_passwords.json` (git-ignored): `{"default": "abcde123"}`, plus `"<mobile>": "..."` for
 accounts that differ (or `{"test": {...}}` per environment), or `GOLD_LOAN_LOGIN_PASSWORD`. UAT still uses
 the OTP login (`user-send-otp` → `verify-login`, OTP `1234`); the OTP length the server announces is
-followed (6 digits → `123456`). An account that has never set a password stops with a clear message
-(the harness does not set passwords on shared accounts). Overrides: `GOLD_LOAN_LOGIN_METHOD=otp|password`,
+followed (6 digits → `123456`). Overrides: `GOLD_LOAN_LOGIN_METHOD=otp|password`,
 `GOLD_LOAN_LOGIN_OTP`, `GOLD_LOAN_MFA_OTP`.
+
+**When TEST rejects the password** ("Invalid credentials"), the harness follows the portal instead of
+stopping: it logs in with OTP (`user-send-otp` → `verify-login`). If the server says the account has never
+set a password (`enrollmentRequired`), it sets one through `api/auth/mfa/enroll` (the portal's "Secure
+account" page). If OTP login gives no session, it resets the password through forgot-password
+(`user-otp/verify-otp` type `forget` → `api/user/update-password`) and logs in again. The password it
+sets is `"new_password"` from `config/login_passwords.json` (or `GOLD_LOAN_NEW_PASSWORD`). It must meet
+TEST's policy (at least 10 characters with upper case, lower case, a number and a special character, and
+not the mobile number or email); the harness checks that before sending anything. After a successful
+set, it saves the password for that mobile under `"test"` in the same file, and the run summary lists
+every account whose password it changed. `GOLD_LOAN_PASSWORD_FALLBACK=false` stops at the rejection
+instead.
 
 **Saved login sessions.** Every role's login token is saved in `config/session_tokens.json`
 (git-ignored, per environment and mobile) and reused by every runner until it is within 10 minutes of
 expiring (tokens last 24 h), so a run normally sends **no OTP at all** and the backend's hourly login
 cap is not spent. Only tokens are saved — never customer / loan / KYC state. If the server rejects a
 saved token (someone logged into the portal with that mobile, or an earlier auth failure ended it) —
-any 401, or a 403 / 419 / 440 about the login, token or session — that mobile is logged in again with
-OTP and the request is retried once. Business errors (400s) and permission refusals are not retried. `--fresh-login` (any runner) or
-`GOLD_LOAN_SESSION_CACHE=false` logs every role in with OTP; deleting the file has the same effect once.
+any 401, or a 403 / 419 / 440 about the login, token or session — the harness first looks for a newer
+token another run saved for that mobile and uses it without logging in. Only if there is none does it log
+that mobile in again, at most twice per mobile per run, and retry the request once. That keeps two runs on
+the same account from knocking each other out. Business errors (400s) and permission refusals are not
+retried. `--fresh-login` (any runner) logs every role in again but still saves the new tokens for the
+next runs; `GOLD_LOAN_SESSION_CACHE=false` switches the saved sessions off entirely.
 The run summary says how many logins used OTP and how many were reused.
 
 Run `python flows/e2e_full_loan.py --help` for the auto-generated usage.
@@ -301,8 +315,11 @@ All optional; sensible defaults are baked in. Common ones:
 | `GOLD_LOAN_TRANSFER_MODE`             | Disbursement transfer mode `neft` / `imps` / `rtgs` (also settable via `--transfer-mode`) |
 | `GOLD_LOAN_LOGIN_METHOD`              | `password` (password + MFA OTP; TEST default) or `otp` (UAT default) |
 | `GOLD_LOAN_LOGIN_PASSWORD`            | Login password for every account (else `config/login_passwords.json`) |
+| `GOLD_LOAN_NEW_PASSWORD`              | Password to set when an account must enroll / be reset (else `"new_password"` in `config/login_passwords.json`) |
+| `GOLD_LOAN_PASSWORD_FALLBACK`         | `false` = stop on a rejected password instead of OTP login → enroll / reset (default `true`) |
 | `GOLD_LOAN_LOGIN_OTP` / `GOLD_LOAN_MFA_OTP` | Override the static login / MFA OTP (default by length: `1234` / `123456`) |
-| `GOLD_LOAN_SESSION_CACHE`             | `false` = ignore the saved login sessions and log in with OTP (also `--fresh-login`; default on) |
+| `GOLD_LOAN_SESSION_CACHE`             | `false` = no saved login sessions at all (neither read nor written; default on) |
+| `GOLD_LOAN_FRESH_LOGIN`               | `true` = log in again instead of reusing saved tokens, but still save the new ones (what `--fresh-login` sets) |
 | `GOLD_LOAN_SESSION_FILE`              | Where login sessions are saved (default `config/session_tokens.json`) |
 | `GOLD_LOAN_CASH_AMOUNT`               | Advance cash at bank details, rupees or `full` (also settable via `--cash-amount`; default none = all by bank) |
 | `GOLD_LOAN_RELEASE_KYC_DOCS`          | `true` = free the profile's real PAN (+ Aadhaar) before KYC, TEST/UAT only (also `--release-kyc-docs`) |

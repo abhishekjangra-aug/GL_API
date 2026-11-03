@@ -229,7 +229,7 @@ def main():
                "  python flows/create_packets.py --appraiser-id 1473   # bind to a given appraiser\n",
     )
     parser.add_argument("--fresh-login", action="store_true",
-                        help="Ignore the saved login sessions and log every role in with OTP.")
+                        help="Log every role in again instead of reusing saved sessions (the new tokens are still saved).")
     parser.add_argument("--env", choices=sorted(GoldLoanApiTest.ENVIRONMENTS),
                         default=os.getenv("GOLD_LOAN_ENV", GoldLoanApiTest.DEFAULT_ENV).strip().lower(),
                         help="Target environment (default: %(default)s). 'test' = gfat, 'uat' = gfau.")
@@ -258,7 +258,7 @@ def main():
     # and every role login mobile.
     os.environ["GOLD_LOAN_ENV"] = args.env
     if args.fresh_login:
-        os.environ["GOLD_LOAN_SESSION_CACHE"] = "false"
+        os.environ["GOLD_LOAN_FRESH_LOGIN"] = "true"
     if args.branch:
         os.environ["GOLD_LOAN_INTERNAL_BRANCH_ID"] = str(args.branch)
 

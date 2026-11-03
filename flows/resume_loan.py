@@ -468,7 +468,7 @@ def build_parser():
     parser.add_argument("--partner", choices=["roshan", "arvog"], default="roshan",
                         help="Partner whose login disburses the loan (default: roshan).")
     parser.add_argument("--fresh-login", action="store_true",
-                        help="Ignore the saved login sessions and log every role in with OTP.")
+                        help="Log every role in again instead of reusing saved sessions (the new tokens are still saved).")
     parser.add_argument("--igl-docs", metavar="N|all",
                         help="IGL loans: income document types to upload (default 1; 'all').")
     parser.add_argument("--igl-doc-files", type=int, metavar="M",
@@ -496,7 +496,7 @@ def main():
     # before the suite is constructed.
     os.environ["GOLD_LOAN_ENV"] = args.env
     if args.fresh_login:
-        os.environ["GOLD_LOAN_SESSION_CACHE"] = "false"
+        os.environ["GOLD_LOAN_FRESH_LOGIN"] = "true"
     if args.igl_docs:
         os.environ["GOLD_LOAN_IGL_DOCS"] = args.igl_docs
     if args.igl_doc_files:

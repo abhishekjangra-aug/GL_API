@@ -365,9 +365,12 @@ class GoldLoanApiTest:
         # Saved login sessions (config/session_tokens.json): every role's token is reused across runs
         # until it expires, so a run does not spend the backend's hourly login allowance. TOKENS ONLY
         # -- never customer / loan / KYC state (restoring that once caused "PAN already exists").
-        # --fresh-login / GOLD_LOAN_SESSION_CACHE=false turns it off.
+        # GOLD_LOAN_SESSION_CACHE=false turns it off entirely. --fresh-login (GOLD_LOAN_FRESH_LOGIN)
+        # only skips REUSING saved tokens: the new ones are still saved for the next runs.
         self.session_cache_enabled = os.getenv("GOLD_LOAN_SESSION_CACHE", "true").strip().lower() \
             not in ("0", "false", "no", "off")
+        self.fresh_login = os.getenv("GOLD_LOAN_FRESH_LOGIN", "").strip().lower() in ("1", "true", "yes", "on")
+        self._relogins = {}            # mobile -> re-logins after a rejected session, this run
         self.session_file = os.getenv("GOLD_LOAN_SESSION_FILE") or os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "session_tokens.json")
         self._token_mobile = {}        # token -> mobile, to log the right number in again on a 401
@@ -442,6 +445,7 @@ class GoldLoanApiTest:
         # kycType on the KYC endpoints. Like the portal (reKycType = kycStatus === 'approved' ?
         # RE_KYC : NEW_KYC) it follows the customer: NEW_KYC for a first KYC, RE_KYC only when the
         # customer's KYC is already approved. GOLD_LOAN_KYC_TYPE=NEW_KYC|RE_KYC forces one.
+        self.passwords_set = []   # (mobile, "enrolled"|"reset") -- password fallback changes
         self.kyc_type_requested = (os.getenv("GOLD_LOAN_KYC_TYPE") or "auto").strip().upper()
         if self.kyc_type_requested == "AUTO":
             self.kyc_type_requested = "auto"
@@ -1296,6 +1300,13 @@ class GoldLoanApiTest:
 
     def _session_lookup(self, mobile: str):
         """(token, userDetails) of a saved, unexpired session for `mobile`, else None."""
+        if not self.session_cache_enabled or self.fresh_login:
+            return None
+        return self._saved_session(mobile)
+
+    def _saved_session(self, mobile: str):
+        """The saved (token, userDetails) for `mobile` if unexpired -- read from the file every time,
+        so a token another run saved meanwhile is seen too."""
         if not self.session_cache_enabled:
             return None
         entry = self._load_sessions().get(self._session_key(), {}).get(str(mobile))
@@ -1316,10 +1327,16 @@ class GoldLoanApiTest:
         }
         self._write_sessions(data)
 
-    def _session_drop(self, mobile: str) -> None:
+    def _session_drop(self, mobile: str, only_token: str = None) -> None:
+        """Forget the saved session for `mobile` (only while it is still `only_token`, when given,
+        so a newer one another run saved is kept)."""
         data = self._load_sessions()
-        if data.get(self._session_key(), {}).pop(str(mobile), None) is not None:
-            self._write_sessions(data)
+        entries = data.get(self._session_key(), {})
+        entry = entries.get(str(mobile))
+        if entry is None or (only_token and isinstance(entry, dict) and entry.get("token") != only_token):
+            return
+        entries.pop(str(mobile), None)
+        self._write_sessions(data)
 
     LOGIN_METHODS = ("otp", "password")
     KYC_TYPES = ("NEW_KYC", "RE_KYC")
@@ -1355,12 +1372,7 @@ class GoldLoanApiTest:
         forced = os.getenv("GOLD_LOAN_LOGIN_PASSWORD")
         if forced:
             return forced
-        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), self.LOGIN_PASSWORDS_FILE)
-        try:
-            with open(path, encoding="utf-8") as fh:
-                data = json.load(fh)
-        except (OSError, ValueError):
-            data = {}
+        data = self._login_passwords_data()
         per_env = data.get(self.env_name) if isinstance(data.get(self.env_name), dict) else {}
         password = per_env.get(str(mobile)) or data.get(str(mobile)) or per_env.get("default") or data.get("default")
         if not password:
@@ -1396,34 +1408,184 @@ class GoldLoanApiTest:
             raise RuntimeError(f"Password encryption failed: {result.stderr.strip()[:300]}")
         return result.stdout.strip()
 
+    async def _encrypted_password(self, password: str) -> dict:
+        """{encPassword, kid, nonce} for a password, with a fresh one-time key (api/auth/login-key) --
+        the shape user-login, mfa/enroll and user/update-password all take."""
+        key = (await self._make_authenticated_request('GET', "/api/auth/login-key")).json()
+        key = key.get("data") if isinstance(key.get("data"), dict) else key
+        return {"encPassword": self._encrypt_login_password(password, key.get("publicKey"), key.get("nonce")),
+                "kid": key.get("kid"), "nonce": key.get("nonce")}
+
+    async def _post_auth(self, path: str, body: dict) -> dict:
+        return (await self._make_authenticated_request(
+            'POST', path, json_data=body, headers={'Content-Type': 'application/json'})).json()
+
+    async def _complete_mfa(self, answer: dict, mobile: str, step: str) -> dict:
+        """A session answer as-is; an MFA step -> mfa/verify with the static OTP (LoginSession.complete)."""
+        if answer.get("Token"):
+            return answer
+        if answer.get("mfaRequired") and answer.get("mfaToken"):
+            return await self._post_auth("/api/auth/mfa/verify", {
+                "mfaToken": answer["mfaToken"], "referenceCode": answer.get("referenceCode"),
+                "otp": self._mfa_otp(answer)})
+        raise RuntimeError(f"{step} for {mobile} returned neither a session nor an MFA step: {str(answer)[:300]}")
+
     async def _password_login(self, mobile: str):
         """TEST's login since Nov 2026 (LoginComponent.submit -> MfaOtpComponent.submit):
         GET login-key -> POST user-login {mobileNumber, encPassword, kid, nonce} -> mfaRequired
         {mfaToken, referenceCode, otpLength} -> POST mfa/verify {mfaToken, referenceCode, otp}.
+        A rejected password falls back to the portal's OTP routes (_recover_password_login).
         Returns the final answer (Token + userDetails). Bearer-less, like the OTP route."""
         saved_token, self.auth_token = self.auth_token, None
         try:
-            key = (await self._make_authenticated_request('GET', "/api/auth/login-key")).json()
-            key = key.get("data") if isinstance(key.get("data"), dict) else key
-            enc = self._encrypt_login_password(self._login_password(mobile), key.get("publicKey"), key.get("nonce"))
-            first = (await self._make_authenticated_request(
-                'POST', "/api/auth/user-login",
-                json_data={"mobileNumber": mobile, "encPassword": enc, "kid": key.get("kid"),
-                           "nonce": key.get("nonce")},
-                headers={'Content-Type': 'application/json'})).json()
-            self._check_login_answer(first, mobile)
-            if first.get("Token"):
-                return first                      # no second factor asked for
-            if not first.get("mfaRequired") or not first.get("mfaToken"):
-                raise RuntimeError(f"user-login for {mobile} returned neither a session nor an MFA step: "
-                                   f"{str(first)[:300]}")
-            return (await self._make_authenticated_request(
-                'POST', "/api/auth/mfa/verify",
-                json_data={"mfaToken": first["mfaToken"], "referenceCode": first.get("referenceCode"),
-                           "otp": self._mfa_otp(first)},
-                headers={'Content-Type': 'application/json'})).json()
+            password = self._login_password(mobile)
+            try:
+                first = await self._post_auth("/api/auth/user-login",
+                                              {"mobileNumber": mobile, **(await self._encrypted_password(password))})
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 423:
+                    # Locked after repeated failures: any further attempt (password, OTP or reset) only
+                    # risks extending it. Stop and say when to try again.
+                    raise RuntimeError(
+                        f"{self.env_name.upper()} has locked {mobile} ({self._role_of_mobile(mobile)}): "
+                        f"{e.response.text[:160]} Not trying again in this run; re-run after the lock "
+                        "expires.") from None
+                if e.response.status_code != 401:
+                    raise
+                return await self._recover_password_login(mobile, password, e.response.text[:120])
+            return await self._complete_mfa(first, mobile, "user-login")
         finally:
             self.auth_token = saved_token
+
+    @property
+    def password_fallback_enabled(self) -> bool:
+        return (os.getenv("GOLD_LOAN_PASSWORD_FALLBACK", "true").strip().lower()
+                not in ("0", "false", "no", "off"))
+
+    PASSWORD_POLICY = ("at least 10 characters with upper case, lower case, a number and a special "
+                       "character, and not the mobile number or email")
+
+    def _password_policy_problems(self, password: str, mobile: str) -> list:
+        """TEST's policy for a NEW password (the server's message; portal checkPasswordPolicy)."""
+        problems = []
+        if len(password) < 10: problems.append("shorter than 10 characters")
+        if not re.search(r"[A-Z]", password): problems.append("no upper-case letter")
+        if not re.search(r"[a-z]", password): problems.append("no lower-case letter")
+        if not re.search(r"[0-9]", password): problems.append("no number")
+        if not re.search(r"[^A-Za-z0-9]", password): problems.append("no special character")
+        if str(mobile) in password: problems.append("contains the mobile number")
+        return problems
+
+    def _new_password(self, mobile: str) -> str:
+        """The password to SET when an account must enroll or be reset: GOLD_LOAN_NEW_PASSWORD, else
+        "new_password" in config/login_passwords.json (per env or top level). Checked against the
+        policy before anything is sent, so a bad one costs no OTP and changes nothing."""
+        data = self._login_passwords_data()
+        per_env = data.get(self.env_name) if isinstance(data.get(self.env_name), dict) else {}
+        new = os.getenv("GOLD_LOAN_NEW_PASSWORD") or per_env.get("new_password") or data.get("new_password")
+        if not new:
+            raise RuntimeError(
+                f"{mobile} ({self._role_of_mobile(mobile)}) must set a new password, and none is configured. "
+                f"Add \"new_password\": \"...\" to {self.LOGIN_PASSWORDS_FILE} (or GOLD_LOAN_NEW_PASSWORD): "
+                f"{self.PASSWORD_POLICY}.")
+        problems = self._password_policy_problems(new, mobile)
+        if problems:
+            raise RuntimeError(f"The configured new_password doesn't meet {self.env_name.upper()}'s policy "
+                               f"({', '.join(problems)}); it needs {self.PASSWORD_POLICY}.")
+        return new
+
+    def _login_passwords_path(self) -> str:
+        return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), self.LOGIN_PASSWORDS_FILE)
+
+    def _login_passwords_data(self) -> dict:
+        try:
+            with open(self._login_passwords_path(), encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _remember_password(self, mobile: str, password: str, how: str) -> None:
+        """After an enroll / reset, store the account's password under the env so the next run logs
+        in with it directly (the file is git-ignored)."""
+        self.passwords_set.append((mobile, how))
+        if os.getenv("GOLD_LOAN_LOGIN_PASSWORD"):
+            return                          # a one-run override; don't write the file
+        data = self._login_passwords_data()
+        per_env = data.get(self.env_name) if isinstance(data.get(self.env_name), dict) else {}
+        per_env[str(mobile)] = password
+        data[self.env_name] = per_env
+        try:
+            with open(self._login_passwords_path(), "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+        except OSError as e:
+            print(self._c(f"Could not save the new password for {mobile}: {e}", "red"))
+
+    async def _recover_password_login(self, mobile: str, password: str, reason: str) -> dict:
+        """The password was rejected. Follow the portal instead of stopping:
+          1. Login with OTP (sign-in-otp): user-send-otp {type: login} -> verify-login. A session
+             answer is used as-is.
+          2. verify-login answers enrollmentRequired (the account never set a password under the new
+             login): secure-account -> mfa/enroll {enrollToken, encPassword} with the configured
+             password, which sets it and answers with the session.
+          3. Otherwise forgot-password: user-send-otp {type: forget} -> user-otp/verify-otp ->
+             user/update-password {referenceCode, encPassword}, then the password login again.
+        Steps 2-3 SET the account's password to the configured NEW password ("new_password" in
+        config/login_passwords.json / GOLD_LOAN_NEW_PASSWORD; it must meet the policy) and save it
+        for that mobile. GOLD_LOAN_PASSWORD_FALLBACK=false stops at the rejection instead."""
+        who = f"{mobile} ({self._role_of_mobile(mobile)})"
+        if not self.password_fallback_enabled:
+            raise RuntimeError(
+                f"{self.env_name.upper()} rejected the password for {who}: {reason}. Set that account's "
+                f"password in {self.LOGIN_PASSWORDS_FILE} as \"{mobile}\": \"...\" (or "
+                "GOLD_LOAN_LOGIN_PASSWORD), or allow GOLD_LOAN_PASSWORD_FALLBACK to log in with OTP.")
+        print(self._c(f"Password rejected for {who} ({reason}); logging in with OTP instead.", "yellow"))
+        sent = await self._post_auth("/api/user-otp/user-send-otp", {"mobileNumber": mobile, "type": "login", "id": None})
+        try:
+            answer = await self._post_auth("/api/auth/verify-login", {
+                "referenceCode": sent.get("referenceCode"), "otp": self._login_otp(sent),
+                "type": "login", "isFromWeb": True})
+        except httpx.HTTPStatusError as e:
+            # e.g. 403 "Please login using password or Google": the account HAS a password (just not
+            # the configured one) and OTP login is closed to it -> forgot password below.
+            if e.response.status_code not in (400, 401, 403):
+                raise
+            print(f"OTP login refused for {who}: {e.response.text[:120]}")
+            answer = {}
+        if answer.get("Token") or answer.get("mfaRequired"):
+            print(f"OTP login worked for {who}; the configured password still doesn't match the account's.")
+            return await self._complete_mfa(answer, mobile, "verify-login")
+        if answer.get("enrollmentRequired") and answer.get("enrollToken"):
+            new_password = self._new_password(mobile)
+            print(self._c(f"{who} has no password under the new login yet: setting the configured new "
+                          f"password (mfa/enroll, as the portal's Secure account page does).", "yellow"))
+            enrolled = await self._post_auth("/api/auth/mfa/enroll", {
+                "enrollToken": answer["enrollToken"], **(await self._encrypted_password(new_password))})
+            self._remember_password(mobile, new_password, "enrolled")
+            return await self._complete_mfa(enrolled, mobile, "mfa/enroll")
+        new_password = self._new_password(mobile)
+        password = new_password
+        print(self._c(f"OTP login gave no session for {who}; resetting the password (forgot password).", "yellow"))
+        sent = await self._post_auth("/api/user-otp/user-send-otp", {"mobileNumber": mobile, "type": "forget"})
+        reference = sent.get("referenceCode")
+        await self._post_auth("/api/user-otp/verify-otp",
+                              {"referenceCode": reference, "otp": self._login_otp(sent), "type": "forget"})
+        await self._post_auth("/api/user/update-password",
+                              {"referenceCode": reference, **(await self._encrypted_password(password))})
+        self._remember_password(mobile, new_password, "reset")
+        first = await self._post_auth("/api/auth/user-login",
+                                      {"mobileNumber": mobile, **(await self._encrypted_password(password))})
+        return await self._complete_mfa(first, mobile, "user-login after reset")
+
+    def _role_of_mobile(self, mobile: str) -> str:
+        """Which configured login a mobile belongs to (for error messages)."""
+        names = []
+        for key, value in self.env.items():
+            if isinstance(value, dict):
+                names += [f"{key[:-1] if key.endswith('s') else key} {k}" for k, v in value.items() if str(v) == str(mobile)]
+            elif str(value) == str(mobile):
+                names.append(key)
+        return ", ".join(names) or "unknown role"
 
     def _mfa_otp(self, first: dict) -> str:
         """The MFA OTP: GOLD_LOAN_MFA_OTP, else the static test OTP of the announced length (123456)."""
@@ -1528,17 +1690,36 @@ class GoldLoanApiTest:
             return False
         return any(marker in text for marker in cls.SESSION_REJECTION_MARKERS)
 
+    MAX_RELOGINS_PER_MOBILE = 2    # per run: a session that keeps dying is a real problem, not a retry
+
     async def _relogin_after_401(self, stale_token: str):
-        """A saved session the server no longer accepts (someone logged in elsewhere with that
-        mobile, or an auth failure ended it): drop it, log that mobile in again, and swap the new
-        token in everywhere the old one was in use. Returns the new token, or None."""
+        """The server no longer accepts a session (someone logged in elsewhere with that mobile, or an
+        auth failure ended it). First take a NEWER saved token for that mobile if another run left one
+        (no login call); otherwise log in again -- at most MAX_RELOGINS_PER_MOBILE times per run. The
+        new token is swapped in everywhere the old one was in use. Returns it, or None."""
         mobile = self._token_mobile.get(stale_token)
-        if not mobile or stale_token not in self._restored_tokens:
+        if not mobile:
             return None
-        print(self._c(f"The saved session for {mobile} was rejected; logging in again.", "yellow"))
         self._restored_tokens.discard(stale_token)
-        self._session_drop(mobile)
-        token, _ = await self._otp_login(mobile)
+        saved = self._saved_session(mobile)
+        if saved and saved[0] != stale_token:
+            token, user_details = saved
+            print(self._c(f"The session for {mobile} was rejected; using the newer one another run saved "
+                          "(no login).", "yellow"))
+            self.logins_reused += 1
+            self._token_mobile[token] = mobile
+            self._restored_tokens.add(token)
+            self._user_details_by_token[token] = user_details
+        else:
+            count = self._relogins.get(mobile, 0)
+            if count >= self.MAX_RELOGINS_PER_MOBILE:
+                print(self._c(f"The session for {mobile} was rejected again after {count} re-login(s) this "
+                              "run; not logging in again (is another session using this mobile?).", "red"))
+                return None
+            self._relogins[mobile] = count + 1
+            print(self._c(f"The session for {mobile} was rejected; logging in again.", "yellow"))
+            self._session_drop(mobile, only_token=stale_token)
+            token, _ = await self._otp_login(mobile)
         if self.auth_token == stale_token:
             self.auth_token = token
         for key, cached in list(self._role_token_cache.items()):
@@ -8231,6 +8412,9 @@ class GoldLoanApiTest:
         )
         print(f"  Logins: {self.logins_fresh} new ({self.login_method}), {self.logins_reused} reused from saved sessions"
               + ("" if self.session_cache_enabled else " (session cache off)"))
+        for mobile, how in getattr(self, "passwords_set", []):
+            print(self._c(f"  Password {'set (first enrollment)' if how == 'enrolled' else 'reset'} for "
+                          f"{mobile} ({self._role_of_mobile(mobile)}) to the configured one.", "yellow"))
         print(self._c(rule, "gray"))
 
         # List every failed endpoint so failures are visible at a glance at the end of the run.
@@ -8349,8 +8533,9 @@ def main():
                              "manual OFFLINE options NEFT / IMPS / RTGS, with a UTR. ICICI / RazorpayX "
                              "payouts are not used.")
     parser.add_argument("--fresh-login", action="store_true",
-                        help="Ignore the saved login sessions (config/session_tokens.json) and log every "
-                             "role in with OTP. Default: reuse a role's saved token until it expires.")
+                        help="Log every role in again instead of reusing the saved sessions "
+                             "(config/session_tokens.json); the new tokens are still saved. Default: reuse "
+                             "a role's saved token until it expires.")
     parser.add_argument("--igl-docs", metavar="N|all",
                         help="IGL loans: how many of the purpose's income document types to upload at "
                              "upload documents (default 1; 'all' = every visible type). The LIP form is "
@@ -8403,7 +8588,7 @@ def main():
     if args.cash_amount:
         os.environ["GOLD_LOAN_CASH_AMOUNT"] = args.cash_amount
     if args.fresh_login:
-        os.environ["GOLD_LOAN_SESSION_CACHE"] = "false"
+        os.environ["GOLD_LOAN_FRESH_LOGIN"] = "true"
     if args.igl_docs:
         os.environ["GOLD_LOAN_IGL_DOCS"] = args.igl_docs
     if args.igl_doc_files:

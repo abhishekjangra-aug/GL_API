@@ -90,7 +90,7 @@ def main():
                         help="TEST/UAT: free the profile's real PAN (+ Aadhaar) before KYC (--kyc auto).")
     parser.add_argument("--login", default="appraiser", help="Role that runs the KYC (default: appraiser).")
     parser.add_argument("--fresh-login", action="store_true",
-                        help="Ignore the saved login sessions and log every role in with OTP.")
+                        help="Log every role in again instead of reusing saved sessions (the new tokens are still saved).")
     args = parser.parse_args()
 
     if args.count < 1:
@@ -111,7 +111,7 @@ def main():
     if args.release_kyc_docs:
         os.environ["GOLD_LOAN_RELEASE_KYC_DOCS"] = "true"
     if args.fresh_login:
-        os.environ["GOLD_LOAN_SESSION_CACHE"] = "false"
+        os.environ["GOLD_LOAN_FRESH_LOGIN"] = "true"
 
     suite = GoldLoanApiTest()
     print(f">> Environment: {args.env.upper()} ({suite.BASE_URL})")

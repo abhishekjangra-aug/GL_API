@@ -69,7 +69,7 @@ def build_parser():
     parser.add_argument("--new-scheme", metavar="SCHEME_ID",
                         help="Pin the scheme the renewal / top-up / part-release loan moves to.")
     parser.add_argument("--fresh-login", action="store_true",
-                        help="Ignore the saved login sessions and log every role in with OTP.")
+                        help="Log every role in again instead of reusing saved sessions (the new tokens are still saved).")
     parser.add_argument("--approver", choices=["ops", "admin"], default="ops",
                         help="Role that approves the paid amount and assigns the appraiser "
                              "(default: ops; falls back to admin when refused).")
@@ -187,7 +187,7 @@ def main():
     os.environ["GOLD_LOAN_PARTNER_NAME"] = {"roshan": "ROSHAN PARTNER", "arvog": "ARVOG"}[args.partner]
     os.environ["GOLD_LOAN_TRANSFER_MODE"] = args.transfer_mode
     if args.fresh_login:
-        os.environ["GOLD_LOAN_SESSION_CACHE"] = "false"
+        os.environ["GOLD_LOAN_FRESH_LOGIN"] = "true"
     os.environ["GOLD_LOAN_PURPOSE_TYPE"] = args.purpose_type
     if args.top_up_amount is not None:
         if args.scenario not in ("topup", "renewal-topup"):

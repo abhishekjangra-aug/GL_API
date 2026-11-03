@@ -226,16 +226,27 @@ The harness runs against **either environment**, chosen with `--env {test|uat}` 
   `\n` escapes in its embedded JS). `_otp_login` dispatches on `login_method`; `_finish_login` records
   the session for both. Live 3 Nov: appraiser + admin logged in; kyc_v1 on TEST PASSED (MW07Q4CT).
   Offline tests pin GOLD_LOAN_LOGIN_METHOD=otp; the password route has a round-trip decrypt test.
+- **Rejected password (401 Invalid credentials) → `_recover_password_login`** (user asked for it, 3 Nov):
+  OTP login (verify-login) → session as-is; `enrollmentRequired` → `mfa/enroll {enrollToken, encPassword}`;
+  else forgot-password (`user-send-otp` type forget → `user-otp/verify-otp` → `user/update-password`) →
+  user-login again. Sets `_new_password` (GOLD_LOAN_NEW_PASSWORD / "new_password" in login_passwords.json),
+  checked by `_password_policy_problems` first (10+ chars, upper, lower, digit, special, not the mobile;
+  the server rejected abcde123 and abcde@12345). `_remember_password` saves it under the env per mobile and
+  the run metrics list the changes (`passwords_set`). GOLD_LOAN_PASSWORD_FALLBACK=false stops instead.
+  Partner 8767002003 on TEST had never enrolled (verify-login → enrollmentRequired).
 
 ## Saved login sessions (`config/session_tokens.json`)
 - `login()` and `_role_token()` both go through `_session_token(mobile)`: saved + unexpired (JWT `exp`
   minus `SESSION_EXPIRY_MARGIN` 600 s; tokens live 24 h) -> reuse, no OTP; else `_otp_login` (send-otp ->
   verify-login, sent WITHOUT a bearer) and `_session_store`. Keyed `"<env>|<BASE_URL>"` -> mobile ->
   {token, userDetails (state/city for customer creation), expires}. TOKENS ONLY — never customer, loan or KYC state (restoring that once caused "PAN already exists").
-- Off: `--fresh-login` on every runner / `GOLD_LOAN_SESSION_CACHE=false` (old path `_login_with_otp`).
+- `--fresh-login` sets GOLD_LOAN_FRESH_LOGIN: `_session_lookup` skips reuse, but new tokens are still
+  saved. GOLD_LOAN_SESSION_CACHE=false = fully off (old path `_login_with_otp`; offline tests use it).
   `GOLD_LOAN_SESSION_FILE` overrides the path. Run metrics print OTP vs reused login counts.
-- The backend invalidates a token when the same mobile logs in elsewhere (portal) — handled by the
-  401 re-login. Offline tests force the cache OFF and a dummy path; the `session` group opts in with a
+- The backend invalidates a token when the same mobile logs in elsewhere (portal) — handled by
+  `_relogin_after_401` for ANY token with a known mobile: first a newer saved token from another run
+  (`_saved_session`, no login), else re-login capped at MAX_RELOGINS_PER_MOBILE=2 per run;
+  `_session_drop(mobile, only_token=)` keeps a newer entry another run wrote. Offline tests force the cache OFF and a dummy path; the `session` group opts in with a
   temp file (a test once leaked fake tokens into the real file — keep that isolation).
 - **Gateway retry (502/503/504 + transport blips), asymmetric on purpose.** nginx answers 502 while the backend restarts, and one blip used to lose a whole run — or a whole `--count` batch (live: `GET /api/customer` 502 killed loan 2, `update-loan-lock` 502 killed loan 1). `_send_with_gateway_retry` retries **GET** on 502/503/504 and on any transport error, with a linear backoff. A **write is NOT retried on a gateway status** — nginx cannot say whether the backend applied it first, and re-sending a create would duplicate a customer/loan/rating, i.e. manufacture the very "already exists" mess the appraiser-request code exists to clean up; it prints a line saying so. A write IS retried on `ConnectError`/`ConnectTimeout` (no connection ⇒ nothing processed) but NOT on a read timeout (the request went out). Tunable: `GOLD_LOAN_GATEWAY_RETRIES` (default 3, `1` disables), `GOLD_LOAN_GATEWAY_RETRY_DELAY` (default 2s).
 - Normalizes the body via `_js_number_normalize` before signing/sending.
