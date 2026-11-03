@@ -263,6 +263,16 @@ python flows/e2e_full_loan.py --amount 300000
 python flows/e2e_full_loan.py --customer MS35QNJP --amount 550000
 ```
 
+**How each environment logs in.** TEST (since Nov 2026) uses **password + MFA OTP**, as its portal does:
+`GET api/auth/login-key` (one-time public key) → `POST api/auth/user-login` with the password encrypted
+(RSA-OAEP / SHA-256, via Node) → `POST api/auth/mfa/verify` with the MFA OTP `123456`. The password comes
+from `config/login_passwords.json` (git-ignored): `{"default": "abcde123"}`, plus `"<mobile>": "..."` for
+accounts that differ (or `{"test": {...}}` per environment), or `GOLD_LOAN_LOGIN_PASSWORD`. UAT still uses
+the OTP login (`user-send-otp` → `verify-login`, OTP `1234`); the OTP length the server announces is
+followed (6 digits → `123456`). An account that has never set a password stops with a clear message
+(the harness does not set passwords on shared accounts). Overrides: `GOLD_LOAN_LOGIN_METHOD=otp|password`,
+`GOLD_LOAN_LOGIN_OTP`, `GOLD_LOAN_MFA_OTP`.
+
 **Saved login sessions.** Every role's login token is saved in `config/session_tokens.json`
 (git-ignored, per environment and mobile) and reused by every runner until it is within 10 minutes of
 expiring (tokens last 24 h), so a run normally sends **no OTP at all** and the backend's hourly login
@@ -289,6 +299,9 @@ All optional; sensible defaults are baked in. Common ones:
 | `GOLD_LOAN_AMOUNT`                    | Requested loan amount (also settable via `--amount`)       |
 | `GOLD_LOAN_HTTP_TIMEOUT`              | Seconds to wait for a server reply (default `60`; httpx's own default of 5 s was too short) |
 | `GOLD_LOAN_TRANSFER_MODE`             | Disbursement transfer mode `neft` / `imps` / `rtgs` (also settable via `--transfer-mode`) |
+| `GOLD_LOAN_LOGIN_METHOD`              | `password` (password + MFA OTP; TEST default) or `otp` (UAT default) |
+| `GOLD_LOAN_LOGIN_PASSWORD`            | Login password for every account (else `config/login_passwords.json`) |
+| `GOLD_LOAN_LOGIN_OTP` / `GOLD_LOAN_MFA_OTP` | Override the static login / MFA OTP (default by length: `1234` / `123456`) |
 | `GOLD_LOAN_SESSION_CACHE`             | `false` = ignore the saved login sessions and log in with OTP (also `--fresh-login`; default on) |
 | `GOLD_LOAN_SESSION_FILE`              | Where login sessions are saved (default `config/session_tokens.json`) |
 | `GOLD_LOAN_CASH_AMOUNT`               | Advance cash at bank details, rupees or `full` (also settable via `--cash-amount`; default none = all by bank) |
@@ -301,7 +314,7 @@ All optional; sensible defaults are baked in. Common ones:
 | `GOLD_LOAN_PURPOSE`                   | Pin one loan purpose by name (also settable via `--purpose`) |
 | `GOLD_LOAN_EXISTING_CUSTOMER_UNIQUE_ID` | Existing-customer unique id (also settable via `--customer`) |
 | `GOLD_LOAN_KYC_MODE`                  | `manual` / `auto` / `ovd` (also settable via `--kyc`)       |
-| `GOLD_LOAN_KYC_TYPE`                  | `kycType` on the v2 endpoints (default `RE_KYC`)           |
+| `GOLD_LOAN_KYC_TYPE`                  | `kycType`: `auto` (default: `NEW_KYC`, or `RE_KYC` if the customer's KYC is already approved) / `NEW_KYC` / `RE_KYC` |
 | `GOLD_LOAN_KYC_PROFILE`               | Path to the real-identity JSON (default `config/kyc_identity.json`) |
 
 Every field of the identity profile also has an env override, so a run can be driven without the
@@ -369,6 +382,36 @@ printing the command to create a loan against each customer it produced:
 `--count > 1` is allowed in `manual` mode, and in `auto` mode together with `--release-kyc-docs`
 (TEST/UAT; the real PAN is freed before each customer). It is refused for `ovd`: the identity profile
 holds one real person's OVD, and a document can be registered against only one customer.
+
+## KYC version 1 on its own
+
+`flows/kyc_v1.py` creates customer(s) and completes KYC on the **version 1** KYC endpoints — the journey
+before the portal moved to `/api/kyc/v2/*` and added the consent OTP:
+
+| Step | v1 call |
+|---|---|
+| Create customer (admin) | `POST /api/customer` (today's lead OTP) |
+| Basic info / PAN | `POST /api/kyc/customer-info` — identifies the customer by name + **mobile number** |
+| Personal details | `POST /api/kyc/customer-kyc-personal` |
+| Address + Aadhaar | `POST /api/kyc/customer-kyc-address` |
+| Submit | `POST /api/kyc/submit-all-kyc-info` (same as v2) |
+| Ops approval | `POST /api/classification/ops-team` (same as v2) |
+
+No consent OTP and no v2 `get-customer-detail`. Identity modes: `manual` (generated PAN / Aadhaar, no
+verification) or `auto` (real PAN + offline-Aadhaar XML, verified — same rules as v2, see below).
+
+```bash
+python flows/kyc_v1.py                         # manual, one new customer
+python flows/kyc_v1.py --kyc auto              # real PAN + Aadhaar XML
+python flows/kyc_v1.py --count 3               # three customers (manual)
+python flows/kyc_v1.py --customer MS35QNJP     # v1 KYC on an existing customer
+python flows/kyc_v1.py --env uat --skip-ops-approval
+```
+
+Flags: `--env`, `--kyc manual|auto`, `--kyc-profile`, `--pan-type pan|form60`, `--customer`, `--count`,
+`--skip-ops-approval`, `--release-kyc-docs`, `--login`, `--fresh-login`. Verified live on UAT (manual:
+customer MW07DMFW approved). The request bodies are the harness's own with the v1 field set
+(`GOLD_LOAN_KYC_API_VERSION=v1`), so encryption and identity rules are shared with v2.
 
 ## Packets on their own
 
@@ -544,6 +587,7 @@ A pass means "the requests we build match the ones the browser sent, and the con
 │   ├── resume_loan.py            Finish an in-flight loan from the stage it is at.
 │   ├── e2e_repayment.py          Renewal / renewal + top-up / top-up / part release / full release.
 │   ├── kyc_only.py               KYC only (all three identity modes, no loan process).
+│   ├── kyc_v1.py                 Customer + KYC on the version 1 KYC endpoints (manual / auto).
 │   ├── kyc_release_documents.py  TEST/UAT: free a PAN / Aadhaar so it can be registered again.
 │   └── create_packets.py         Bulk packet creation + appraiser assignment (admin).
 ├── tests/                        OFFLINE regression tests only (no network). Naming: test_<what>.py
@@ -649,7 +693,7 @@ and `flows/e2e_stop_before_disbursement.py` (stops after ops rating), which reus
 | `--env` | `test` \| `uat` | `test` | Target environment. |
 | `--kyc` | `manual` \| `auto` \| `ovd` | `manual` | Identity mode (as in `flows/e2e_full_loan.py`). |
 | `--kyc-profile` | path | `config/kyc_identity.json` | Real identity data for `auto` / `ovd`. |
-| `--kyc-type` | string | `RE_KYC` | `kycType` sent on the v2 endpoints (the captured OVD flow used `NEW_KYC`). |
+| `--kyc-type` | `auto`/`NEW_KYC`/`RE_KYC` | `auto` | `kycType` on the KYC endpoints. `auto` follows the portal: `NEW_KYC` for a customer without an approved KYC, `RE_KYC` only when it is already approved. |
 | `--customer` | customer unique id | *(none — create new)* | Run KYC on an EXISTING customer (Re-KYC). |
 | `--count`, `-n` | N | `1` | How many new customers to create and KYC (`manual`; `auto` only with `--release-kyc-docs`). |
 | `--skip-ops-approval` | *(switch)* | off | Submit the KYC but leave it pending (no ops approval). |

@@ -27,6 +27,8 @@ sys.path.insert(0, ROOT)
 os.environ["GOLD_LOAN_COLOR"] = "off"
 # Never read or write the real saved login sessions: the session tests opt in with a temp file.
 os.environ["GOLD_LOAN_SESSION_CACHE"] = "false"
+# The mocks below model the OTP login; the password + MFA route has its own test.
+os.environ["GOLD_LOAN_LOGIN_METHOD"] = "otp"
 os.environ["GOLD_LOAN_SESSION_FILE"] = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                     "__no_such_session_file__.json")
 os.environ.setdefault("GOLD_LOAN_LOG_LEVEL", "quiet")
@@ -149,6 +151,21 @@ def http_error(status, payload, path="/x"):
 # GROUP: kyc-body -- generated request bodies vs the captured ones
 # --------------------------------------------------------------------------------------------
 
+@test("kyc-body: kycType follows the customer like the portal (NEW_KYC first, RE_KYC if approved)")
+def _():
+    s = suite("manual")
+    assert s.kyc_type_requested == "auto"
+    assert s.kyc_type == "NEW_KYC"                # new customer, nothing fetched yet
+    s.kyc_status = "approved"                     # the KYC's own approval must not flip it
+    assert s.kyc_type == "NEW_KYC"
+    s._kyc_type = ""                              # next customer (batch reset)
+    assert s.kyc_type == "RE_KYC"                 # already-approved customer -> Re-KYC
+    s._kyc_type, s.kyc_status = "", "pending"
+    assert s.kyc_type == "NEW_KYC"
+    s.kyc_type_requested = "RE_KYC"               # GOLD_LOAN_KYC_TYPE / --kyc-type forces it
+    assert s.kyc_type == "RE_KYC"
+
+
 @test("kyc-body: manual submit-basic-info is byte-identical to gold-loan-e2e-flow.har")
 def _():
     expected = req_body(find(E2E, "submit-basic-info"))
@@ -163,6 +180,36 @@ def _():
     d = diff_bodies(mine, expected)
     ok(not d, f"differs from capture: {d}")
     eq(len(mine), 17, "field count")
+
+@test("kyc-body: KYC v1 uses the old endpoints and the v1 request shapes; v2 is untouched")
+def _():
+    s = suite()
+    s.first_name, s.last_name, s.mobile_number, s.module_id = "A", "B", "9123456789", "1"
+    basic = {"id": 5, "firstName": "A", "lastName": "B", "panType": "pan", "panCardNumber": "ABCDE1234F",
+             "panImage": "uploads/lead/p.png", "panImg": "http://x/p.png", "moduleId": "1",
+             "isAutoApproved": False, "isPanVerified": False, "kycType": "RE_KYC", "dateOfBirth": None}
+    eq(s._kyc_call("/api/kyc/v2/submit-basic-info", basic), ("/api/kyc/v2/submit-basic-info", basic),
+       "v2 default: path and body unchanged")
+    s.kyc_api_version = "v1"
+    path, v1 = s._kyc_call("/api/kyc/v2/submit-basic-info", basic)
+    eq(path, "/api/kyc/customer-info", "v1 endpoint")
+    eq(v1["mobileNumber"], "9123456789", "v1 identifies the customer by mobile number")
+    ok("kycType" not in v1 and "id" not in v1 and "panImg" not in v1, "no v2-only fields")
+    eq(set(v1), {"firstName", "lastName", "mobileNumber", "otp", "panType", "form60", "panImage",
+                 "panCardNumber", "dateOfBirth", "userType", "moduleId", "organizationTypeId",
+                 "dateOfIncorporation", "form60Image", "isAutoApproved", "isPanVerified"},
+       "exactly the v1 customer-info fields")
+    path, v1 = s._kyc_call("/api/kyc/v2/customer-kyc-personal", {"customerId": 1, "profileImg": "x",
+                                                                 "kycType": "RE_KYC", "gender": "m"})
+    eq((path, "profileImg" in v1, "kycType" in v1, v1["gender"]),
+       ("/api/kyc/customer-kyc-personal", False, False, "m"), "personal: v1 fields only")
+    path, v1 = s._kyc_call("/api/kyc/v2/customer-kyc-address", {
+        "customerId": 1, "latitude": 1.0, "kycType": "RE_KYC", "identityProofNumber": "enc",
+        "address": [{"addressType": "permanent", "addressProofImg": ["x"], "pinCode": 400001}]})
+    eq(path, "/api/kyc/customer-kyc-address", "v1 address endpoint")
+    ok("latitude" not in v1 and "kycType" not in v1 and v1["moduleId"] == "1", "address: v1 fields + moduleId")
+    eq(set(v1["address"][0]) <= set(G.KYC_V1_ADDRESS_ENTRY_FIELDS), True, "address entries: v1 fields")
+    close(s)
 
 @test("kyc-body: ovd submit-basic-info is byte-identical to ovd-kyc-flow.har")
 def _():
@@ -3957,6 +4004,72 @@ def _():
     eq(G._session_rejected(r(403, {"message": "You are not allowed to cencel this loan."})), False,
        "a permission refusal is not a session problem")
     eq(G._session_rejected(r(400, {"message": "Invalid value for type"})), False, "a business 400 is not")
+
+@test("session: the login OTP follows the announced length; enrollment stops with a clear message")
+def _():
+    s = suite()
+    eq(s._login_otp({"otpLength": 6}), "123456", "TEST: 6-digit OTP")
+    eq(s._login_otp({"otpLength": 4}), "1234", "UAT: 4-digit OTP")
+    eq(s._login_otp({}), "1234", "no length announced: the old 4 digits")
+    os.environ["GOLD_LOAN_LOGIN_OTP"] = "999999"
+    try:
+        eq(s._login_otp({"otpLength": 6}), "999999", "GOLD_LOAN_LOGIN_OTP overrides")
+    finally:
+        del os.environ["GOLD_LOAN_LOGIN_OTP"]
+    try:
+        s._check_login_answer({"enrollmentRequired": True, "enrollToken": "t", "otpLength": 6}, "8880008881")
+    except RuntimeError as e:
+        ok("password enrollment" in str(e) and "8880008881" in str(e), f"says what is needed: {e}")
+    else:
+        raise Fail("enrollmentRequired must stop the login")
+    s._check_login_answer({"Token": "x"}, "8880008881")   # a session passes through
+    close(s)
+
+@test("session: TEST password login = login-key -> user-login (RSA-OAEP password) -> mfa/verify 123456")
+def _():
+    import base64, subprocess as sp
+    # a throwaway RSA key pair from Node, to check the encryption round-trips
+    keys = json.loads(sp.run(["node", "-e", """
+        const c=require('crypto');const k=c.generateKeyPairSync('rsa',{modulusLength:2048});
+        console.log(JSON.stringify({pub:k.publicKey.export({type:'spki',format:'pem'}),
+                                    priv:k.privateKey.export({type:'pkcs8',format:'pem'})}));"""],
+        capture_output=True, text=True, check=True).stdout)
+    s = suite()
+    os.environ["GOLD_LOAN_LOGIN_METHOD"] = "password"
+    os.environ["GOLD_LOAN_LOGIN_PASSWORD"] = "abcde123"
+    sent = []
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        sent.append((path, json_data, s.auth_token))
+        payload = {"/api/auth/login-key": {"publicKey": keys["pub"], "kid": "k1", "nonce": "n1"},
+                   "/api/auth/user-login": {"mfaRequired": True, "mfaToken": "m1", "referenceCode": "r1",
+                                            "otpLength": 6},
+                   "/api/auth/mfa/verify": {"Token": "tok-ok", "userDetails": {"id": 1473}}}[path]
+        class R:
+            def json(self_inner): return payload
+        return R()
+    s._make_authenticated_request = fake
+    s.auth_token = "stale"
+    try:
+        token, details = asyncio.run(quiet_async(s._otp_login, "8880008881"))
+    finally:
+        del os.environ["GOLD_LOAN_LOGIN_METHOD"]; del os.environ["GOLD_LOAN_LOGIN_PASSWORD"]
+        os.environ["GOLD_LOAN_LOGIN_METHOD"] = "otp"
+    eq((token, details), ("tok-ok", {"id": 1473}), "session from mfa/verify")
+    eq([p for p, _, _ in sent], ["/api/auth/login-key", "/api/auth/user-login", "/api/auth/mfa/verify"],
+       "the portal's three calls")
+    login = sent[1][1]
+    eq((login["mobileNumber"], login["kid"], login["nonce"]), ("8880008881", "k1", "n1"), "user-login body")
+    plain = sp.run(["node", "-e", """
+        const c=require('crypto');let d='';process.stdin.on('data',x=>d+=x).on('end',()=>{const j=JSON.parse(d);
+        process.stdout.write(c.privateDecrypt({key:j.priv,padding:c.constants.RSA_PKCS1_OAEP_PADDING,oaepHash:'sha256'},
+        Buffer.from(j.enc,'base64')).toString());});"""],
+        input=json.dumps({"priv": keys["priv"], "enc": login["encPassword"]}), capture_output=True, text=True).stdout
+    decrypted = json.loads(plain)
+    eq((decrypted["password"], decrypted["nonce"]), ("abcde123", "n1"), "RSA-OAEP/SHA-256 of {password, nonce, ts}")
+    ok("password" not in json.dumps(login).lower().replace("encpassword", ""), "the password never travels in clear")
+    eq(sent[2][1], {"mfaToken": "m1", "referenceCode": "r1", "otp": "123456"}, "MFA OTP 123456")
+    ok(all(t is None for _, _, t in sent), "sent without a bearer token")
+    close(s)
 
 @test("session: --fresh-login (cache off) always uses OTP and saves nothing")
 def _():

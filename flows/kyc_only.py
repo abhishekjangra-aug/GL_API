@@ -27,7 +27,7 @@ Usage:
     python flows/kyc_only.py --kyc ovd                    # real OVD + Form 97, no PAN
     python flows/kyc_only.py --count 5                    # seed 5 KYC'd customers (manual only)
     python flows/kyc_only.py --customer MS35QNJP          # Re-KYC an existing customer
-    python flows/kyc_only.py --kyc-type NEW_KYC           # NEW_KYC instead of the RE_KYC default
+    python flows/kyc_only.py --kyc-type RE_KYC            # force RE_KYC (default: from the customer's status)
     python flows/kyc_only.py --skip-ops-approval          # leave the KYC pending for a manual review
     python flows/kyc_only.py --env uat --kyc ovd
 
@@ -99,6 +99,7 @@ class KycOnlyTest:
         s.kyc_verification_log = []
         s.kyc_mode_effective = s.kyc_mode_requested
         s.kyc_mode = s.kyc_mode_requested
+        s._kyc_type = ""                        # NEW_KYC / RE_KYC is decided per customer
 
     # --- one customer ------------------------------------------------------------------------
 
@@ -187,9 +188,9 @@ class KycOnlyTest:
     async def run(self):
         s = self.suite
         s._banner(
-            "GOLD LOAN - KYC ONLY",
+            "GOLD LOAN - KYC ONLY" + (" (KYC v1)" if s.kyc_api_version == "v1" else ""),
             f"env={s.env_name.upper()}   kyc={s.kyc_mode_requested}   "
-            f"kycType={s.kyc_type}   customers={self.count}   base={s.BASE_URL}",
+            f"kycType={s.kyc_type_requested}   customers={self.count}   base={s.BASE_URL}",
         )
         try:
             s._log_step("Authentication")
@@ -303,9 +304,11 @@ def main():
     parser.add_argument("--kyc-profile", metavar="PATH",
                         help="JSON file with the REAL identity data for --kyc auto/ovd "
                              "(default: config/kyc_identity.json).")
-    parser.add_argument("--kyc-type", default=os.getenv("GOLD_LOAN_KYC_TYPE", "RE_KYC"),
-                        help="kycType sent on the v2 endpoints (default: %(default)s). "
-                             "The captured OVD flow used NEW_KYC.")
+    parser.add_argument("--kyc-type", type=str.upper, choices=["AUTO", "NEW_KYC", "RE_KYC"],
+                        default=(os.getenv("GOLD_LOAN_KYC_TYPE") or "auto").upper(),
+                        help="kycType on the KYC endpoints. AUTO (default) follows the portal: "
+                             "NEW_KYC for a customer without an approved KYC, RE_KYC when it is "
+                             "already approved. NEW_KYC / RE_KYC force one.")
     parser.add_argument("--customer", metavar="UNIQUE_ID",
                         help="Run KYC against an EXISTING customer (Re-KYC) instead of creating one.")
     parser.add_argument("--count", "-n", type=int, default=1,
@@ -352,7 +355,7 @@ def main():
 
     suite = GoldLoanApiTest()
     print(f">> Environment: {args.env.upper()} ({suite.BASE_URL})")
-    print(f">> KYC mode: {args.kyc}   |  kycType: {args.kyc_type}   |  "
+    print(f">> KYC mode: {args.kyc}   |  kycType: {args.kyc_type.lower() if args.kyc_type == 'AUTO' else args.kyc_type}   |  "
           f"ops approval: {'yes' if args.ops_approval else 'skipped'}")
     if args.customer:
         print(f">> Mode: Re-KYC of existing customer {args.customer}")

@@ -53,6 +53,8 @@ class GoldLoanApiTest:
             "partner_mobiles": {"152": "8767002003", "10": "9375876473"},  # ROSHAN / ARVOG ARV10
             "partner_user_mobiles": {"152": "8652849318",   # roshan ghadge (id 170)
                                      "10": "7777777788"},   # arvog: newbranch user
+            # Since Nov 2026 TEST logs in with password + MFA OTP (see _password_login).
+            "login_method": "password",
         },
         "uat": {
             "base_url": "https://gold-loan-backend-api.gfau.augmont.com",
@@ -270,6 +272,11 @@ class GoldLoanApiTest:
         # bank-details step (the portal's "advance cash"); the bank transfer pays the rest. 'full' =
         # everything in cash (to-be-paid 0, the portal's dummy "TO PAID ZERO" bank details).
         self.cash_amount_choice = (os.getenv("GOLD_LOAN_CASH_AMOUNT") or "").strip().lower()
+        # GOLD_LOAN_KYC_API_VERSION=v1 (flows/kyc_v1.py): the three KYC calls v2 renamed go to their
+        # v1 endpoints (customer-info / customer-kyc-personal / customer-kyc-address, no kycType).
+        self.kyc_api_version = (os.getenv("GOLD_LOAN_KYC_API_VERSION") or "v2").strip().lower()
+        if self.kyc_api_version not in ("v1", "v2"):
+            raise ValueError(f"GOLD_LOAN_KYC_API_VERSION must be v1 or v2, not {self.kyc_api_version!r}.")
         # --igl-docs N|all / --igl-doc-files M: how many of the purpose's income document TYPES an IGL
         # loan fills at upload documents (default 1, the page's minimum) and how many PDFs go under
         # each (1..10, the page's maximum). The LIP form is sent alongside whenever it is required.
@@ -432,9 +439,16 @@ class GoldLoanApiTest:
         self.existing_customer_id = os.getenv("GOLD_LOAN_EXISTING_CUSTOMER_ID", "")
         self.existing_customer_unique_id = os.getenv("GOLD_LOAN_EXISTING_CUSTOMER_UNIQUE_ID", "")
         self.kyc_status = ""  # captured from get_customer_by_id (approved/pending/etc.)
-        # KYC v2 flow: kycType drives the v2 endpoints. RE_KYC re-runs KYC for an existing customer;
-        # a fresh customer's KYC also flows through the same v2 endpoints.
-        self.kyc_type = os.getenv("GOLD_LOAN_KYC_TYPE", "RE_KYC")
+        # kycType on the KYC endpoints. Like the portal (reKycType = kycStatus === 'approved' ?
+        # RE_KYC : NEW_KYC) it follows the customer: NEW_KYC for a first KYC, RE_KYC only when the
+        # customer's KYC is already approved. GOLD_LOAN_KYC_TYPE=NEW_KYC|RE_KYC forces one.
+        self.kyc_type_requested = (os.getenv("GOLD_LOAN_KYC_TYPE") or "auto").strip().upper()
+        if self.kyc_type_requested == "AUTO":
+            self.kyc_type_requested = "auto"
+        elif self.kyc_type_requested not in self.KYC_TYPES:
+            raise ValueError(f"GOLD_LOAN_KYC_TYPE must be auto or one of {self.KYC_TYPES}, "
+                             f"not {self.kyc_type_requested!r}.")
+        self._kyc_type = ""
         self.kyc_reference_code = ""  # OTP consent reference (send-otp -> verify-otp-admin)
         # --- KYC verification mode + real identity data ----------------------------------------
         self.kyc_mode = (os.getenv("GOLD_LOAN_KYC_MODE", self.KYC_MODE_MANUAL) or "").strip().lower()
@@ -1307,26 +1321,172 @@ class GoldLoanApiTest:
         if data.get(self._session_key(), {}).pop(str(mobile), None) is not None:
             self._write_sessions(data)
 
+    LOGIN_METHODS = ("otp", "password")
+    KYC_TYPES = ("NEW_KYC", "RE_KYC")
+
+    @property
+    def kyc_type(self) -> str:
+        """NEW_KYC or RE_KYC for this customer's KYC. A forced type wins; otherwise it is decided
+        from the customer's kycStatus the first time it is needed and then kept, so the approval
+        that the KYC itself produces does not flip it to RE_KYC halfway (portal rule)."""
+        if self.kyc_type_requested != "auto":
+            return self.kyc_type_requested
+        if not self._kyc_type:            # unknown status = a customer with no KYC yet
+            self._kyc_type = "RE_KYC" if (self.kyc_status or "").lower() == "approved" else "NEW_KYC"
+        return self._kyc_type
+
+    @kyc_type.setter
+    def kyc_type(self, value: str):
+        self._kyc_type = value or ""
+    LOGIN_PASSWORDS_FILE = os.path.join("config", "login_passwords.json")
+
+    @property
+    def login_method(self) -> str:
+        """How this environment's users log in: 'password' (password + MFA OTP; TEST since Nov 2026)
+        or 'otp' (user-send-otp -> verify-login; UAT). GOLD_LOAN_LOGIN_METHOD overrides."""
+        method = (os.getenv("GOLD_LOAN_LOGIN_METHOD") or self.env.get("login_method") or "otp").strip().lower()
+        if method not in self.LOGIN_METHODS:
+            raise ValueError(f"GOLD_LOAN_LOGIN_METHOD must be one of {self.LOGIN_METHODS}, not {method!r}.")
+        return method
+
+    def _login_password(self, mobile: str) -> str:
+        """The account's password: GOLD_LOAN_LOGIN_PASSWORD, else config/login_passwords.json
+        ({"default": "...", "<mobile>": "..."}, git-ignored like the rest of config/)."""
+        forced = os.getenv("GOLD_LOAN_LOGIN_PASSWORD")
+        if forced:
+            return forced
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), self.LOGIN_PASSWORDS_FILE)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            data = {}
+        per_env = data.get(self.env_name) if isinstance(data.get(self.env_name), dict) else {}
+        password = per_env.get(str(mobile)) or data.get(str(mobile)) or per_env.get("default") or data.get("default")
+        if not password:
+            raise RuntimeError(
+                f"{self.env_name.upper()} logs in with a password, and none is set for {mobile}. Put it in "
+                f"{self.LOGIN_PASSWORDS_FILE} as {{\"default\": \"...\", \"{mobile}\": \"...\"}} or set "
+                "GOLD_LOAN_LOGIN_PASSWORD.")
+        return password
+
+    @staticmethod
+    def _encrypt_login_password(password: str, public_key_pem: str, nonce: str) -> str:
+        """LoginCryptoService.encrypt: RSA-OAEP (SHA-256) over JSON {password, nonce, ts} with the
+        one-time SPKI key from api/auth/login-key, base64. Node's crypto (Node is already required)."""
+        script = """
+        const crypto = require('crypto');
+        let input = '';
+        process.stdin.setEncoding('utf8');
+        process.stdin.on('data', c => input += c);
+        process.stdin.on('end', () => {
+          const { password, nonce, publicKey } = JSON.parse(input);
+          let pem = publicKey;
+          if (!pem.includes('BEGIN')) pem = '-----BEGIN PUBLIC KEY-----\\n' + pem + '\\n-----END PUBLIC KEY-----';
+          const payload = JSON.stringify({ password, nonce, ts: Date.now() });
+          const cipher = crypto.publicEncrypt(
+            { key: pem, padding: crypto.constants.RSA_PKCS1_OAEP_PADDING, oaepHash: 'sha256' },
+            Buffer.from(payload, 'utf8'));
+          process.stdout.write(cipher.toString('base64'));
+        });
+        """
+        result = subprocess.run(["node", "-e", script], text=True, capture_output=True, check=False,
+                                input=json.dumps({"password": password, "nonce": nonce, "publicKey": public_key_pem}))
+        if result.returncode != 0 or not result.stdout.strip():
+            raise RuntimeError(f"Password encryption failed: {result.stderr.strip()[:300]}")
+        return result.stdout.strip()
+
+    async def _password_login(self, mobile: str):
+        """TEST's login since Nov 2026 (LoginComponent.submit -> MfaOtpComponent.submit):
+        GET login-key -> POST user-login {mobileNumber, encPassword, kid, nonce} -> mfaRequired
+        {mfaToken, referenceCode, otpLength} -> POST mfa/verify {mfaToken, referenceCode, otp}.
+        Returns the final answer (Token + userDetails). Bearer-less, like the OTP route."""
+        saved_token, self.auth_token = self.auth_token, None
+        try:
+            key = (await self._make_authenticated_request('GET', "/api/auth/login-key")).json()
+            key = key.get("data") if isinstance(key.get("data"), dict) else key
+            enc = self._encrypt_login_password(self._login_password(mobile), key.get("publicKey"), key.get("nonce"))
+            first = (await self._make_authenticated_request(
+                'POST', "/api/auth/user-login",
+                json_data={"mobileNumber": mobile, "encPassword": enc, "kid": key.get("kid"),
+                           "nonce": key.get("nonce")},
+                headers={'Content-Type': 'application/json'})).json()
+            self._check_login_answer(first, mobile)
+            if first.get("Token"):
+                return first                      # no second factor asked for
+            if not first.get("mfaRequired") or not first.get("mfaToken"):
+                raise RuntimeError(f"user-login for {mobile} returned neither a session nor an MFA step: "
+                                   f"{str(first)[:300]}")
+            return (await self._make_authenticated_request(
+                'POST', "/api/auth/mfa/verify",
+                json_data={"mfaToken": first["mfaToken"], "referenceCode": first.get("referenceCode"),
+                           "otp": self._mfa_otp(first)},
+                headers={'Content-Type': 'application/json'})).json()
+        finally:
+            self.auth_token = saved_token
+
+    def _mfa_otp(self, first: dict) -> str:
+        """The MFA OTP: GOLD_LOAN_MFA_OTP, else the static test OTP of the announced length (123456)."""
+        forced = (os.getenv("GOLD_LOAN_MFA_OTP") or "").strip()
+        return forced or self.STATIC_LOGIN_OTPS.get(int(first.get("otpLength") or 6), "123456")
+
+    # Static test OTPs by length. TEST moved to 6-digit login OTPs (Nov 2026: user-send-otp answers
+    # "otpLength": 6, and the old 1234 makes verify-login 500 "Something went wrong."); UAT still 4.
+    STATIC_LOGIN_OTPS = {4: "1234", 6: "123456"}
+
+    def _login_otp(self, send_answer: dict) -> str:
+        """The OTP to send to verify-login: GOLD_LOAN_LOGIN_OTP if set, else the static test OTP of
+        the length the server announced (user-send-otp `otpLength`, as the portal sizes its box)."""
+        forced = (os.getenv("GOLD_LOAN_LOGIN_OTP") or "").strip()
+        if forced:
+            return forced
+        length = int((send_answer or {}).get("otpLength") or 4)
+        return self.STATIC_LOGIN_OTPS.get(length, "123456"[:length] if length <= 6 else "1" * length)
+
+    def _check_login_answer(self, body: dict, mobile: str) -> None:
+        """verify-login may now return no session: `enrollmentRequired` (+ enrollToken) means the
+        account must first set a PASSWORD (portal: secure-account -> api/auth/mfa/enroll) and then log
+        in with password + MFA OTP. That changes how everyone logs into a shared test account, so the
+        harness stops and says so instead of enrolling by itself."""
+        if isinstance(body, dict) and body.get("enrollmentRequired"):
+            raise RuntimeError(
+                f"Login for {mobile} needs password enrollment first (verify-login answered "
+                "enrollmentRequired). TEST's new login asks this account to set a password and use "
+                "password + MFA OTP. Enroll it once in the portal (Secure account), then tell the harness "
+                "which login to use -- it does not set passwords on shared accounts by itself.")
+
     async def _otp_login(self, mobile: str):
-        """user-send-otp -> verify-login (static OTP 1234). Returns (token, userDetails). Sent
-        without a bearer token: a stale one must not ride along when this is a re-login."""
+        """user-send-otp -> verify-login with the static test OTP of the announced length. Returns
+        (token, userDetails). Sent without a bearer token: a stale one must not ride along when
+        this is a re-login."""
+        if self.login_method == "password":
+            body = await self._password_login(mobile)
+            return self._finish_login(mobile, body)
         saved_token, self.auth_token = self.auth_token, None
         try:
             sent = await self._make_authenticated_request(
                 'POST', "/api/user-otp/user-send-otp",
                 json_data={"mobileNumber": mobile, "type": "login", "id": None},
                 headers={'Content-Type': 'application/json'})
-            reference = sent.json().get('referenceCode')
-            assert reference, f"send-otp returned no referenceCode for {mobile}: {sent.json()}"
+            sent_body = sent.json() if isinstance(sent.json(), dict) else {}
+            reference = sent_body.get('referenceCode')
+            assert reference, f"send-otp returned no referenceCode for {mobile}: {sent_body}"
+            self.reference_code = reference
             verified = await self._make_authenticated_request(
                 'POST', "/api/auth/verify-login",
-                json_data={"referenceCode": reference, "otp": 1234, "type": "login", "isFromWeb": True},
+                json_data={"referenceCode": reference, "otp": self._login_otp(sent_body),
+                           "type": "login", "isFromWeb": True},
                 headers={'Content-Type': 'application/json'})
         finally:
             self.auth_token = saved_token
         body = verified.json()
+        self._check_login_answer(body, mobile)
+        return self._finish_login(mobile, body)
+
+    def _finish_login(self, mobile: str, body: dict):
+        """Record a new session (either login route) and return (token, userDetails)."""
         token = body.get('Token')
-        assert token, f"verify-login returned no Token for {mobile}: {body}"
+        assert token, f"login returned no Token for {mobile}: {str(body)[:300]}"
         user_details = body.get('userDetails') or {}
         self.logins_fresh += 1
         self._token_mobile[token] = mobile
@@ -1346,7 +1506,8 @@ class GoldLoanApiTest:
             expires = datetime.datetime.fromtimestamp(self._token_expiry(token)).strftime("%d %b %H:%M")
             print(f"{label}: reusing the saved session for {mobile} (valid until {expires}; no OTP).")
             return token, user_details
-        print(f"{label}: logging in {mobile} with OTP...")
+        how = "password + MFA OTP" if self.login_method == "password" else "OTP"
+        print(f"{label}: logging in {mobile} with {how}...")
         return await self._otp_login(mobile)
 
     SESSION_REJECTION_MARKERS = ("please login", "login first", "auth failed", "token", "session",
@@ -1374,7 +1535,7 @@ class GoldLoanApiTest:
         mobile = self._token_mobile.get(stale_token)
         if not mobile or stale_token not in self._restored_tokens:
             return None
-        print(self._c(f"The saved session for {mobile} was rejected; logging in again with OTP.", "yellow"))
+        print(self._c(f"The saved session for {mobile} was rejected; logging in again.", "yellow"))
         self._restored_tokens.discard(stale_token)
         self._session_drop(mobile)
         token, _ = await self._otp_login(mobile)
@@ -1409,50 +1570,10 @@ class GoldLoanApiTest:
             print(f"Error decoding JWT: {e}")
 
     async def _login_with_otp(self, mobile_number: str):
-        # Step 1: Send OTP
-        api_path_send_otp = "/api/user-otp/user-send-otp"
-        request_body_send_otp = {
-            "mobileNumber": mobile_number,
-            "type": "login",
-            "id": None
-        }
-        print(f"Attempting to send OTP to {mobile_number}...")
-        response_send_otp = await self._make_authenticated_request(
-            'POST',
-            api_path_send_otp,
-            json_data=request_body_send_otp,
-            headers={'Content-Type': 'application/json'}, # Explicitly set for initial login
-        )
-        response_data_send_otp = response_send_otp.json()
-        self.reference_code = response_data_send_otp.get('referenceCode')
-        assert self.reference_code, f"Reference code not found in send-otp response: {response_data_send_otp}"
-        print(f"OTP sent successfully. Reference Code: {self.reference_code}")
-        self._print_json_block("Cookies", dict(self.client.cookies))
-
-        # Step 2: Verify Login with OTP
-        api_path_verify_login = "/api/auth/verify-login"
-        otp_to_verify = 1234
-        request_body_verify_login = {
-            "referenceCode": self.reference_code,
-            "otp": otp_to_verify,
-            "type": "login",
-            "isFromWeb": True
-        }
-        print(f"Attempting to verify login with OTP {otp_to_verify} and Reference Code {self.reference_code}...")
-        response_verify_login = await self._make_authenticated_request(
-            'POST',
-            api_path_verify_login,
-            json_data=request_body_verify_login,
-            headers={'Content-Type': 'application/json'}, # Explicitly set for initial login
-        )
-
-        response_data_verify_login = response_verify_login.json()
-        self.auth_token = response_data_verify_login.get('Token')
-        self._user_details_by_token[self.auth_token] = response_data_verify_login.get('userDetails') or {}
-        self.logins_fresh += 1
-        self._token_mobile[self.auth_token] = mobile_number
-        print(f"Login successful. New auth_token obtained: {self.auth_token[:10]}...") # Added debug print
-        assert self.auth_token, f"Auth Token not found in verify-login response: {response_data_verify_login}"
+        """Main-role OTP login without the saved sessions (--fresh-login)."""
+        print(f"Logging in {mobile_number} ({self.login_method})...")
+        token, _ = await self._otp_login(mobile_number)
+        self.auth_token = token
         print("Login successful. Auth token obtained.")
         self._after_login(mobile_number)
 
@@ -1753,6 +1874,7 @@ class GoldLoanApiTest:
             if branch.get("id"):
                 self.customer_branch_id = str(branch["id"])
         print(f"Fetched customer {self.customer_id} (kycStatus={self.kyc_status or 'unknown'}).")
+        return data
 
     async def appraiser_request_branch_id(self):
         """The portal posts the appraiser request with the CUSTOMER's branch
@@ -1764,7 +1886,6 @@ class GoldLoanApiTest:
                 print(f"Customer lookup for the branch failed ({e.response.status_code}); using the login branch.")
         branch = self.customer_branch_id or self.internal_branch_id
         return int(branch) if str(branch).isdigit() else None
-        return data
 
     async def get_kyc_customer_detail(self) -> dict:
         # KYC v2: fetch by customerId + kycType (the old /api/kyc/get-customer-detail is superseded).
@@ -2630,6 +2751,7 @@ class GoldLoanApiTest:
             if self.form97_image:
                 request_body["form97Image"] = self.form97_image
                 request_body["form97Img"] = f"{self.BASE_URL}/{self.form97_image}"
+            api_path, request_body = self._kyc_call(api_path, request_body)
             response = await self._make_authenticated_request(
                 'POST',
                 api_path,
@@ -2641,6 +2763,64 @@ class GoldLoanApiTest:
             if data.get('customerId'):
                 self.customer_id = str(data['customerId'])
             print(f'Submit basic info successful. Customer KYC ID: {self.customer_kyc_id}')
+
+    KYC_V1_PATHS = {
+        "/api/kyc/v2/submit-basic-info": "/api/kyc/customer-info",
+        "/api/kyc/v2/customer-kyc-personal": "/api/kyc/customer-kyc-personal",
+        "/api/kyc/v2/customer-kyc-address": "/api/kyc/customer-kyc-address",
+    }
+
+    # The v1 request fields, from the v1 harness (git 8f3d435, src/main.py).
+    KYC_V1_PERSONAL_FIELDS = (
+        "customerId", "customerKycId", "profileImage", "alternateMobileNumber", "gender", "spouseName",
+        "martialStatus", "signatureProof", "occupationId", "dateOfBirth", "age", "moduleId", "userType",
+        "email", "alternateEmail", "landLineNumber", "gstinNumber", "cinNumber", "constitutionsDeed",
+        "constitutionsDeedFileName", "gstCertificate", "gstCertificateFileName", "annualIncome",
+        "motherName", "religionId", "qualificationId", "physicalChallengeId", "politicalExposedId",
+        "specialCategoryId")
+    KYC_V1_ADDRESS_FIELDS = (
+        "customerId", "customerKycId", "identityTypeId", "identityProof", "identityProofNumber",
+        "moduleId", "userType", "isAutoApproved", "nameAsPerAadhaar", "address", "isCityEdit",
+        "isAahaarVerified", "unMaskedIdentityProof")
+    KYC_V1_ADDRESS_ENTRY_FIELDS = (
+        "addressType", "addressProofTypeId", "addressProofNumber", "address", "stateId", "cityId",
+        "pinCode", "landmark", "addressProof", "unMaskedAddressProof")
+
+    def _kyc_call(self, v2_path: str, body: dict):
+        """(path, body) for one of the KYC calls v2 renamed. Unchanged on v2. On v1: the old endpoint
+        and the v1 request shape -- customer-info identifies the customer by name + MOBILE NUMBER
+        (no customer id; 400 "mobile Number is required" otherwise) and carries otp / form60 /
+        organizationTypeId / dateOfIncorporation; personal and address are the v2 bodies without the
+        fields v2 added (kycType, *Img / *FileName, lat/long, the XML fields)."""
+        if self.kyc_api_version != "v1":
+            return v2_path, body
+        if v2_path.endswith("submit-basic-info"):
+            v1 = {
+                "firstName": body.get("firstName") or self.first_name,
+                "lastName": body.get("lastName") or self.last_name,
+                "mobileNumber": self.mobile_number,
+                "otp": None,
+                "panType": body.get("panType"),
+                "form60": None,
+                "panImage": body.get("panImage"),
+                "panCardNumber": body.get("panCardNumber"),
+                "dateOfBirth": body.get("dateOfBirth"),
+                "userType": None,
+                "moduleId": body.get("moduleId") or self.module_id,
+                "organizationTypeId": None,
+                "dateOfIncorporation": None,
+                "form60Image": self.form60_image if body.get("panType") == "form60" else None,
+                "isAutoApproved": body.get("isAutoApproved", False),
+                "isPanVerified": body.get("isPanVerified", False),
+            }
+        elif v2_path.endswith("customer-kyc-personal"):
+            v1 = {k: body.get(k) for k in self.KYC_V1_PERSONAL_FIELDS}
+        else:
+            v1 = {k: body.get(k) for k in self.KYC_V1_ADDRESS_FIELDS}
+            v1["moduleId"] = v1.get("moduleId") or self.module_id
+            v1["address"] = [{k: entry.get(k) for k in self.KYC_V1_ADDRESS_ENTRY_FIELDS}
+                             for entry in (body.get("address") or []) if isinstance(entry, dict)]
+        return self.KYC_V1_PATHS[v2_path], v1
 
     async def _kyc_consent_otp(self):
         """New v2 step: capture KYC consent via OTP (send-otp -> verify-otp-admin). The consent
@@ -2881,6 +3061,7 @@ class GoldLoanApiTest:
             "specialCategoryId": int(self.special_category_id) if self.special_category_id else None, # Convert to int
             "kycType": self.kyc_type,  # v2 requires kycType
         }
+        api_path, request_body = self._kyc_call(api_path, request_body)
         response = await self._make_authenticated_request(
             'POST',
             api_path,
@@ -3059,8 +3240,9 @@ class GoldLoanApiTest:
                 "isAahaarVerified": self.aadhaar_verified,  # server's spelling, not a typo here
                 "kycType": self.kyc_type,
             }
-            await self._make_authenticated_request('POST', "/api/kyc/v2/customer-kyc-address", json_data=v2_body)
-            print('Submitted customer-kyc-address (v2).')
+            address_path, address_body = self._kyc_call("/api/kyc/v2/customer-kyc-address", v2_body)
+            await self._make_authenticated_request('POST', address_path, json_data=address_body)
+            print(f"Submitted customer-kyc-address ({self.kyc_api_version}).")
         except httpx.HTTPStatusError as e:
             # A duplicate document never reaches here: _make_authenticated_request raises
             # KycDocumentAlreadyExistsError, which this handler deliberately does not catch.
@@ -8047,7 +8229,7 @@ class GoldLoanApiTest:
             f"  API calls: {self._c(total, 'bold')}   {ok_txt}   {fail_txt}   "
             f"{self._G['pipe']}  verdict: {verdict}"
         )
-        print(f"  Logins: {self.logins_fresh} with OTP, {self.logins_reused} reused from saved sessions"
+        print(f"  Logins: {self.logins_fresh} new ({self.login_method}), {self.logins_reused} reused from saved sessions"
               + ("" if self.session_cache_enabled else " (session cache off)"))
         print(self._c(rule, "gray"))
 

@@ -208,6 +208,25 @@ The harness runs against **either environment**, chosen with `--env {test|uat}` 
   `auth_token` / `_role_token_cache`, saves it, and the request is re-sent once (a 401 is refused before
   processing, so even a write is safe). A token from this run's own OTP login still just raises.
 
+## TEST login change (3 Nov 2026)
+- user-send-otp answers `otpLength` (TEST 6, UAT 4). `_login_otp`: GOLD_LOAN_LOGIN_OTP, else
+  `STATIC_LOGIN_OTPS` (4 -> "1234", 6 -> "123456"); sent as a string. The old int 1234 on TEST ->
+  verify-login 500 "Something went wrong.".
+- verify-login can answer `enrollmentRequired` + `enrollToken` (account has no password yet): portal
+  -> secure-account -> `POST api/auth/mfa/enroll {enrollToken, encPassword, kid, nonce}` (password
+  RSA-OAEP/SHA-256 over JSON {password, nonce, ts} with the SPKI key from `GET api/auth/login-key`
+  {publicKey, kid, nonce}). After enrollment the OTP sign-in returns the session directly. Password
+  route: `user-login {mobileNumber, encPassword, kid, nonce}` -> `mfaRequired` + mfaToken/referenceCode/
+  otpLength -> `mfa/verify {mfaToken, referenceCode, otp}`. `_check_login_answer` STOPS on
+  enrollmentRequired (no auto password on shared accounts).
+- **TEST now logs in with password + MFA** (`ENVIRONMENTS["test"]["login_method"] = "password"`,
+  `_password_login`; UAT stays "otp"). Password: GOLD_LOAN_LOGIN_PASSWORD or git-ignored
+  `config/login_passwords.json` {"default": "abcde123", "<mobile>": ...}; MFA OTP 123456
+  (GOLD_LOAN_MFA_OTP). RSA-OAEP via Node `crypto.publicEncrypt` (`_encrypt_login_password`; keep the
+  `\n` escapes in its embedded JS). `_otp_login` dispatches on `login_method`; `_finish_login` records
+  the session for both. Live 3 Nov: appraiser + admin logged in; kyc_v1 on TEST PASSED (MW07Q4CT).
+  Offline tests pin GOLD_LOAN_LOGIN_METHOD=otp; the password route has a round-trip decrypt test.
+
 ## Saved login sessions (`config/session_tokens.json`)
 - `login()` and `_role_token()` both go through `_session_token(mobile)`: saved + unexpired (JWT `exp`
   minus `SESSION_EXPIRY_MARGIN` 600 s; tokens live 24 h) -> reuse, no OTP; else `_otp_login` (send-otp ->
@@ -299,10 +318,21 @@ unaffected.
 
 Migrated to `/api/kyc/v2/*` (stage A of `gold-loan-e2e-flow.har`). `_run_full_kyc` order:
 `get_customer_by_id` → `get_kyc_customer_detail` (**`/api/kyc/v2/get-customer-detail`**, body `{customerId, moduleId, kycType}`; captures an existing `customerKycId` from `customerInfo.customerKycPersonal`) → `submit_basic_info` (**`/api/kyc/v2/submit-basic-info`**, replaces old `customer-info`; records PAN, returns/creates `customerKycId` in `data`) → `_kyc_consent_otp` (**new mandatory step**: `/api/customer-otp/send-otp` `{type:"kycConsent", customerId}` → `referenceCode`, then `/api/customer-otp/verify-otp-admin` `{type:"kycConsent", referenceCode, otp:"123456"}`) → `load_kyc_master_data` → `save_customer_address` (**`/api/kyc/v2/customer-kyc-address`**, encrypted identity/address proofs, `isAutoApproved:false`; non-fatal) → `save_customer_personal_details` (**`/api/kyc/v2/customer-kyc-personal`**) → `submit_all_kyc_info` (`/api/kyc/submit-all-kyc-info`, still non-v2, authoritative) → `kyc_ops_approval` (`/api/classification/ops-team`, `userType:"Individual"`).
-- `kyc_type` = `GOLD_LOAN_KYC_TYPE` (default `RE_KYC`). All v2 bodies carry `kycType`.
+- `kyc_type` is a property. `GOLD_LOAN_KYC_TYPE` forces `NEW_KYC`/`RE_KYC`; default `auto` follows the portal (`reKycType = kycStatus === 'approved' ? RE_KYC : NEW_KYC`). It is decided from `kyc_status` on first use and latched in `_kyc_type`, so the approval doesn't flip it; the kyc_only batch reset clears `_kyc_type`. All v2 bodies carry `kycType`.
 - `PUT /api/kyc/initiate` is unused by `_run_full_kyc` (`initiate_kyc`/`_safe_initiate_kyc` remain but are not called); `ovd-kyc-flow.har` does still show the UI calling it first.
 - **Auto-verification EXISTS and is now implemented** — see "KYC identity modes" above. The default `manual` mode still skips it (matching the original capture, where `verify-pan` 503s and `offline-aadhaar-xml` 400s and the flow falls through to the manual path); `--kyc auto`/`--kyc ovd` exercise it.
 - Loan side confirmed unchanged by this HAR (Roshan 853, rpg 4533, 400k < 5L). Keep `GOLD_LOAN_AMOUNT` < 500000.
+
+## KYC version 1 (`flows/kyc_v1.py`, `GOLD_LOAN_KYC_API_VERSION=v1`)
+- Source: git 8f3d435 `src/main.py` (the pre-restructure harness). Order: customer-info -> master data
+  -> customer-kyc-personal -> customer-kyc-address -> submit-all-kyc-info -> ops-team; no consent OTP,
+  no v2 get-customer-detail. Modes manual / auto only.
+- `_kyc_call(v2_path, body)` maps the three renamed calls to `KYC_V1_PATHS` and the v1 shape:
+  customer-info = {firstName, lastName, **mobileNumber**, otp, panType, form60, panImage, panCardNumber,
+  dateOfBirth, userType, moduleId, organizationTypeId, dateOfIncorporation, form60Image, isAutoApproved,
+  isPanVerified} (no customer id — UAT 400 "mobile Number is required" without it); personal / address =
+  `KYC_V1_PERSONAL_FIELDS` / `KYC_V1_ADDRESS_FIELDS` (+ entry fields) out of the v2 body. v2 untouched.
+- Live: UAT manual PASSED (customer 22004 / MW07DMFW, 34 calls). TEST login was 500 (server) on 2-3 Nov.
 
 ## KYC flow — domain rules learned the hard way
 
