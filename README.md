@@ -266,22 +266,27 @@ python flows/e2e_full_loan.py --customer MS35QNJP --amount 550000
 **How each environment logs in.** TEST (since Nov 2026) uses **password + MFA OTP**, as its portal does:
 `GET api/auth/login-key` (one-time public key) → `POST api/auth/user-login` with the password encrypted
 (RSA-OAEP / SHA-256, via Node) → `POST api/auth/mfa/verify` with the MFA OTP `123456`. The password comes
-from `config/login_passwords.json` (git-ignored): `{"default": "abcde123"}`, plus `"<mobile>": "..."` for
+from `config/login_passwords.json` (git-ignored): `{"default": "<password>"}`, plus `"<mobile>": "..."` for
 accounts that differ (or `{"test": {...}}` per environment), or `GOLD_LOAN_LOGIN_PASSWORD`. UAT still uses
 the OTP login (`user-send-otp` → `verify-login`, OTP `1234`); the OTP length the server announces is
 followed (6 digits → `123456`). Overrides: `GOLD_LOAN_LOGIN_METHOD=otp|password`,
 `GOLD_LOAN_LOGIN_OTP`, `GOLD_LOAN_MFA_OTP`.
 
-**When TEST rejects the password** ("Invalid credentials"), the harness follows the portal instead of
-stopping: it logs in with OTP (`user-send-otp` → `verify-login`). If the server says the account has never
-set a password (`enrollmentRequired`), it sets one through `api/auth/mfa/enroll` (the portal's "Secure
-account" page). If OTP login gives no session, it resets the password through forgot-password
-(`user-otp/verify-otp` type `forget` → `api/user/update-password`) and logs in again. The password it
-sets is `"new_password"` from `config/login_passwords.json` (or `GOLD_LOAN_NEW_PASSWORD`). It must meet
-TEST's policy (at least 10 characters with upper case, lower case, a number and a special character, and
-not the mobile number or email); the harness checks that before sending anything. After a successful
-set, it saves the password for that mobile under `"test"` in the same file, and the run summary lists
-every account whose password it changed. `GOLD_LOAN_PASSWORD_FALLBACK=false` stops at the rejection
+**When TEST rejects the password** ("Invalid credentials"), every account is moved to the standard new
+password, `"new_password"` in the git-ignored `config/login_passwords.json` (or `GOLD_LOAN_NEW_PASSWORD`):
+1. It tries the new password itself first: the account may already have it, and then nothing is changed.
+2. Otherwise it resets the password through forgot-password (`user-send-otp` type `forget` →
+   `user-otp/verify-otp` → `api/user/update-password`) and logs in with it.
+3. Only if the reset is refused does it try OTP login. That is for an account that has never set a
+   password under the new login (`verify-login` answers `enrollmentRequired`); it then sets the password
+   through `api/auth/mfa/enroll`, the portal's "Secure account" page.
+
+The new password must meet TEST's policy (at least 10 characters with upper case, lower case, a number and
+a special character, and not the mobile number or email); the harness checks that before sending
+anything. The working password is saved for that mobile under `"test"`, and the run summary lists every
+account whose password was found, reset or set. If the server answers "Please try again after a minute"
+to an OTP request, the harness waits that minute once and tries again. A locked account (`423`) stops the
+run at once, with no further attempts. `GOLD_LOAN_PASSWORD_FALLBACK=false` stops at the first rejection
 instead.
 
 **Saved login sessions.** Every role's login token is saved in `config/session_tokens.json`

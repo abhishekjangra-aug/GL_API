@@ -1434,7 +1434,7 @@ class GoldLoanApiTest:
         """TEST's login since Nov 2026 (LoginComponent.submit -> MfaOtpComponent.submit):
         GET login-key -> POST user-login {mobileNumber, encPassword, kid, nonce} -> mfaRequired
         {mfaToken, referenceCode, otpLength} -> POST mfa/verify {mfaToken, referenceCode, otp}.
-        A rejected password falls back to the portal's OTP routes (_recover_password_login).
+        A rejected password -> the standard new password, reset if needed (_recover_password_login).
         Returns the final answer (Token + userDetails). Bearer-less, like the OTP route."""
         saved_token, self.auth_token = self.auth_token, None
         try:
@@ -1443,13 +1443,7 @@ class GoldLoanApiTest:
                 first = await self._post_auth("/api/auth/user-login",
                                               {"mobileNumber": mobile, **(await self._encrypted_password(password))})
             except httpx.HTTPStatusError as e:
-                if e.response.status_code == 423:
-                    # Locked after repeated failures: any further attempt (password, OTP or reset) only
-                    # risks extending it. Stop and say when to try again.
-                    raise RuntimeError(
-                        f"{self.env_name.upper()} has locked {mobile} ({self._role_of_mobile(mobile)}): "
-                        f"{e.response.text[:160]} Not trying again in this run; re-run after the lock "
-                        "expires.") from None
+                self._raise_if_locked(e, mobile)
                 if e.response.status_code != 401:
                     raise
                 return await self._recover_password_login(mobile, password, e.response.text[:120])
@@ -1521,61 +1515,108 @@ class GoldLoanApiTest:
         except OSError as e:
             print(self._c(f"Could not save the new password for {mobile}: {e}", "red"))
 
+    OTP_COOLDOWN_SECONDS = 61   # the server's "Please try again after a minute" between OTP sends
+
+    async def _send_user_otp(self, body: dict) -> dict:
+        """user-send-otp, waiting out the server's one-minute resend cooldown ONCE if it answers
+        "Please try again after a minute" (respecting its limit, not working around it)."""
+        try:
+            return await self._post_auth("/api/user-otp/user-send-otp", body)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code != 400 or "after a minute" not in (e.response.text or "").lower():
+                raise
+            print(f"OTP resend cooldown for {body.get('mobileNumber')}; waiting "
+                  f"{self.OTP_COOLDOWN_SECONDS}s as the server asks...")
+            await asyncio.sleep(self.OTP_COOLDOWN_SECONDS)
+            return await self._post_auth("/api/user-otp/user-send-otp", body)
+
+    def _raise_if_locked(self, error, mobile: str) -> None:
+        if error.response.status_code == 423:
+            # Locked after repeated failures: any further attempt only risks extending it.
+            raise RuntimeError(
+                f"{self.env_name.upper()} has locked {mobile} ({self._role_of_mobile(mobile)}): "
+                f"{error.response.text[:160]} Not trying again in this run; re-run after the lock "
+                "expires.") from None
+
+    async def _try_password(self, mobile: str, password: str):
+        """user-login with `password`: the finished session, or None when it is rejected (401)."""
+        try:
+            first = await self._post_auth("/api/auth/user-login",
+                                          {"mobileNumber": mobile, **(await self._encrypted_password(password))})
+        except httpx.HTTPStatusError as e:
+            self._raise_if_locked(e, mobile)
+            if e.response.status_code != 401:
+                raise
+            return None
+        return await self._complete_mfa(first, mobile, "user-login")
+
     async def _recover_password_login(self, mobile: str, password: str, reason: str) -> dict:
-        """The password was rejected. Follow the portal instead of stopping:
-          1. Login with OTP (sign-in-otp): user-send-otp {type: login} -> verify-login. A session
-             answer is used as-is.
-          2. verify-login answers enrollmentRequired (the account never set a password under the new
-             login): secure-account -> mfa/enroll {enrollToken, encPassword} with the configured
-             password, which sets it and answers with the session.
-          3. Otherwise forgot-password: user-send-otp {type: forget} -> user-otp/verify-otp ->
-             user/update-password {referenceCode, encPassword}, then the password login again.
-        Steps 2-3 SET the account's password to the configured NEW password ("new_password" in
-        config/login_passwords.json / GOLD_LOAN_NEW_PASSWORD; it must meet the policy) and save it
-        for that mobile. GOLD_LOAN_PASSWORD_FALLBACK=false stops at the rejection instead."""
+        """The password was rejected. Every account ends up on the standard NEW password
+        ("new_password" in config/login_passwords.json / GOLD_LOAN_NEW_PASSWORD):
+          1. Try the new password itself -- the account may already have it (no change made).
+          2. Reset it (forgot password): user-send-otp {type: forget} -> user-otp/verify-otp ->
+             user/update-password {referenceCode, encPassword}, then log in with it.
+          3. If the reset is refused (an account that never set a password under the new login):
+             OTP login -> verify-login answers enrollmentRequired -> mfa/enroll {enrollToken,
+             encPassword} (the portal's Secure account page), which sets it and gives the session.
+        The working password is saved for that mobile, so the next run logs straight in.
+        GOLD_LOAN_PASSWORD_FALLBACK=false stops at the rejection instead."""
         who = f"{mobile} ({self._role_of_mobile(mobile)})"
         if not self.password_fallback_enabled:
             raise RuntimeError(
                 f"{self.env_name.upper()} rejected the password for {who}: {reason}. Set that account's "
                 f"password in {self.LOGIN_PASSWORDS_FILE} as \"{mobile}\": \"...\" (or "
-                "GOLD_LOAN_LOGIN_PASSWORD), or allow GOLD_LOAN_PASSWORD_FALLBACK to log in with OTP.")
-        print(self._c(f"Password rejected for {who} ({reason}); logging in with OTP instead.", "yellow"))
-        sent = await self._post_auth("/api/user-otp/user-send-otp", {"mobileNumber": mobile, "type": "login", "id": None})
+                "GOLD_LOAN_LOGIN_PASSWORD), or allow GOLD_LOAN_PASSWORD_FALLBACK to reset it.")
+        new_password = self._new_password(mobile)
+        if new_password != password:
+            print(self._c(f"Password rejected for {who} ({reason}); trying the standard new password.", "yellow"))
+            answer = await self._try_password(mobile, new_password)
+            if answer:
+                self._remember_password(mobile, new_password, "found")
+                return answer
+
+        print(self._c(f"Resetting the password for {who} to the standard new password (forgot password).",
+                      "yellow"))
+        reset_error = None
+        try:
+            sent = await self._send_user_otp({"mobileNumber": mobile, "type": "forget"})
+            reference = sent.get("referenceCode")
+            await self._post_auth("/api/user-otp/verify-otp",
+                                  {"referenceCode": reference, "otp": self._login_otp(sent), "type": "forget"})
+            await self._post_auth("/api/user/update-password",
+                                  {"referenceCode": reference, **(await self._encrypted_password(new_password))})
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code not in (400, 401, 403, 404):
+                raise
+            reset_error = e.response.text[:160]
+            print(f"Password reset refused for {who}: {reset_error}")
+        if reset_error is None:
+            self._remember_password(mobile, new_password, "reset")
+            answer = await self._try_password(mobile, new_password)
+            if answer:
+                return answer
+            raise RuntimeError(f"The password for {who} was reset, but logging in with it was still rejected.")
+
+        print(self._c(f"Trying OTP login for {who} (an account with no password yet must enroll one).", "yellow"))
+        sent = await self._send_user_otp({"mobileNumber": mobile, "type": "login", "id": None})
         try:
             answer = await self._post_auth("/api/auth/verify-login", {
                 "referenceCode": sent.get("referenceCode"), "otp": self._login_otp(sent),
                 "type": "login", "isFromWeb": True})
         except httpx.HTTPStatusError as e:
-            # e.g. 403 "Please login using password or Google": the account HAS a password (just not
-            # the configured one) and OTP login is closed to it -> forgot password below.
             if e.response.status_code not in (400, 401, 403):
                 raise
-            print(f"OTP login refused for {who}: {e.response.text[:120]}")
-            answer = {}
-        if answer.get("Token") or answer.get("mfaRequired"):
-            print(f"OTP login worked for {who}; the configured password still doesn't match the account's.")
-            return await self._complete_mfa(answer, mobile, "verify-login")
+            raise RuntimeError(f"Could not recover the login for {who}: password rejected ({reason}), reset "
+                               f"refused ({reset_error}), OTP login refused ({e.response.text[:120]}).") from None
         if answer.get("enrollmentRequired") and answer.get("enrollToken"):
-            new_password = self._new_password(mobile)
-            print(self._c(f"{who} has no password under the new login yet: setting the configured new "
-                          f"password (mfa/enroll, as the portal's Secure account page does).", "yellow"))
+            print(self._c(f"{who} has no password under the new login yet: enrolling the standard new "
+                          "password (mfa/enroll).", "yellow"))
             enrolled = await self._post_auth("/api/auth/mfa/enroll", {
                 "enrollToken": answer["enrollToken"], **(await self._encrypted_password(new_password))})
             self._remember_password(mobile, new_password, "enrolled")
             return await self._complete_mfa(enrolled, mobile, "mfa/enroll")
-        new_password = self._new_password(mobile)
-        password = new_password
-        print(self._c(f"OTP login gave no session for {who}; resetting the password (forgot password).", "yellow"))
-        sent = await self._post_auth("/api/user-otp/user-send-otp", {"mobileNumber": mobile, "type": "forget"})
-        reference = sent.get("referenceCode")
-        await self._post_auth("/api/user-otp/verify-otp",
-                              {"referenceCode": reference, "otp": self._login_otp(sent), "type": "forget"})
-        await self._post_auth("/api/user/update-password",
-                              {"referenceCode": reference, **(await self._encrypted_password(password))})
-        self._remember_password(mobile, new_password, "reset")
-        first = await self._post_auth("/api/auth/user-login",
-                                      {"mobileNumber": mobile, **(await self._encrypted_password(password))})
-        return await self._complete_mfa(first, mobile, "user-login after reset")
+        print(f"OTP login worked for {who}, but its password is still unknown.")
+        return await self._complete_mfa(answer, mobile, "verify-login")
 
     def _role_of_mobile(self, mobile: str) -> str:
         """Which configured login a mobile belongs to (for error messages)."""
@@ -8413,8 +8454,10 @@ class GoldLoanApiTest:
         print(f"  Logins: {self.logins_fresh} new ({self.login_method}), {self.logins_reused} reused from saved sessions"
               + ("" if self.session_cache_enabled else " (session cache off)"))
         for mobile, how in getattr(self, "passwords_set", []):
-            print(self._c(f"  Password {'set (first enrollment)' if how == 'enrolled' else 'reset'} for "
-                          f"{mobile} ({self._role_of_mobile(mobile)}) to the configured one.", "yellow"))
+            what = {"enrolled": "set (first enrollment) to the standard new password",
+                    "reset": "reset to the standard new password",
+                    "found": "already the standard new password (saved; nothing changed)"}.get(how, how)
+            print(self._c(f"  Password for {mobile} ({self._role_of_mobile(mobile)}): {what}.", "yellow"))
         print(self._c(rule, "gray"))
 
         # List every failed endpoint so failures are visible at a glance at the end of the run.

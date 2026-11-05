@@ -221,19 +221,20 @@ The harness runs against **either environment**, chosen with `--env {test|uat}` 
   enrollmentRequired (no auto password on shared accounts).
 - **TEST now logs in with password + MFA** (`ENVIRONMENTS["test"]["login_method"] = "password"`,
   `_password_login`; UAT stays "otp"). Password: GOLD_LOAN_LOGIN_PASSWORD or git-ignored
-  `config/login_passwords.json` {"default": "abcde123", "<mobile>": ...}; MFA OTP 123456
+  `config/login_passwords.json` {"default": "<password>", "<mobile>": ...}; MFA OTP 123456
   (GOLD_LOAN_MFA_OTP). RSA-OAEP via Node `crypto.publicEncrypt` (`_encrypt_login_password`; keep the
   `\n` escapes in its embedded JS). `_otp_login` dispatches on `login_method`; `_finish_login` records
   the session for both. Live 3 Nov: appraiser + admin logged in; kyc_v1 on TEST PASSED (MW07Q4CT).
   Offline tests pin GOLD_LOAN_LOGIN_METHOD=otp; the password route has a round-trip decrypt test.
-- **Rejected password (401 Invalid credentials) → `_recover_password_login`** (user asked for it, 3 Nov):
-  OTP login (verify-login) → session as-is; `enrollmentRequired` → `mfa/enroll {enrollToken, encPassword}`;
-  else forgot-password (`user-send-otp` type forget → `user-otp/verify-otp` → `user/update-password`) →
-  user-login again. Sets `_new_password` (GOLD_LOAN_NEW_PASSWORD / "new_password" in login_passwords.json),
-  checked by `_password_policy_problems` first (10+ chars, upper, lower, digit, special, not the mobile;
-  the server rejected abcde123 and abcde@12345). `_remember_password` saves it under the env per mobile and
-  the run metrics list the changes (`passwords_set`). GOLD_LOAN_PASSWORD_FALLBACK=false stops instead.
-  Partner 8767002003 on TEST had never enrolled (verify-login → enrollmentRequired).
+- **Rejected password (401) → `_recover_password_login`** (user, 5 Nov: a wrong password is always reset to
+  the standard new password): 1) `_try_password(new_password)` (may already be set → "found", nothing
+  changed); 2) forgot-password reset (`_send_user_otp` type forget → `user-otp/verify-otp` →
+  `user/update-password`) → login; 3) only if the reset is refused: OTP login → `enrollmentRequired` →
+  `mfa/enroll`. No OTP-login detour before the reset (it used up the 1-minute OTP cooldown). `_send_user_otp`
+  waits OTP_COOLDOWN_SECONDS (61) once on "Please try again after a minute". 423 → `_raise_if_locked` stops.
+  `_new_password` = GOLD_LOAN_NEW_PASSWORD / "new_password" in the git-ignored config, checked by
+  `_password_policy_problems`; `_remember_password` saves per mobile under the env; `passwords_set` in the
+  run metrics. Never write the actual passwords into tracked files.
 
 ## Saved login sessions (`config/session_tokens.json`)
 - `login()` and `_role_token()` both go through `_session_token(mobile)`: saved + unexpired (JWT `exp`

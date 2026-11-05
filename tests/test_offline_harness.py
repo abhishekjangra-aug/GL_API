@@ -4072,24 +4072,37 @@ def _():
     s._check_login_answer({"Token": "x"}, "8880008881")   # a session passes through
     close(s)
 
-def _password_fallback_run(answers, fallback=True, new_password="Qwerty@12345"):
-    """Drive _password_login against scripted answers; user-login's first answer is a 401."""
+def _password_fallback_run(answers, fallback=True, new_password="Qwerty@12345", logins=("401",)):
+    """Drive _password_login against scripted answers. `logins` scripts user-login in order:
+    "401" = Invalid credentials, a dict = that answer. answers[path] may be a dict, or an
+    exception-raising callable."""
     import httpx as _httpx
     s = suite()
+    s.OTP_COOLDOWN_SECONDS = 0
     s._encrypt_login_password = staticmethod(lambda pw, key, nonce: f"enc({pw})")
-    os.environ["GOLD_LOAN_LOGIN_PASSWORD"] = "abcde123"
+    os.environ["GOLD_LOAN_LOGIN_PASSWORD"] = "old-pass-1"
     os.environ["GOLD_LOAN_PASSWORD_FALLBACK"] = "true" if fallback else "false"
     os.environ["GOLD_LOAN_NEW_PASSWORD"] = new_password
-    sent, logins = [], [0]
+    sent, queue = [], list(logins)
+    def http_error(path, status, message):
+        req = _httpx.Request("POST", "http://x" + path)
+        raise _httpx.HTTPStatusError(str(status), request=req, response=_httpx.Response(
+            status, request=req, text=json.dumps({"message": message})))
     async def fake(method, path, json_data=None, params=None, files=None, headers=None):
         sent.append((path, json_data))
-        if path == "/api/auth/user-login":
-            logins[0] += 1
-            if logins[0] == 1:
-                req = _httpx.Request("POST", "http://x" + path)
-                raise _httpx.HTTPStatusError("401", request=req, response=_httpx.Response(
-                    401, request=req, text='{"message":"Invalid credentials."}'))
-        payload = {"/api/auth/login-key": {"publicKey": "PUB", "kid": "k", "nonce": "n"}}.get(path)             or answers[path]
+        if path == "/api/auth/login-key":
+            payload = {"publicKey": "PUB", "kid": "k", "nonce": "n"}
+        elif path == "/api/auth/user-login":
+            payload = queue.pop(0) if queue else {"mfaRequired": True, "mfaToken": "m", "referenceCode": "r",
+                                                  "otpLength": 6}
+            if payload == "401":
+                http_error(path, 401, "Invalid credentials.")
+            if payload == "423":
+                http_error(path, 423, "Your account is temporarily locked due to multiple failed attempts.")
+        else:
+            payload = answers[path]
+            if callable(payload):
+                payload = payload(path, http_error)
         class R:
             def json(self_inner): return payload
         return R()
@@ -4100,83 +4113,90 @@ def _password_fallback_run(answers, fallback=True, new_password="Qwerty@12345"):
         for k in ("GOLD_LOAN_LOGIN_PASSWORD", "GOLD_LOAN_PASSWORD_FALLBACK", "GOLD_LOAN_NEW_PASSWORD"):
             os.environ.pop(k, None)
         close(s)
-    return result, [p for p, _ in sent], dict(sent), s.passwords_set
+    return result, [p for p, _ in sent], sent, s.passwords_set
 
-@test("session: rejected password -> OTP login -> enrollmentRequired -> mfa/enroll sets the configured password")
-def _():
-    result, paths, bodies, changed = _password_fallback_run({
-        "/api/user-otp/user-send-otp": {"referenceCode": "r1", "otpLength": 6},
-        "/api/auth/verify-login": {"enrollmentRequired": True, "enrollToken": "e1", "otpLength": 6},
-        "/api/auth/mfa/enroll": {"Token": "tok-enrolled", "userDetails": {"id": 170}}})
-    eq(result.get("Token"), "tok-enrolled", "session from mfa/enroll")
-    eq(paths, ["/api/auth/login-key", "/api/auth/user-login", "/api/user-otp/user-send-otp",
-               "/api/auth/verify-login", "/api/auth/login-key", "/api/auth/mfa/enroll"], "portal order")
-    eq(bodies["/api/auth/verify-login"]["otp"], "123456", "6-digit static OTP")
-    eq((bodies["/api/auth/mfa/enroll"]["enrollToken"], bodies["/api/auth/mfa/enroll"]["encPassword"]),
-       ("e1", "enc(Qwerty@12345)"), "enrolls the configured NEW password")
-    eq(changed, [("8767002003", "enrolled")], "reported as a password change")
+MFA_OK = {"/api/auth/mfa/verify": {"Token": "tok"}}
 
-@test("session: rejected password, OTP login gives an MFA step -> mfa/verify, nothing changed")
+@test("password: rejected -> the standard new password already works -> saved, nothing reset")
 def _():
-    result, paths, _, changed = _password_fallback_run({
-        "/api/user-otp/user-send-otp": {"referenceCode": "r1", "otpLength": 6},
-        "/api/auth/verify-login": {"mfaRequired": True, "mfaToken": "m", "referenceCode": "r2", "otpLength": 6},
-        "/api/auth/mfa/verify": {"Token": "tok-otp"}})
-    eq((result.get("Token"), changed), ("tok-otp", []), "OTP session, password untouched")
-    eq(paths[-1], "/api/auth/mfa/verify", "finishes with mfa/verify")
+    result, paths, sent, changed = _password_fallback_run(MFA_OK, logins=("401",))
+    eq(result.get("Token"), "tok", "session")
+    logins = [b["encPassword"] for p, b in sent if p == "/api/auth/user-login"]
+    eq(logins, ["enc(old-pass-1)", "enc(Qwerty@12345)"], "configured, then the standard new password")
+    ok("/api/user/update-password" not in paths and "/api/user-otp/user-send-otp" not in paths, "no OTP, no reset")
+    eq(changed, [("8767002003", "found")], "reported as found")
 
-@test("session: rejected password, no OTP session -> forgot password reset -> password login again")
+@test("password: rejected twice -> forgot-password reset to the new password -> logged in")
 def _():
-    result, paths, bodies, changed = _password_fallback_run({
+    result, paths, sent, changed = _password_fallback_run({
         "/api/user-otp/user-send-otp": {"referenceCode": "r1", "otpLength": 6},
-        "/api/auth/verify-login": {"message": "nope"},
         "/api/user-otp/verify-otp": {"message": "ok"},
-        "/api/user/update-password": {"message": "updated"},
-        "/api/auth/user-login": {"mfaRequired": True, "mfaToken": "m", "referenceCode": "r2", "otpLength": 6},
-        "/api/auth/mfa/verify": {"Token": "tok-reset"}})
-    eq(result.get("Token"), "tok-reset", "session after the reset")
-    ok("/api/user/update-password" in paths and paths.count("/api/auth/user-login") == 2, f"{paths}")
-    eq((bodies["/api/user-otp/verify-otp"]["type"], bodies["/api/user/update-password"]["encPassword"]),
-       ("forget", "enc(Qwerty@12345)"), "forget OTP + configured new password")
+        "/api/user/update-password": {"message": "updated"}, **MFA_OK}, logins=("401", "401"))
+    eq(result.get("Token"), "tok", "session after the reset")
+    order = [p for p in paths if p != "/api/auth/login-key"]
+    eq(order, ["/api/auth/user-login", "/api/auth/user-login", "/api/user-otp/user-send-otp",
+               "/api/user-otp/verify-otp", "/api/user/update-password", "/api/auth/user-login",
+               "/api/auth/mfa/verify"], "no OTP-login detour before the reset")
+    bodies = dict(sent)
+    eq((bodies["/api/user-otp/user-send-otp"]["type"], bodies["/api/user-otp/verify-otp"]["otp"],
+        bodies["/api/user/update-password"]["encPassword"]), ("forget", "123456", "enc(Qwerty@12345)"),
+       "forget OTP + the new password")
     eq(changed, [("8767002003", "reset")], "reported as a reset")
 
-@test("session: OTP login refused (403 'login using password') -> forgot password reset")
+@test("password: reset refused (never had a password) -> OTP login -> mfa/enroll the new password")
 def _():
-    import httpx as _httpx
-    def refuse():
-        req = _httpx.Request("POST", "http://x/api/auth/verify-login")
-        raise _httpx.HTTPStatusError("403", request=req, response=_httpx.Response(
-            403, request=req, text='{"message":"Please login using password or Google"}'))
-    class Refusing(dict):
-        def __getitem__(self, k):
-            if k == "/api/auth/verify-login": refuse()
-            return dict.__getitem__(self, k)
-    result, paths, bodies, changed = _password_fallback_run(Refusing({
-        "/api/user-otp/user-send-otp": {"referenceCode": "r1", "otpLength": 6},
-        "/api/user-otp/verify-otp": {"message": "ok"},
-        "/api/user/update-password": {"message": "updated"},
-        "/api/auth/user-login": {"mfaRequired": True, "mfaToken": "m", "referenceCode": "r2", "otpLength": 6},
-        "/api/auth/mfa/verify": {"Token": "tok-reset"}}))
-    eq((result.get("Token"), changed), ("tok-reset", [("8767002003", "reset")]), "reset, then logged in")
-    ok("/api/user/update-password" in paths, f"{paths}")
+    def send(path, err, _n=[0]):
+        return {"referenceCode": "r1", "otpLength": 6}
+    def verify_otp(path, err):
+        err(path, 400, "Password not set for this user")
+    result, paths, sent, changed = _password_fallback_run({
+        "/api/user-otp/user-send-otp": send, "/api/user-otp/verify-otp": verify_otp,
+        "/api/auth/verify-login": {"enrollmentRequired": True, "enrollToken": "e1", "otpLength": 6},
+        "/api/auth/mfa/enroll": {"Token": "tok-enrolled"}}, logins=("401", "401"))
+    eq(result.get("Token"), "tok-enrolled", "session from mfa/enroll")
+    enroll = [b for p, b in sent if p == "/api/auth/mfa/enroll"][0]
+    eq((enroll["enrollToken"], enroll["encPassword"]), ("e1", "enc(Qwerty@12345)"), "enrolls the new password")
+    eq(changed, [("8767002003", "enrolled")], "reported as enrolled")
 
-@test("session: a new password that breaks the policy stops before enrolling (no change sent)")
+@test("password: 'Please try again after a minute' on the reset OTP -> waits once, then resets")
+def _():
+    calls = [0]
+    def send(path, err):
+        calls[0] += 1
+        if calls[0] == 1:
+            err(path, 400, "Please try again after a minute")
+        return {"referenceCode": "r1", "otpLength": 6}
+    result, paths, _, changed = _password_fallback_run({
+        "/api/user-otp/user-send-otp": send, "/api/user-otp/verify-otp": {"message": "ok"},
+        "/api/user/update-password": {"message": "updated"}, **MFA_OK}, logins=("401", "401"))
+    eq((result.get("Token"), calls[0], changed), ("tok", 2, [("8767002003", "reset")]), "retried once after the wait")
+
+@test("password: a locked account (423) stops at once, no reset attempted")
+def _():
+    sent_paths = []
+    def never(path, err):
+        sent_paths.append(path); return {}
+    try:
+        _password_fallback_run({"/api/user-otp/user-send-otp": never}, logins=("401", "423"))
+    except RuntimeError as e:
+        ok("locked" in str(e) and not sent_paths, f"{e} / OTP calls: {sent_paths}")
+    except Exception as e:
+        raise Fail(f"unexpected {type(e).__name__}: {e}")
+
+@test("password: a new password that breaks the policy stops before anything is sent")
 def _():
     try:
-        _password_fallback_run({
-            "/api/user-otp/user-send-otp": {"referenceCode": "r1", "otpLength": 6},
-            "/api/auth/verify-login": {"enrollmentRequired": True, "enrollToken": "e1"}},
-            new_password="abcde@12345")
+        _password_fallback_run({}, new_password="qwerty@12345")
     except RuntimeError as e:
         ok("no upper-case letter" in str(e), str(e))
     else:
-        raise Fail("must refuse abcde@12345")
+        raise Fail("must refuse a password with no upper case")
     s = suite()
-    eq(s._password_policy_problems("Abcde@12345", "8767002003"), [], "Abcde@12345 passes")
+    eq(s._password_policy_problems("Qwerty@12345", "8767002003"), [], "Qwerty@12345 passes")
     ok("contains the mobile number" in s._password_policy_problems("Ab@8767002003", "8767002003"), "mobile")
     close(s)
 
-@test("session: GOLD_LOAN_PASSWORD_FALLBACK=false stops at the rejected password and names the account")
+@test("password: GOLD_LOAN_PASSWORD_FALLBACK=false stops at the rejected password and names the account")
 def _():
     try:
         _password_fallback_run({}, fallback=False)
@@ -4196,7 +4216,7 @@ def _():
         capture_output=True, text=True, check=True).stdout)
     s = suite()
     os.environ["GOLD_LOAN_LOGIN_METHOD"] = "password"
-    os.environ["GOLD_LOAN_LOGIN_PASSWORD"] = "abcde123"
+    os.environ["GOLD_LOAN_LOGIN_PASSWORD"] = "old-pass-1"
     sent = []
     async def fake(method, path, json_data=None, params=None, files=None, headers=None):
         sent.append((path, json_data, s.auth_token))
@@ -4225,7 +4245,7 @@ def _():
         Buffer.from(j.enc,'base64')).toString());});"""],
         input=json.dumps({"priv": keys["priv"], "enc": login["encPassword"]}), capture_output=True, text=True).stdout
     decrypted = json.loads(plain)
-    eq((decrypted["password"], decrypted["nonce"]), ("abcde123", "n1"), "RSA-OAEP/SHA-256 of {password, nonce, ts}")
+    eq((decrypted["password"], decrypted["nonce"]), ("old-pass-1", "n1"), "RSA-OAEP/SHA-256 of {password, nonce, ts}")
     ok("password" not in json.dumps(login).lower().replace("encpassword", ""), "the password never travels in clear")
     eq(sent[2][1], {"mfaToken": "m1", "referenceCode": "r1", "otp": "123456"}, "MFA OTP 123456")
     ok(all(t is None for _, _, t in sent), "sent without a bearer token")
