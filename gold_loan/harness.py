@@ -1368,7 +1368,7 @@ class GoldLoanApiTest:
 
     def _login_password(self, mobile: str) -> str:
         """The account's password: GOLD_LOAN_LOGIN_PASSWORD, else config/login_passwords.json
-        ({"default": "...", "<mobile>": "..."}, git-ignored like the rest of config/)."""
+        ({"default": "...", "<mobile>": "..."}; tracked in git, unlike the rest of config/)."""
         forced = os.getenv("GOLD_LOAN_LOGIN_PASSWORD")
         if forced:
             return forced
@@ -1501,7 +1501,7 @@ class GoldLoanApiTest:
 
     def _remember_password(self, mobile: str, password: str, how: str) -> None:
         """After an enroll / reset, store the account's password under the env so the next run logs
-        in with it directly (the file is git-ignored)."""
+        in with it directly (the file is tracked, so commit the change)."""
         self.passwords_set.append((mobile, how))
         if os.getenv("GOLD_LOAN_LOGIN_PASSWORD"):
             return                          # a one-run override; don't write the file

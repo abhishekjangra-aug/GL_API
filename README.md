@@ -266,14 +266,14 @@ python flows/e2e_full_loan.py --customer MS35QNJP --amount 550000
 **How each environment logs in.** TEST (since Nov 2026) uses **password + MFA OTP**, as its portal does:
 `GET api/auth/login-key` (one-time public key) → `POST api/auth/user-login` with the password encrypted
 (RSA-OAEP / SHA-256, via Node) → `POST api/auth/mfa/verify` with the MFA OTP `123456`. The password comes
-from `config/login_passwords.json` (git-ignored): `{"default": "<password>"}`, plus `"<mobile>": "..."` for
+from `config/login_passwords.json` (tracked; the repo is org-internal): `{"default": "<password>"}`, plus `"<mobile>": "..."` for
 accounts that differ (or `{"test": {...}}` per environment), or `GOLD_LOAN_LOGIN_PASSWORD`. UAT still uses
 the OTP login (`user-send-otp` → `verify-login`, OTP `1234`); the OTP length the server announces is
 followed (6 digits → `123456`). Overrides: `GOLD_LOAN_LOGIN_METHOD=otp|password`,
 `GOLD_LOAN_LOGIN_OTP`, `GOLD_LOAN_MFA_OTP`.
 
 **When TEST rejects the password** ("Invalid credentials"), every account is moved to the standard new
-password, `"new_password"` in the git-ignored `config/login_passwords.json` (or `GOLD_LOAN_NEW_PASSWORD`):
+password, `"new_password"` in `config/login_passwords.json` (or `GOLD_LOAN_NEW_PASSWORD`):
 1. It tries the new password itself first: the account may already have it, and then nothing is changed.
 2. Otherwise it resets the password through forgot-password (`user-send-otp` type `forget` →
    `user-otp/verify-otp` → `api/user/update-password`) and logs in with it.
