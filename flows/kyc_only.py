@@ -95,6 +95,7 @@ class KycOnlyTest:
         # Verification verdicts are per-customer, and so is a degrade back to manual.
         s.pan_verified = False
         s.aadhaar_verified = False
+        s.aadhaar_xml_details = {}
         s.ovd_verified = False
         s.kyc_verification_log = []
         s.kyc_mode_effective = s.kyc_mode_requested

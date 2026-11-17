@@ -87,7 +87,7 @@ request body, signature and domain rule stays defined once in `gold_loan/harness
   can hold several.
 - **`tests/test_offline_harness.py`** — offline regression suite, **no network and no extra deps** (there is
   no pytest here). `python tests/test_offline_harness.py [group-prefix]`. Request bodies are byte-compared
-  against `reference/*.har`; control flow is mock-driven. 130 tests, groups: `kyc-body`, `kyc-verify`,
+  against `reference/*.har`; control flow is mock-driven. 275 tests (17 Nov; incl. groups `bt`, `cpv`, `kyc-address`, `audit`), groups: `kyc-body`, `kyc-verify`,
   `duplicate`, `profile`, `packets`, `appraiser`, `bank`, `resume`, `stage`, `batch`, `gateway`, `kyc-runner`. Node is required (CryptoJS tests).
   **This suite was mutation-tested** — the code was deliberately broken to confirm each test fails.
   When adding a KYC behaviour, add a test AND check a mutation trips it; the first version of the
@@ -175,6 +175,7 @@ request body, signature and domain rule stays defined once in `gold_loan/harness
 | `GOLD_LOAN_BANK_STATUS_FILE` | Where the cross-run bank-account status is kept (default `config/bank_account_status.json`) |
 | `GOLD_LOAN_BANK_RETRY_ALL` | `true` → re-try accounts the penny-drop already rejected this run (default: skip them) |
 | `GOLD_LOAN_BANK_ACCOUNT_ATTEMPTS` | How many accounts the penny-drop may walk (default 12) |
+| `GOLD_LOAN_REQUEST_OTHER_BRANCH` | `false` → don't try the login's other branches first when the default branch refuses a new appraiser request (default `true`) |
 | `GOLD_LOAN_FRESH_APPRAISER_REQUEST` | `true` → cancel an existing appraiser request's loan and create a new one instead of RESUMING it. CLI: `--fresh-request` |
 | `GOLD_LOAN_LOG_LEVEL` | `quiet` \| `normal` \| `verbose` |
 | `GOLD_LOAN_HTTP_LOG` | `false` → quiet |
@@ -298,6 +299,14 @@ unaffected.
   aadhaarNumber: <CryptoJS-encrypted>, maskedAadhaarNumber: "XXXXXXXX"+last4}`. The XML and the
   number must be the same person or it 400s "Aadhaar number does not match with the XML data".
   UIDAI's `referenceId` starts with the Aadhaar's last 4 digits — a cheap way to check a profile.
+- **Auto KYC address = the verified Aadhaar XML's address** (`_aadhaar_permanent_address`, mirrors
+  portal `UserAddressComponent.patchAaddarValue`/`checkForAadhar`). `_verify_aadhaar_xml_auto` keeps
+  the answer in `aadhaar_xml_details` (live keys `aadhaarAddress/aadhaarPinCode/aadhaarState/
+  aadhaarCity/aadhaarLandmark`; persisted UIDAI keys `address/pc/state/vtc|dist` also read, by
+  `aadhaar_address_from_xml`). Both KYC addresses get it, proof type 2 (Aadhaar images). State/city
+  resolved BY NAME (`_resolve_state_city_by_name`); a missing city is created with `POST
+  /api/city/new-city {stateId, cityName, cityUniqueId:null}`. Live 17 Nov: MWK9NJRG -> Hisar, Haryana
+  125001 (state 13, city 5995) stored on both addresses. Manual/OVD/unverified keep the generated one.
 - **Auto-mode Aadhaar = 8 random digits + the REAL last 4** (`_aadhaar_with_last4`, re-drawn until
   Verhoeff-valid), with the person's real name. The XML can only be matched on the last 4 + name, so
   every customer gets a unique Aadhaar from one XML. PAN has NO such workaround (stays real), so
@@ -365,6 +374,20 @@ Set `GOLD_LOAN_EXISTING_CUSTOMER_UNIQUE_ID` or `..._ID`. In `run_e2e_test`:
 - **Already-filled info is pulled from the real record, not regenerated.** `get_customer_by_id` (`/api/customer/{id}` → `singleCustomer`) and `get_kyc_customer_detail` (`/api/kyc/get-customer-detail` → `customerInfo`) extract `gender`, `dateOfBirth` (ISO → `dob` via `[:10]`), `age`, `motherName`, and the nested **`customerKycPersonal`** (`profileImage`, `signatureProof`, `martialStatus`, `spouseName`, `identityProofNumber`). `_prepare_loan_fields_from_existing` only generates a value when the record didn't supply it. **Watch for downstream clobbers:** `store_loan_basic_details` used to regenerate `dob`/`age` unconditionally — it must guard `if not self.age or not self.dob` so real values survive. (The nominee name is correctly generated — it's a separate person.)
 
 ## Appraiser-request lookup & reuse ("already Exists")
+
+- **OTHER BRANCH FIRST (user, 13 Nov):** when the default (customer's) branch refuses a NEW request with
+  any 400, `create_appraiser_request` first runs `_create_request_in_another_branch` (login's branches,
+  `get-my-branches`, max 3; order: login branch, GOLD_LOAN_REQUEST_BRANCHES ids, then the server's alphabetical list -- the TEST appraiser has ~140 branches, and "1q2q" (152) sorting first is why MSSU4GTG has 1Q2Q-* loans); only if none accepts does the reuse / diagnosis handling below run.
+  `GOLD_LOAN_REQUEST_OTHER_BRANCH=false` (`request_other_branch_enabled`) restores reuse-first. The
+  **Five-active-loans rule (max-loan-limit 400, `isFiveLoanActive`) is CUSTOMER-WIDE, not per branch:**
+  13 Nov MSSU4GTG was refused in branches 1, 152, 40, 76, 72 (0 loans in the last three), and moving the
+  request created 4 empty requests that can't be deleted (no cancel/delete endpoint for appraiser
+  requests). So `fetch_max_loan_limit` raises `LoanLimitReachedError` and the run stops — for an existing
+  customer right after loading it, before any request. Global `maxActiveLoans` (2690) is not it.
+  The ladder prefers `login_branch_id` (JWT branch, set in `_after_login`) — `internal_branch_id` can
+  already be the customer's branch by then. The
+  ladder now skips the branch in the request body (the customer's), not the login's branch — the
+  login's own branch used to be wrongly skipped. Tests: `_branch_request_run` (3 tests).
 
 - **`GET /api/appraiser-request/view-all?from&to` does NOT index `customerUniqueId` in its `search` param, AND the list is scoped to the logged-in user.** Confirmed on UAT: the create POST 400'd *"This product Request already Exists"* for `MSYIITOI`/customerId 20308, yet `search=MSYIITOI` returned `{"message":"Data not found!","data":[]}` — and an unfiltered paginated scan under the **appraiser** token found nothing either. The request exists but belongs to another appraiser/branch. The captured HAR only ever calls this endpoint as `?from=1&to=25`, with no `search`; the filter was the harness's invention.
 - **Lookup ladder** (`_lookup_appraiser_request` + `_fetch_existing_appraiser_request`): `search=<customerUniqueId>` → `search=<mobileNumber>` → **unfiltered paginated scan** (`_list_appraiser_requests`, follows `pagination.hasMore`, 8 pages × 25) → **the whole ladder again under an ADMIN token** (`_role_token("admin")`, restored in a `finally`). Admin sees every branch — the same reason `add_customer` and packet create/assign run as admin. `_match_appraiser_request` does the matching: item-level `id` is the request id; `customer.id` is the CUSTOMER id — never use it as the request id.
@@ -628,6 +651,99 @@ first when no `--loan/--master-loan-id` is given, then drives any NEW loan with
   while the server already sets `isLoanCreated`/`newLoanId` at the hand-over (so newLoanId != done).
   `jewellery-release/document` (needs `customerHandOver` too) is skipped when documents exist.
   Never re-test a scenario on a used parent; use its child loan.
+
+## Audit (`gold_loan/audit.py`, `flows/e2e_audit.py`) — TEST only
+- Portal: lazy chunk 12.js (loan-management): AuditorsLoanService (`api/audit/auditor-loan`,
+  `check-packet` (unused), `submit`), AuditCalculationComponent (submit body), RequestAuditDialog
+  (`api/audit/assign {auditorId, masterLoanId, auditType}`), OpenAuditAssignment (`assign-multiple`,
+  OpenAuditAssignment (`assign-multiple`). AuditType: Audit / Re-audit / Open-audit — all three covered.
+- **Open audit (`--audit-type Open-audit`, chunk 13):** admin `POST audit/assign-multiple {internalBranchId,
+  auditorId, startDate, endDate (YYYY-MM-DD|null), auditType}` (run uses the loan's start date for both) →
+  START AUDIT blocked until `internalBranch.custodianStatus` (Not Assigned/Pending/Accepted/Rejected) is
+  Accepted: auditor `POST audit/custodian-assign {internalBranchId, custodianId}` (custodianId from
+  `user/internal-branch-user-list`), custodian `POST audit/custodian-status {internalBranchId, status:"Accepted"}`
+  → normal submit → masterLoan `auditStatus: "Custodian Approval"` (audit NOT applied; loan leaves the
+  auditor list) → custodian `GET audit/custodian-requests-list?from&to&internalBranchId` + `POST
+  audit/custodian-requests-status {status:"accepted", internalBranchId, ids, masterLoanIds}`.
+  - **Custodian = whoever the branch's request is addressed to.** `custodian-status-requests` answers data
+    null for anyone else, and `custodian-requests-list` is EMPTY for anyone but that user (even admin).
+    Branch 1 on TEST had someone else's Accepted custodian → the run re-requests its own (`--custodian`,
+    default appraiser 1473, a branch-1 user) — this replaces the branch's custodian for everyone.
+  - Custodian acts in its TOKEN's branch: `GET api/auth/change-user-branch?branchId=` → new `Token`.
+    **Switching retires the login's earlier sessions** (the saved appraiser session 401'd afterwards), so
+    `restore_custodian_branch` switches back and stores THAT token as the saved session.
+  - auditStatus is only on the admin `un-audited-loan` rows (not single-loan-customer); `audit_status()`
+    scans it in pages of 500 (no search param). A loan already in "Custodian Approval" resumes at the
+    custodian approval.
+  - Custodian request row (`custodian-requests-list`, ~1400 rows on branch 1 → filter `loanUniqueId`, the
+    screen's own filter, then page by `totalCount`) is CREATED AT ASSIGNMENT ("Open-audit Initiated",
+    auditorReqData null). Accepting it before the submit → 500 "Cannot read properties of null (reading
+    'body')" — there is NO pre-audit handover; accept only rows with auditorReqData. The takeover
+    re-addresses all the branch's rows to the new custodian.
+  - auditStatus values: "Un-audited" (fresh — NOT null), "Open-audit Initiated", "Custodian Approval".
+    resolve_loan picks only Un-audited; Initiated-for-our-auditor skips assign; Custodian Approval resumes.
+  - `un-audited-loan` pages come back SHORT (498 of 500) → page by `count`, not by a short page.
+  - Live 17 Nov PASSED: AUGM-45530 (master 12392) → request 1483 approved, audit applied (loanAmountAfterAudit
+    662723.81), 20/20. STRANDED: AUGM-34519 (master 12431) submitted while another user was branch-1
+    custodian → "Custodian Approval" but NO custodian row (not even after the takeover); needs a dev fix.
+- Auditor = role "auditor" in ENVIRONMENTS["test"]["role_mobiles"] (8880008886, user 2828, branch 1;
+  its password was reset by the recovery on 7 Nov). `auditor-list?internalBranchId=` lists branch auditors.
+- Flow: admin assign → admin new packet (POST /api/packet + PUT with auditorId, userType "auditor") →
+  auditor single-loan-customer (loanUnAudited* replace current when present, id = oldOrnamentId) →
+  `audited_ornaments` (net −delta, deduction +delta, gross same, ltvPercent one step down the ltvRange
+  or −1; netWtAfterPurity = `purity_weight` = net*ltv/100 ROUND_HALF_UP) → auditor available-packet +
+  4 packet photos → POST /api/audit/submit {auditorOrnaments, oldOrnaments, auditorPackets, oldPacket,
+  masterLoanId, auditNote, isOldPacketInUse} → verify via single-loan-customer.
+- After submit: loanOrnamentsDetail = auditor values, loanUnAuditedOrnamentsDetail = appraiser's;
+  loanPacketDetails = auditor packet (auditCount 1), loanUnAuditedPacketDetails = old packet;
+  loanAmountAfterAudit / auditExcessMarginAmount / auditValues set. Live 7 Nov: AUGM-09203 (master 12325).
+
+## BT loan (`gold_loan/bt_loan.py`, `flows/e2e_bt_loan.py`)
+- Portal source: chunk 13.js (BTLoanService, BtLoanComponent tabs existing-bt-info / ornament-details /
+  schemes / bank-info / regulatory-documents / approvals, AppliedBtLoansComponent), 16.js
+  (NewRequestListComponent.applyBTLoan), main.js (NewRequestAddComponent). Live TEST 17 Nov:
+  AUGM-BT-96444 / -90168 / -68011 all reached stage 11.
+- Start = `POST /api/appraiser-request` with the normal body + `request: "bt application"` ->
+  "Request Created"; the request carries `customerLoanBusinessTransfer {id, btUniqueId, customerBtStage}`.
+  **BT requests / lists are ADMIN-only**: appraiser view-all (search or not) does not show them; use
+  admin `view-all?from&to&search=<customerUniqueId>` and `bt-process/applied-closed-list?…&search=AUGM-BT-…
+  &showCompletedApplications=` (rows under `appliedBtList`). Apply = `track-bt-history {appraiserRequestId, action:3}`.
+- Stage = `businessTransfer.btCurrentStageId` from `GET bt-process/applied-bt-application/<id>` (also
+  isCpvRequired / isStatementItrSsRequired at top level): 1 existing-bt-info, 2 ornament-details,
+  3 scheme-details, 4 bank-details, 5 upload-document, 6-10 update-rating-rch/rh/zh/zah/ceo (server picks
+  which; 3L/6.5L RCH only, 12L RCH+RH), 11 "Advance Transfer Initiated" (advanceRequestId) = END: the
+  next step is the finance advance-transfer approval -> ICICI payout; never driven.
+- Bodies: see the module docstrings. Scheme: partner-scheme-amount/<branch>?isFromLoanTransfer=true,
+  billing-cycle?tenure&isFromBt=true (`billingCycles[].value`), loan-scheme-calculator (truthy params only,
+  loanType=BT, netWeightAfterPurity from the application) -> rows {schemeId, eligibilityAmount}.
+  Uploads reason `btApplication` (+customerId); cheques = ceil(amount/5L); CPV re-upload (APNT-350) =
+  reason `customer` -> `reUploadCpv`. Approvals as admin work (rchId = admin).
+- **BT bank must be VERIFIED at stage 4** (user, 17 Nov). Bug fixed: bank-details used to send
+  isVerified = bankTxnStatus (`bank_account_verified`) -> the advance showed "Verified by System" with
+  forOpsApproval true (advances 2199-2206). Now: if `forOpsApproval or not (bank_system_verified or
+  bank_manually_verified)` -> OPS `loan-process/bank-verification-manual {status approved, detailsFor customer,
+  customerId, requestFrom: "bt application", businessTransferId, ...}` (probe-found; 'loan' needs a loan bank
+  detail, 'advance request' needs requestId) -> isManuallyVerified true; bank-details sends the real flags;
+  still pending -> BtLoanError. Advance 2207/2208: "Verified by Operations".
+- **One BT per customer**: a second request -> 400 "This customer's loan transfer is in process", also
+  at stage 11. The flow names the customer's BT(s) in the error.
+
+## Customer CPV (`gold_loan/cpv.py`, `flows/complete_cpv.py`, BT `--complete-cpv`)
+- Portal: chunk 46.js CpvService / CpvFormComponent (`/admin/cpv/form?customerId&customerKycId`), 48.js
+  AppliedKycComponent.cpvStatus/doCpv. `POST api/customer-cpv/create {customerId, customerKycId (strings),
+  personMetName, relationshipWithCustomer, isNameSameAsSystem, isAddressSameAsSystem, verifiedAddress,
+  residenceOwnership, landmarkArea, yearsAtCurrentAddress, neighbourhoodFeedback, endUser, remarks,
+  photos[{url,path,lat,lng,capturedAt,label}] (labels 'Selfie with person met' / 'Image of the residence',
+  upload reason 'customer'), customerSignatureUrl}` -> 201, cpvStatus Approved, expiresAt +1 year.
+  Status: `GET customer-cpv/customer/<id>` (404 = none). Prefill: `GET kyc/kyc-form-review?customerId&customerKycId`
+  (internalBranch.latitude/longitude used for the photos).
+- **Signature**: the server only requires customerSignatureUrl ("Customer Signature Url is required"). The
+  portal's real route `customer-cpv/digi-sign` -> Digio OTP e-sign; `loan-process/digi-sign-file?referenceId
+  &documentFrom=cpv` stays 406 "Digi sign is requested" until the customer signs. **User decision (17 Nov):
+  placeholder signature image only** -- harness CPVs are unsigned, TEST/UAT only.
+- Live TEST 17 Nov: CPV 69/70/71. A valid CPV is never redone; expired / isReKycInitiated -> new CPV.
+- BT documents: the application's own `cpvImage` is sent when present, else one is uploaded if
+  isCpvRequired; that BT image lands on `customer.cpvImage` after approval (APNT-350 behaviour).
 
 ## Full E2E order (`run_e2e_test`)
 

@@ -149,6 +149,13 @@ with "PAN Card already exists!". On TEST/UAT add **`--release-kyc-docs`** to fre
 [Releasing real KYC documents](#releasing-real-kyc-documents-testuat)); that also allows
 `--kyc auto --count N`.
 
+**KYC address in `auto` mode:** once the Aadhaar XML verifies, the address it carries becomes the
+customer's KYC address, as the portal does. Both the permanent and the residential address get the
+XML's address, pincode and landmark, with Aadhaar (proof type 2) as the address proof. State and city
+are matched by name against `/api/state` and `/api/city`. A city that isn't in the master list is
+created with `POST /api/city/new-city`, as the portal does. Manual and OVD runs, and an auto run whose
+Aadhaar didn't verify, still use a generated address.
+
 `auto` and `ovd` need genuine documents — the verification APIs check them against the issuing
 authority, so numbers cannot be generated. Supply them in **`config/kyc_identity.json`** (copy
 `config/kyc_identity.example.json`) or via `GOLD_LOAN_KYC_*` env vars. `config/` is gitignored
@@ -546,6 +553,147 @@ driving that new loan to completion is still to be run. `full-release` has not b
 The customer hand-over already stores the release documents (NOC acknowledgement, pawn copy,
 hand-over photo), so the separate document upload is skipped when they are on file.
 
+## Audit (TEST only for now)
+
+`flows/e2e_audit.py` audits a completed loan as the auditor, the way the portal's audit screens do:
+
+```bash
+python flows/e2e_audit.py                         # newest unaudited loan of the auditor's branch
+python flows/e2e_audit.py --loan AUGM-09203
+python flows/e2e_audit.py --loan AUGM-09203 --weight-change 0.1 --purity-change 1
+python flows/e2e_audit.py --loan AUGM-09203 --old-packet
+```
+
+1. The admin assigns the loan to the auditor (`POST /api/audit/assign`, audit type `Audit`). The
+   auditor is TEST's 8880008886 (role `auditor`); it logs in like every role, with the saved sessions
+   and the password recovery.
+2. The admin creates a **new packet** and assigns it to the auditor (`POST /api/packet`, then
+   `PUT /api/packet/{id}` with `auditorId` and `userType: "auditor"`).
+3. The auditor opens the loan (`single-loan-customer`) and re-checks every ornament. By default the
+   net weight comes out 0.05–0.25 g lower (the deduction goes up by the same amount, the gross weight
+   stays) and the purity (`ltvPercent`) one step lower in the ornament's purity range; the weight after
+   purity is recomputed as the portal does.
+4. The auditor photographs the new packet (four photos), puts every ornament in it and submits
+   (`POST /api/audit/submit`).
+5. The run reads the loan back and prints the appraiser's and the auditor's values side by side,
+   plus the loan amount and excess margin after the audit.
+
+After the audit the server keeps the auditor's values as the loan's ornaments and the appraiser's as
+the "unaudited" ornaments; the loan moves to the auditor's packet and the old one is kept as the
+unaudited packet. Verified live on TEST (7 Nov): AUGM-09203, 4 ornaments, new packet pac85342654.
+
+### Open audit
+
+```bash
+python flows/e2e_audit.py --audit-type Open-audit                       # newest unaudited loan, branch custodian = appraiser
+python flows/e2e_audit.py --audit-type Open-audit --loan AUGM-34519 --custodian bm
+```
+
+Open audit has the same re-check and submit as a normal audit. What differs is how the loan reaches
+the auditor and how the audit is closed:
+
+1. **Assignment:** the admin assigns the loan's whole branch to the auditor
+   (`POST /api/audit/assign-multiple` with `auditType: "Open-audit"`). The run limits the date range
+   to the loan's own start date, so only that day's loans of the branch are assigned.
+2. **Branch custodian:** the auditor can't start an open audit until the branch custodian has
+   accepted. The run makes its `--custodian` login (default: appraiser) that custodian. The auditor
+   requests it (`POST /api/audit/custodian-assign`), and the custodian accepts
+   (`POST /api/audit/custodian-status`, status `Accepted`). The custodian works in the branch on its
+   token. If its default branch is different, the run switches it to the loan's branch first
+   (`GET /api/auth/change-user-branch`) and switches it back at the end. If that login is already the
+   accepted custodian, this step is skipped.
+3. **Audit:** new packet, re-check and submit, the same as a normal audit. The loan then waits with
+   `auditStatus: "Custodian Approval"`. The audit is not applied yet.
+4. **Custodian approval:** the custodian approves the loan's row in
+   `GET /api/audit/custodian-requests-list` (`POST /api/audit/custodian-requests-status`, status
+   `accepted`).
+
+Only the branch's current custodian sees the custodian requests. If another user is the accepted
+custodian, the run **replaces them with its own login** for that branch. On TEST this changes the
+branch's custodian for everyone.
+
+Each loan's custodian request is created when the loan is assigned for open audit. The custodian can
+accept it only after the audit has been submitted; before that the server answers 500. Picking up
+where a run stopped:
+
+| Loan's state | Re-running the same command |
+|---|---|
+| Already assigned for open audit to this auditor (`Open-audit Initiated`) | Skips the assignment |
+| Audit submitted, waiting for the custodian (`Custodian Approval`) | Goes straight to the approval |
+
+Without `--loan`, the run only picks loans whose status is `Un-audited`.
+
+Verified live on TEST on 17 Nov: AUGM-45530 (master loan 12392, branch 1), 20/20 calls. The custodian
+approved request 1483 and the audit was applied: loan amount after the audit is 662,723.81.
+
+## BT loan (balance transfer)
+
+`flows/e2e_bt_loan.py` takes over a gold loan from another lender through the portal's BT screens
+(Customer Management → *Start New BT Process* → Appraiser Requests → *Apply BT Loan*). It has the
+same three ways of running as the gold-loan flows:
+
+```bash
+python flows/e2e_bt_loan.py                                  # FULL: new customer + KYC -> BT approved
+python flows/e2e_bt_loan.py --stop-before-documents          # park the BT at "Upload Documents"
+python flows/e2e_bt_loan.py --customer MWK4X6YU --amount 600000
+python flows/e2e_bt_loan.py --bt AUGM-BT-90168               # RESUME a BT from its current stage
+python flows/e2e_bt_loan.py --customer MWK5D1YA --resume     # resume that customer's open BT
+python flows/e2e_bt_loan.py --rch-decision incomplete        # negative path at RCH
+```
+
+| Stage | Screen | Call |
+|---|---|---|
+| — | Start New BT Process | `POST /api/appraiser-request` (new-request body + `request: "bt application"`) |
+| 1 | Existing BT Info | `POST /api/bt-process/existing-bt-info` (lender from `/api/nbfc`, company type, old loan id, amounts, dates) |
+| 2 | Ornament Details | `POST /api/bt-process/ornament-details` (22 K HM, purity = top of the karat's LTV range, weight after purity rounded half-up) |
+| 3 | Scheme Details | `partner-scheme-amount?isFromLoanTransfer=true` → `billing-cycle?isFromBt=true` → `loan-scheme-calculator?loanType=BT` → `POST /api/bt-process/scheme-details` |
+| 4 | Bank Details | IFSC lookup + penny-drop (the harness's account list); when the account is pending (name mismatch → `forOpsApproval`), **ops verifies it here** (`POST /api/loan-process/bank-verification-manual`, `requestFrom: "bt application"`, `businessTransferId`) → `POST /api/bt-process/bank-details` with the real verdict. The advance request then shows *Verified by Operations*. |
+| 5 | Upload Documents | `generate-undertaking`, then `POST /api/bt-process/upload-document` (pawn ticket, one cheque per 5L, undertaking, live image; CPV / statement when the server requires them) |
+| 6–10 | RCH / RH / ZH / ZAH / CEO | `POST /api/bt-process/update-rating-<rch\|rh\|zh\|zah\|ceo>` — the server decides which are needed (3L and 6.5L: RCH only; 12L: RCH + RH) |
+| 11 | Advance Transfer Initiated | **The run ends here.** |
+
+- Every step reads the application first (`GET /api/bt-process/applied-bt-application/<id>`) and acts
+  on `btCurrentStageId`, so a stopped or failed run is resumed with `--bt`; the run prints that command.
+- The BT request and the BT lists are visible only to the **admin** login; the harness looks them up
+  with the admin token. Approvals are given by the admin (`--approver` to change).
+- One BT per customer at a time: a second request is refused with *"This customer's loan transfer is in
+  process"* — also after approval (stage 11). The run then names the customer's BT so it can be resumed.
+- Stage 11 is the end on purpose: next, finance approves the **advance transfer** that pays the old
+  lender through the ICICI payout gateway, which this harness never triggers.
+- `--reupload-cpv` also sends a CPV re-upload with the documents (APNT-350).
+
+Verified live on TEST (17 Nov): AUGM-BT-96444 (full, 3L), AUGM-BT-90168 (stopped before documents at
+6.5L, then resumed to stage 11), AUGM-BT-68011 (12L, RCH + RH). Offline tests: group `bt`.
+
+## Customer CPV (TEST/UAT)
+
+`flows/complete_cpv.py` completes a customer's **CPV** (Contact Point Verification), the form the
+portal opens from Applied KYC → CPV:
+
+```bash
+python flows/complete_cpv.py --customer MWK4XHP4                    # one existing customer
+python flows/complete_cpv.py --customer MWK4XHP4 --customer MWK5D1YA
+python flows/complete_cpv.py                                         # new customer + KYC, then CPV
+python flows/complete_cpv.py --count 3                               # three new customers
+python flows/complete_cpv.py --customer MWK4XHP4 --status            # only show the CPV status
+python flows/e2e_bt_loan.py --complete-cpv --amount 600000           # CPV first, then the BT
+```
+
+- Sends the CPV form (person met, relationship, name / address match, verified residential address,
+  ownership, years at address, neighbourhood, end user, remarks) with the two geo-tagged photos
+  (*Selfie with person met*, *Image of the residence*), tagged at the customer's branch so they pass the
+  geo-deviation check: `POST /api/customer-cpv/create`. The server approves it at once and it is valid
+  for a year.
+- **The customer's signature is a placeholder image.** In the portal it comes from a real Digio e-sign
+  that the customer completes with an OTP (`customer-cpv/digi-sign`), which cannot run unattended; the
+  server only requires a signature URL. A harness CPV is therefore not a signed CPV — test
+  environments only.
+- A customer with a valid CPV is left alone; an expired one, or one invalidated by a re-KYC, gets a new
+  CPV. A customer whose KYC is not approved goes through KYC first.
+
+Verified live on TEST (17 Nov): CPV 69 (MWK4XHP4), 70 (MWK5D1YA), 71 (MWK69ORZ, followed by BT
+AUGM-BT-08613). Offline tests: group `cpv`.
+
 ## How the harness mirrors the portal
 
 The request bodies were audited against the **live portal code** (screen by screen) and the captured
@@ -599,8 +747,10 @@ A pass means "the requests we build match the ones the browser sent, and the con
 │   ├── __init__.py
 │   ├── harness.py                GoldLoanApiTest — every API step, signing, encryption — plus the
 │   │                             full-loan CLI (main()) that the flows reuse.
-│   └── repayment.py              RepaymentScenarios — renewal, top-up, part / full release on a
-│                                 disbursed loan (wraps GoldLoanApiTest).
+│   ├── repayment.py              RepaymentScenarios — renewal, top-up, part / full release on a
+│   │                             disbursed loan (wraps GoldLoanApiTest).
+│   ├── bt_loan.py                BtLoanFlow — BT (balance transfer) application, stage 1 -> 11.
+│   └── cpv.py                    CustomerCpv — the customer CPV form (customer-cpv/create).
 ├── flows/                        Runnable live scenarios, one per file. Naming: e2e_<scenario>.py
 │   │                             for loan journeys, <area>_<action>.py for focused runs.
 │   ├── e2e_full_loan.py          Complete loan: customer/KYC -> ... -> disbursement -> submit packet.
@@ -608,6 +758,8 @@ A pass means "the requests we build match the ones the browser sent, and the con
 │   ├── e2e_stop_before_disbursement.py  Loan up to and including Ops Rating.
 │   ├── resume_loan.py            Finish an in-flight loan from the stage it is at.
 │   ├── e2e_repayment.py          Renewal / renewal + top-up / top-up / part release / full release.
+│   ├── e2e_bt_loan.py            BT loan: full / stop before documents / resume (--bt).
+│   ├── complete_cpv.py           Customer CPV (placeholder signature; TEST/UAT).
 │   ├── kyc_only.py               KYC only (all three identity modes, no loan process).
 │   ├── kyc_v1.py                 Customer + KYC on the version 1 KYC endpoints (manual / auto).
 │   ├── kyc_release_documents.py  TEST/UAT: free a PAN / Aadhaar so it can be registered again.
@@ -697,6 +849,7 @@ and `flows/e2e_stop_before_disbursement.py` (stops after ops rating), which reus
 | `--transfer-mode` | `neft` \| `imps` \| `rtgs` | `neft` | Disbursement bank transfer mode: the portal's manual OFFLINE options, with a UTR (ICICI / RazorpayX payouts are not used). | `GOLD_LOAN_TRANSFER_MODE` |
 | `--cash-amount` | rupees \| `full` | *(off)* | Advance cash handed over at bank details; the bank transfer pays the rest (see *Cash at bank details*). | `GOLD_LOAN_CASH_AMOUNT` |
 | `--release-kyc-docs` | *(switch)* | off | TEST/UAT only: before KYC, free the identity profile's real PAN (and full Aadhaar) via `POST /api/e-kyc/remove`, so `--kyc auto` can register them again; allows `--kyc auto --count N`. | `GOLD_LOAN_RELEASE_KYC_DOCS=true` |
+| *(env only)* | `true`/`false` | `true` | If the default branch refuses a new appraiser request (e.g. "already Exists"), try the login's other branches (up to 3: its own branch first, then `GOLD_LOAN_REQUEST_BRANCHES`, e.g. `1,66`, then the rest) before reusing an existing request. | `GOLD_LOAN_REQUEST_OTHER_BRANCH=false` |
 | `--fresh-request` | *(switch)* | off | If the customer already has an appraiser request, cancel its loan and create a new request (default: resume it). | `GOLD_LOAN_FRESH_APPRAISER_REQUEST=true` |
 | `--count` | N | `1` | Create N loans back to back in one logged-in session. A failed loan does not stop the batch. | — |
 | `-h`, `--help` | | | Show the help text and exit. | |
@@ -768,6 +921,48 @@ and `flows/e2e_stop_before_disbursement.py` (stops after ops rating), which reus
 | `--new-scheme` | scheme id | *(first that fits)* | Pin the scheme the renewal / top-up / part-release loan moves to. |
 | `--approver` | `ops` \| `admin` | `ops` | Who approves the payment and assigns the appraiser; admin is used automatically when ops cannot see the branch's request. |
 | `--customer`, `--amount`, `--scheme` | as the full-loan flow | — | Only when the loan is created first. |
+
+### `flows/e2e_audit.py` — audit a completed loan (TEST only)
+
+| Flag | Values | Default | What it does |
+|---|---|---|---|
+| `--loan` / `--master-loan-id` | AUGM id / id | *(newest unaudited loan of the auditor's branch)* | The completed loan to audit. |
+| `--weight-change` | grams | random 0.05–0.25 per ornament | How much lighter the auditor finds each ornament's net weight. |
+| `--purity-change` | points | one step down the purity range | How much lower the auditor finds the purity (`ltvPercent`). |
+| `--old-packet` | flag | off (new packet) | Re-use the loan's packet instead of a new one for the auditor. |
+| `--audit-type` | `Audit` \| `Re-audit` \| `Open-audit` | `Audit` | The assignment type. `Open-audit` adds the branch custodian steps (see [Open audit](#open-audit)). |
+| `--custodian` | `appraiser` \| `bm` \| `ops` \| `admin` | `appraiser` | Open audit only: the login that acts as the branch custodian. It must be a user of the loan's branch. |
+| `--note` | text | generated | The audit note. |
+| `--fresh-login` | flag | off | Log every role in again (new tokens still saved). |
+
+### `flows/e2e_bt_loan.py` — BT loan (balance transfer)
+
+| Flag | Values | Default | What it does |
+|---|---|---|---|
+| `--bt` | AUGM-BT id / id | — | Resume this BT from its current stage. |
+| `--customer` | unique id | *(create one + KYC)* | Customer for a new BT (KYC is run if not approved). |
+| `--resume` | flag (with `--customer`) | off | Continue the customer's newest open BT instead of a new one. |
+| `--stop-before-documents` | flag | off | Stop at stage 5 *Upload Documents*. |
+| `--amount` | rupees | 300000 | The old loan taken over (= requested BT amount). |
+| `--tenure` | 30 … 180 | 180 | Loan tenure in days. |
+| `--partner` | `roshan` \| `arvog` \| `any` | roshan | Partner for the scheme: only that partner (fails clearly if none of its schemes covers the amount); `any` = every partner that allows BT. |
+| `--scheme` | scheme id | first that covers the amount | Pin the scheme. |
+| `--lender` / `--company-type` | text | from `/api/nbfc` / `NBFC` | The existing lender. |
+| `--ornaments` | 1–20 | 3 | Number of ornaments. |
+| `--approver` | `admin` \| `ops` \| `bm` \| `appraiser` | admin | Login that gives the approvals. |
+| `--rch-decision` | `approved` \| `incomplete` \| `rejected` | approved | RCH's decision; anything but approved ends the run there. |
+| `--complete-cpv` | flag | off | Complete the customer's CPV before the BT (skipped when a valid CPV exists). |
+| `--reupload-cpv` | flag | off | Send a CPV re-upload with the documents. |
+| `--env`, `--login`, `--fresh-login` | as the other flows | test / appraiser / off | |
+
+### `flows/complete_cpv.py` — customer CPV (TEST/UAT)
+
+| Flag | Values | Default | What it does |
+|---|---|---|---|
+| `--customer` | unique id (repeatable) | *(create a new customer + KYC)* | Customer(s) to complete CPV for. |
+| `--count` | N | 1 | New customers to create (without `--customer`). |
+| `--status` | flag | off | Only print each customer's CPV status (none / valid / expired / re-kyc). |
+| `--env`, `--login`, `--fresh-login` | as the other flows | test / appraiser / off | |
 
 ### Other scripts
 

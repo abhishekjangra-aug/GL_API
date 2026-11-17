@@ -445,6 +445,126 @@ def _():
 
 
 # --------------------------------------------------------------------------------------------
+# GROUP: kyc-address -- auto KYC takes the KYC address from the verified Aadhaar XML
+# --------------------------------------------------------------------------------------------
+
+AADHAAR_XML_ANSWER = {"isAahaarVerified": True, "aahaarName": "Abhishek Jangra",
+                      "aadhaarAddress": "H No 12, Ward 4, Near Shiv Mandir, Kalayat",
+                      "aadhaarPinCode": "136117", "aadhaarState": "Haryana",
+                      "aadhaarCity": "Kaithal", "aadhaarLandmark": "Near Shiv Mandir"}
+STATES = [{"id": 7, "name": "Gujarat"}, {"id": 12, "name": "Haryana"}]
+
+
+def _aadhaar_address_suite(mode="auto", xml=AADHAAR_XML_ANSWER, cities=None, verified=True):
+    """save_customer_address with a stubbed API: /api/state, /api/city (`cities`, a list or a
+    list of successive answers), new-city. Returns (suite, calls)."""
+    env = {}
+    if mode == "auto":
+        env = {"GOLD_LOAN_KYC_PAN": "BXDPA4371D", "GOLD_LOAN_KYC_DOB": "1996-11-25",
+               "GOLD_LOAN_KYC_AADHAAR": "773626564863",
+               "GOLD_LOAN_KYC_AADHAAR_XML": os.path.join(ROOT, "config", "offline_aadhar.xml")}
+    s = suite(mode, **env)
+    s.customer_id, s.customer_kyc_id, s.module_id = "8693", "501", "1"
+    s.state_id, s.city_id, s.random_pincode = "22", "2707", "400001"
+    s.first_name, s.last_name, s.address_proof_type_id = "Abhishek", "Jangra", "1"
+    answers = list(cities if cities is not None else [[{"id": 900, "name": "Kaithal"}]])
+
+    def responder(path):
+        if path == "/api/state":
+            return {"data": STATES}
+        if path.startswith("/api/city?"):
+            return {"data": answers.pop(0) if len(answers) > 1 else answers[0]}
+        return {"data": {}}
+    calls = record_requests(s, responder)
+    fake_uploads(s, image="uploads/customer/aadhaar-masked.png", pdf="uploads/customer/proof.pdf")
+
+    async def noop(*a, **kw): return None
+    async def verify():
+        s.aadhaar_verified = verified
+        s.aadhaar_xml_details = dict(xml) if verified else {}
+        return verified
+    s._fetch_address_proof_types = noop
+    s._fetch_geo_location = noop
+    s._verify_aadhaar_xml_auto = verify
+    return s, calls
+
+
+@test("kyc-address: auto KYC uses the verified Aadhaar XML's address for both KYC addresses")
+def _():
+    s, calls = _aadhaar_address_suite()
+    quiet(lambda: asyncio.run(s.save_customer_address()))
+    addresses = s.customer_details["customerKycAddress"]
+    close(s)
+    eq([a["addressType"] for a in addresses], ["permanent", "residential"], "address types")
+    for a in addresses:
+        eq(a["address"], AADHAAR_XML_ANSWER["aadhaarAddress"], f"{a['addressType']} address")
+        eq(a["pinCode"], "136117", f"{a['addressType']} pincode")
+        eq(a["landmark"], "Near Shiv Mandir", f"{a['addressType']} landmark")
+        eq(a["stateId"], 12, f"{a['addressType']} state (Haryana, by name)")
+        eq(a["cityId"], 900, f"{a['addressType']} city (Kaithal, by name)")
+        eq(a["addressProofTypeId"], 2, f"{a['addressType']} proof type = Aadhaar")
+        eq(a["addressProof"], ["uploads/customer/aadhaar-masked.png"], "proof = the Aadhaar image")
+    eq((s.state_id, s.city_id, s.random_pincode), ("12", "900", "136117"), "suite state follows Aadhaar")
+    v2 = next(body for _m, path, body in calls if "customer-kyc-address" in path)
+    eq([a["address"] for a in v2["address"]], [AADHAAR_XML_ANSWER["aadhaarAddress"]] * 2,
+       "customer-kyc-address carries the Aadhaar address")
+    ok(not any("new-city" in path for _m, path, _b in calls), "no city created when it exists")
+
+
+@test("kyc-address: an Aadhaar city missing from the master list is created, as the portal does")
+def _():
+    s, calls = _aadhaar_address_suite(cities=[[{"id": 5, "name": "Ambala"}],
+                                              [{"id": 5, "name": "Ambala"}, {"id": 901, "name": "Kaithal"}]])
+    quiet(lambda: asyncio.run(s.save_customer_address()))
+    close(s)
+    created = [body for _m, path, body in calls if path == "/api/city/new-city"]
+    eq(created, [{"stateId": 12, "cityName": "Kaithal", "cityUniqueId": None}], "new-city body")
+    eq(s.city_id, "901", "the created city's id")
+
+
+@test("kyc-address: manual KYC and an unverified Aadhaar keep the generated address")
+def _():
+    for mode, verified in (("manual", True), ("auto", False)):
+        s, calls = _aadhaar_address_suite(mode=mode, verified=verified)
+        s.aadhaar_xml_details = dict(AADHAAR_XML_ANSWER)   # even with details lying around
+        if mode == "manual":
+            s.aadhaar_verified = True
+        quiet(lambda: asyncio.run(s.save_customer_address()))
+        addresses = s.customer_details["customerKycAddress"]
+        close(s)
+        ok(all(a["address"] != AADHAAR_XML_ANSWER["aadhaarAddress"] for a in addresses),
+           f"{mode}/verified={verified}: must not use the Aadhaar address")
+        ok(not any(path == "/api/state" for _m, path, _b in calls), f"{mode}: no state lookup")
+
+
+@test("kyc-address: the Aadhaar address reads both the live and the persisted (UIDAI) shape")
+def _():
+    eq(G.aadhaar_address_from_xml(AADHAAR_XML_ANSWER),
+       {"address": AADHAAR_XML_ANSWER["aadhaarAddress"], "pinCode": "136117",
+        "landmark": "Near Shiv Mandir", "state": "Haryana", "city": "Kaithal"}, "live shape")
+    eq(G.aadhaar_address_from_xml({"address": "12 MG Road", "pc": 560001, "state": "Karnataka",
+                                   "vtc": "", "dist": "Bengaluru"}),
+       {"address": "12 MG Road", "pinCode": "560001", "landmark": "", "state": "Karnataka",
+        "city": "Bengaluru"}, "UIDAI shape, vtc empty -> dist")
+    eq(G.aadhaar_address_from_xml({"aahaarName": "x"}), {}, "no address -> {}")
+    eq(G.aadhaar_address_from_xml(None), {}, "None -> {}")
+
+
+@test("kyc-address: a verified offline-aadhaar-xml answer is kept for the address step")
+def _():
+    s = suite("auto", GOLD_LOAN_KYC_PAN="BXDPA4371D", GOLD_LOAN_KYC_DOB="1996-11-25",
+              GOLD_LOAN_KYC_AADHAAR="773626564863",
+              GOLD_LOAN_KYC_AADHAAR_XML=os.path.join(ROOT, "config", "offline_aadhar.xml"))
+    s.customer_id = "8463"
+    record_requests(s, lambda p: {"data": AADHAAR_XML_ANSWER})
+    quiet(lambda: asyncio.run(s._verify_aadhaar_xml_auto()))
+    close(s)
+    eq(s.aadhaar_verified, True, "verified")
+    eq(s.aadhaar_xml_details.get("aadhaarAddress"), AADHAAR_XML_ANSWER["aadhaarAddress"], "kept")
+    eq(s.name_as_per_aadhaar, "Abhishek Jangra", "name as per Aadhaar")
+
+
+# --------------------------------------------------------------------------------------------
 # GROUP: duplicate -- "already registered" aborts the run
 # --------------------------------------------------------------------------------------------
 
@@ -4263,6 +4383,862 @@ def _():
 
 
 # --------------------------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------------------------
+# GROUP: audit -- gold_loan/audit.py (the auditor's re-check)
+# --------------------------------------------------------------------------------------------
+
+AUDIT_LOAN = {
+    "customerLoan": [{"loanUniqueId": "AUGM-1"}], "loanStage": {"name": "packet submitted"},
+    "loanOrnamentsDetail": [
+        {"id": 1, "ornamentType": {"name": "Jhumki"}, "grossWeight": "18.51", "netWeight": "16.97",
+         "deductionWeight": "1.54", "ltvPercent": "99", "ltvRange": ["98", "99", "100"],
+         "netWtAfterPurity": "16.80", "loanId": 7, "createdAt": "x"},
+        {"id": 2, "ornamentType": {"name": "Ring"}, "grossWeight": "5.00", "netWeight": "4.50",
+         "deductionWeight": "0.50", "ltvPercent": "91.6", "ltvRange": ["91.6"], "netWtAfterPurity": "4.12"}],
+    "loanPacketDetails": [{"emptyPacketWithNoOrnament": "e", "emptyPacketWithNoOrnamentImage": "E",
+                           "packets": [{"id": 50, "packetUniqueId": "pacOLD",
+                                        "customerLoanOrnamentsDetails": [{"id": 1, "ornamentType": {"name": "Jhumki"}},
+                                                                         {"id": 2, "ornamentType": {"name": "Ring"}}]}]}],
+}
+
+@test("audit: purity weight = net * ltv% / 100, rounded half-up to 2 places (portal getPurityWeight)")
+def _():
+    from gold_loan.audit import purity_weight
+    eq((purity_weight("16.77", "98"), purity_weight("13.05", "99"), purity_weight("1.005", "100"),
+        purity_weight("4.4", "91.6")), ("16.43", "12.92", "1.01", "4.03"), "portal values")
+
+@test("audit: each ornament comes out lighter and a purity step lower; gross weight unchanged")
+def _():
+    import copy
+    from gold_loan.audit import AuditFlow
+    s = suite()
+    flow = AuditFlow(s, master_loan_id=12325, weight_change=0.1)
+    flow.loan = copy.deepcopy(AUDIT_LOAN)
+    rows = flow.audited_ornaments()
+    close(s)
+    eq([(r["netWeight"], r["deductionWeight"], r["ltvPercent"], r["netWtAfterPurity"]) for r in rows],
+       [("16.87", "1.64", "98", "16.53"), ("4.40", "0.60", "90.6", "3.99")],
+       "net -0.1, deduction +0.1, purity one step down (or -1 with a single-value range)")
+    eq([r["grossWeight"] for r in rows], ["18.51", "5.00"], "gross untouched")
+    ok("loanId" not in rows[0] and "createdAt" not in rows[0], "only the portal's form fields")
+    ok(all(b != a for _, f, b, a in flow.changes if f != "grossWeight"), "every reported value changed")
+
+@test("audit: explicit --purity-change is subtracted; a weight change >= the net weight is refused")
+def _():
+    import copy
+    from gold_loan.audit import AuditFlow, AuditError
+    s = suite()
+    flow = AuditFlow(s, master_loan_id=1, weight_change=0.05, purity_change=2)
+    flow.loan = copy.deepcopy(AUDIT_LOAN)
+    eq([r["ltvPercent"] for r in flow.audited_ornaments()], ["97", "89.6"], "minus 2 points")
+    flow = AuditFlow(s, master_loan_id=1, weight_change=5)
+    flow.loan = copy.deepcopy(AUDIT_LOAN)
+    try:
+        flow.audited_ornaments()
+    except AuditError as e:
+        ok("not usable" in str(e), str(e))
+    else:
+        raise Fail("5 g off a 4.5 g ring must be refused")
+    close(s)
+
+@test("audit: submit body = the portal's (new packet -> isOldPacketInUse false, 4 packet photos)")
+def _():
+    import copy
+    from gold_loan.audit import AuditFlow
+    s = suite()
+    flow = AuditFlow(s, master_loan_id=12325, weight_change=0.1)
+    flow.loan = copy.deepcopy(AUDIT_LOAN)
+    flow.auditor_packet = {"id": 99, "packetUniqueId": "pacNEW"}
+    sent = []
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        sent.append((method, path, json_data))
+        payload = {"data": [{"id": 99, "packetUniqueId": "pacNEW"}]} if "available-packet" in path \
+            else {"message": "success"}
+        class R:
+            def json(self_inner): return payload
+        return R()
+    async def token(role): return f"tok-{role}"
+    async def upload(file_type="image"): return f"uploads/{file_type}/{len(sent)}.jpg"
+    s._make_authenticated_request, s._role_token, s._upload_file_base = fake, token, upload
+    asyncio.run(quiet_async(flow.submit))
+    close(s)
+    body = [b for m, p, b in sent if p == "/api/audit/submit"][0]
+    eq(sorted(body), sorted(["auditorOrnaments", "oldOrnaments", "auditorPackets", "oldPacket", "masterLoanId",
+                             "auditNote", "isOldPacketInUse"]), "portal keys")
+    eq((body["isOldPacketInUse"], body["auditorPackets"]["packetOrnamentArray"]),
+       (False, [{"packetId": "99", "ornamentsId": [1, 2], "packetsName": "pacNEW", "ornamentsName": "Jhumki, Ring"}]),
+       "new packet holds both ornaments")
+    ok(all(body["auditorPackets"].get(k) and body["auditorPackets"].get(k + "Image") for k in
+           ("emptyPacketWithNoOrnament", "sealingPacketWithCustomer", "sealingPacketWithWeight", "sealedPacket")),
+       "four packet photos with paths and URLs")
+    eq(body["oldOrnaments"][0]["netWeight"], "16.97", "the appraiser's values go as oldOrnaments")
+
+@test("audit: --old-packet re-uses the loan's packet (isOldPacketInUse true, no uploads)")
+def _():
+    import copy
+    from gold_loan.audit import AuditFlow
+    s = suite()
+    flow = AuditFlow(s, master_loan_id=12325, weight_change=0.1, old_packet=True)
+    flow.loan = copy.deepcopy(AUDIT_LOAN)
+    sent = []
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        sent.append((method, path, json_data))
+        class R:
+            def json(self_inner): return {"message": "success"}
+        return R()
+    async def token(role): return "t"
+    async def upload(file_type="image"): raise Fail("no upload expected")
+    s._make_authenticated_request, s._role_token, s._upload_file_base = fake, token, upload
+    asyncio.run(quiet_async(flow.submit))
+    close(s)
+    body = [b for m, p, b in sent if p == "/api/audit/submit"][0]
+    eq((body["isOldPacketInUse"], body["auditorPackets"]["packetOrnamentArray"][0]["packetsName"]),
+       (True, "pacOLD"), "same packet")
+
+@test("audit: TEST only; auditor login configured for TEST")
+def _():
+    from gold_loan.audit import AuditFlow, AuditError
+    s = suite()
+    eq(s._get_mobile_number_for_login_type("auditor"), "8880008886", "TEST auditor")
+    s.env_name = "uat"
+    try:
+        asyncio.run(quiet_async(AuditFlow(s, master_loan_id=1).run))
+    except AuditError as e:
+        ok("TEST-only" in str(e), str(e))
+    else:
+        raise Fail("must refuse UAT")
+    close(s)
+
+
+@test("loan-limit: 'five active loans' from max-loan-limit stops the run with the reason")
+def _():
+    s = suite()
+    s.customer_id, s.customer_unique_id = "8703", "MSSU4GTG"
+    msg = ("You have five active loans in the system. As per bank rule, for the new loan creation you "
+           "must close a previous active loan.")
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        req = httpx.Request(method, "http://h" + path)
+        raise httpx.HTTPStatusError("400", request=req, response=httpx.Response(
+            400, request=req, json={"message": msg}))
+    s._make_authenticated_request = fake
+    try:
+        asyncio.run(quiet_async(s.fetch_max_loan_limit))
+    except RuntimeError as e:
+        ok("MSSU4GTG" in str(e) and "five active loans" in str(e), str(e))
+    else:
+        raise Fail("must stop")
+    async def other(method, path, json_data=None, params=None, files=None, headers=None):
+        req = httpx.Request(method, "http://h" + path)
+        raise httpx.HTTPStatusError("500", request=req, response=httpx.Response(500, request=req, text="boom"))
+    s._make_authenticated_request = other
+    eq(asyncio.run(quiet_async(s.fetch_max_loan_limit)), {}, "other failures stay non-fatal")
+    close(s)
+
+
+def _branch_request_run(accept_branch, other_branch_env="true", my_branches=(33, 1, 66)):
+    """create_appraiser_request where the customer's branch (1) refuses with 'already Exists'
+    and only `accept_branch` accepts. Returns (posted branch ids, suite)."""
+    s = suite(GOLD_LOAN_REQUEST_OTHER_BRANCH=other_branch_env)
+    s.customer_id, s.customer_unique_id, s.mobile_number, s.module_id = "8703", "MSSU4GTG", "9", "1"
+    s.customer_branch_id, s.internal_branch_id, s.appraiser_id, s.logged_in_user_id = "1", "33", "1473", 1473
+    posted = []
+    async def no_appraisers(): return None
+    async def none_found(required=False): return False
+    s._fetch_appraisers = no_appraisers
+    s._fetch_existing_appraiser_request = none_found
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        if path == "/api/user/get-my-branches":
+            payload = {"data": [{"id": b, "name": f"B{b}"} for b in my_branches]}
+        elif path == "/api/appraiser-request" and method == "POST":
+            posted.append(json_data["internalBranchId"])
+            if json_data["internalBranchId"] != accept_branch:
+                req = httpx.Request(method, "http://h" + path)
+                raise httpx.HTTPStatusError("400", request=req, response=httpx.Response(
+                    400, request=req, json={"message": "This product Request already Exists"}))
+            payload = {"data": {"id": 777}}
+        else:
+            payload = {}
+        class R:
+            content = b"{}"
+            status_code = 200
+            def json(self_inner): return payload
+        return R()
+    s._make_authenticated_request = fake
+    return posted, s
+
+@test("appraiser: default branch refuses -> a new request in another branch (the login's own branch too)")
+def _():
+    posted, s = _branch_request_run(accept_branch=33)
+    asyncio.run(quiet_async(s.create_appraiser_request))
+    eq(posted, [1, 33], "customer's branch first, then the login's branch 33 (no longer skipped)")
+    eq((s.internal_branch_id, s.appraiser_request_id), ("33", "777"), "the run moves to the accepting branch")
+    close(s)
+
+@test("appraiser: the refusing branch is not retried; the next branches are tried in order")
+def _():
+    posted, s = _branch_request_run(accept_branch=66)
+    asyncio.run(quiet_async(s.create_appraiser_request))
+    eq(posted, [1, 33, 66], "1 refused, 33 refused, 66 accepted -- 1 not tried twice")
+    close(s)
+
+@test("appraiser: branch order = login's branch, then GOLD_LOAN_REQUEST_BRANCHES, then the rest")
+def _():
+    os.environ["GOLD_LOAN_REQUEST_BRANCHES"] = "66"
+    try:
+        posted, s = _branch_request_run(accept_branch=999, my_branches=(152, 40, 66, 33, 1))
+        try:
+            asyncio.run(quiet_async(s.create_appraiser_request))
+        except RuntimeError:
+            pass
+    finally:
+        del os.environ["GOLD_LOAN_REQUEST_BRANCHES"]
+    eq(posted[:4], [1, 33, 66, 152], "default 1, then login 33, then preferred 66, then the list order")
+    close(s)
+
+@test("appraiser: GOLD_LOAN_REQUEST_OTHER_BRANCH=false keeps the old handling (no branch-first ladder)")
+def _():
+    posted, s = _branch_request_run(accept_branch=33, other_branch_env="false")
+    try:
+        asyncio.run(quiet_async(s.create_appraiser_request))
+    except RuntimeError:
+        pass
+    eq(posted[0], 1, "default branch first")
+    ok(s.request_other_branch_enabled is False, "flag read")
+    close(s)
+
+
+# --------------------------------------------------------------------------------------------
+# GROUP: bt -- BT (balance transfer) application: bodies from the portal's BT tabs, stage driver
+# --------------------------------------------------------------------------------------------
+
+import datetime as _dt  # noqa: E402
+import random as _random  # noqa: E402
+from gold_loan import bt_loan as BT  # noqa: E402
+from flows.e2e_bt_loan import build_parser as bt_parser, validate as bt_validate  # noqa: E402
+
+KARAT_22 = {"karat": "22 K HM", "range": [75, 80, 85]}
+
+
+@test("bt: ornaments use the karat's top LTV, HALF_UP purity weight, and totals = row sums")
+def _():
+    body = BT.build_ornaments(300000, [{"name": "Chain"}, {"name": "Ring"}, {"name": "Tops"}],
+                              KARAT_22, count=3, rng=_random.Random(7))
+    rows = body["ornamentDetails"]
+    eq(len(rows), 3, "row count")
+    for r in rows:
+        eq(r["purity"], 85, "purity = top of ltvRange")
+        eq(r["ltvRange"], [75, 80, 85], "ltvRange carried")
+        eq(r["netweightAfterPurity"], BT.purity_weight(r["netWeight"], 85), "nwap")
+        ok(r["grossWeight"] > r["netWeight"], "gross > net")
+    eq(BT.purity_weight("28.5", 90), 25.65, "plain")
+    eq(BT.purity_weight("31.65", 90), 28.49, "half-up on .xx5 (Python round() gives 28.48)")
+    eq(body["totalNetWeightAfterPurity"], BT.half_up(sum(r["netweightAfterPurity"] for r in rows)), "total nwap")
+    eq(body["totalNetWeight"], BT.half_up(sum(r["netWeight"] for r in rows)), "total net")
+    ok(body["totalNetWeightAfterPurity"] * BT.ELIGIBILITY_RATE_FLOOR >= 300000 * 1.1,
+       "sized so eligibility clears the amount")
+
+
+@test("bt: existing-bt-info releases the whole old loan, past start date, end after start")
+def _():
+    today = _dt.date(2026, 11, 17)
+    info = BT.build_existing_bt_info(450000, "Bajaj Finance Ltd.", "NBFC", today=today, rng=_random.Random(1))
+    eq(info["loanAmount"], 450000, "loanAmount")
+    eq(info["releaseLoanAmount"], 450000, "releaseLoanAmount")
+    eq(sorted(info), sorted(["bankNbfcName", "companyType", "existingLoanId", "loanAmount",
+                             "releaseLoanAmount", "loanStartDate", "loanEndDate"]), "form fields")
+    start = _dt.date.fromisoformat(info["loanStartDate"][:10])
+    end = _dt.date.fromisoformat(info["loanEndDate"][:10])
+    ok(start < today < end, f"start {start} < today < end {end}")
+    ok(info["loanStartDate"].endswith("T00:00:00.000Z"), "datepicker ISO midnight")
+
+
+@test("bt: approvals map stage -> endpoint + requestFor; rejection carries the reason type")
+def _():
+    eq([BT.build_approval(1, 2, st)[0] for st in (6, 7, 8, 9, 10)], ["rch", "rh", "zh", "zah", "ceo"], "endpoints")
+    key, body = BT.build_approval(9397, 169, 6)
+    eq(body, {"customerId": 9397, "businessTransferId": 169, "requestFor": "RCH Approval",
+              "approvalStatus": "approved", "comment": "approved by API test"}, "approved body")
+    _, rej = BT.build_approval(1, 2, 7, "rejected")
+    eq(rej["rejectionReasonType"], BT.REJECTION_REASON, "reason type")
+    eq(rej["comment"], BT.REJECTION_REASON, "listed reason is the comment")
+    _, inc = BT.build_approval(1, 2, 6, "incomplete")
+    ok(inc["comment"] and "rejectionReasonType" not in inc, "incomplete: comment, no reason type")
+    for bad in (5, 11):
+        try:
+            BT.build_approval(1, 2, bad)
+            raise Fail(f"stage {bad} accepted")
+        except BT.BtLoanError:
+            pass
+
+
+@test("bt: one signed cheque per 5L, at least one")
+def _():
+    eq([BT.cheques_required(a) for a in (0, 300000, 500000, 500001, "650000.00", 1200000)],
+       [1, 1, 1, 2, 2, 3], "cheques")
+
+
+@test("bt: scheme pick = pinned id, else first whose eligibility covers the amount")
+def _():
+    rows = [{"schemeId": 5, "eligibilityAmount": 250000}, {"schemeId": 8, "eligibilityAmount": 480000},
+            {"schemeId": 9, "eligibilityAmount": 506740}]
+    eq(BT.pick_scheme(rows, 300000)[0]["schemeId"], 8, "first covering")
+    eq(BT.pick_scheme(rows, 300000, "9")[0]["schemeId"], 9, "pinned")
+    eq(BT.pick_scheme(rows, 300000, "5")[0], None, "pinned but too small")
+    eq(BT.pick_scheme(rows, 600000)[0], None, "nothing covers")
+
+
+@test("bt: --partner keeps the scheme on that partner only (Arvog never falls back to another)")
+def _():
+    offered = [{"id": 2, "name": "Catholic Syrian Bank CAT-2", "allowBtTransfer": True},
+               {"id": 10, "name": "Arvog ARV10", "allowBtTransfer": True},
+               {"id": 152, "name": "Roshan Partner", "allowBtTransfer": True},
+               {"id": 9, "name": "Fincare FIN-9", "allowBtTransfer": False}]
+    eq([p["id"] for p in BT.select_partners(offered, "ARVOG")], [10], "arvog only")
+    eq([p["id"] for p in BT.select_partners(offered, "ROSHAN PARTNER")], [152], "roshan only")
+    eq([p["id"] for p in BT.select_partners(offered, "")], [2, 10, 152], "any: every BT partner")
+    try:
+        BT.select_partners([p for p in offered if p["id"] != 10], "ARVOG")
+        raise Fail("missing Arvog did not raise")
+    except BT.BtLoanError as e:
+        ok("ARVOG" in str(e), str(e))
+
+
+def _bt_flow(start_stage, approvals_needed=(6,), stuck_at=None):
+    """A BtLoanFlow on a fake server: every step POST advances the stage like the live server."""
+    s = suite()
+    flow = BT.BtLoanFlow(s, amount=300000)
+    flow.bt_id, flow.request_id = "169", "15235"
+    state = {"stage": start_stage}
+    posts = []
+
+    def next_stage(stage):
+        if stage == stuck_at:
+            return stage
+        if stage < 6:
+            return stage + 1
+        later = [x for x in approvals_needed if x > stage]
+        return later[0] if later else 11
+
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        if method == "POST":
+            posts.append(path)
+            state["stage"] = next_stage(state["stage"])
+            payload = {"message": "Success"}
+        else:
+            payload = {"businessTransfer": {"id": 169, "btUniqueId": "AUGM-BT-90168", "customerId": 9397,
+                                            "appraiserRequestId": 15235, "btCurrentStageId": state["stage"],
+                                            "requiredLoanAmount": "300000.00"},
+                       "isCpvRequired": False, "isStatementItrSsRequired": False}
+        class R:
+            content = b"{}"
+            def json(self_inner): return payload
+        return R()
+    s._make_authenticated_request = fake
+
+    async def step():  # the tab bodies are covered above; here only the stage driver matters
+        await fake("POST", f"/step/{state['stage']}")
+    for name in ("existing_info", "ornaments", "scheme", "bank", "documents"):
+        setattr(flow, name, step)
+
+    async def approve():
+        key, _ = BT.build_approval(9397, 169, flow.stage)
+        await fake("POST", f"/api/bt-process/update-rating-{key}")
+        return "approved"
+    flow.approve = approve
+    async def role_token(role): return "tok-" + role
+    s._role_token = role_token
+    return s, flow, posts
+
+
+@test("bt: stop-before-documents parks at stage 5 and never uploads documents")
+def _():
+    s, flow, posts = _bt_flow(1)
+    outcome, _ = quiet(asyncio.run, flow.drive(stop_before_documents=True))
+    eq(outcome, "stopped before documents", "outcome")
+    eq(posts, ["/step/1", "/step/2", "/step/3", "/step/4"], "steps")
+    eq(flow.stage, 5, "parked at upload documents")
+    close(s)
+
+
+@test("bt: full run follows the server's approval chain (RCH -> RH) to stage 11")
+def _():
+    s, flow, posts = _bt_flow(1, approvals_needed=(6, 7))
+    outcome, _ = quiet(asyncio.run, flow.drive())
+    eq(outcome, "approved", "outcome")
+    eq(posts[-2:], ["/api/bt-process/update-rating-rch", "/api/bt-process/update-rating-rh"], "approvals")
+    eq(flow.steps_done, ["existing_info", "ornaments", "scheme", "bank", "documents", "approve", "approve"], "steps")
+    close(s)
+
+
+@test("bt: resume starts at the stored stage (documents) without redoing earlier tabs")
+def _():
+    s, flow, posts = _bt_flow(5)
+    outcome, _ = quiet(asyncio.run, flow.drive())
+    eq(outcome, "approved", "outcome")
+    eq(posts, ["/step/5", "/api/bt-process/update-rating-rch"], "only documents + RCH")
+    close(s)
+
+
+@test("bt: a stage that does not move after its step stops the run (no loop)")
+def _():
+    s, flow, posts = _bt_flow(3, stuck_at=3)
+    try:
+        quiet(asyncio.run, flow.drive())
+        raise Fail("a stuck stage did not raise")
+    except BT.BtLoanError as e:
+        ok("did not leave stage 3" in str(e), str(e))
+    eq(posts, ["/step/3"], "one attempt only")
+    close(s)
+
+
+@test("bt: a non-approved RCH decision ends the run there")
+def _():
+    s, flow, posts = _bt_flow(6)
+    async def incomplete():
+        await s._make_authenticated_request("POST", "/api/bt-process/update-rating-rch")
+        return "incomplete"
+    flow.approve = incomplete
+    outcome, _ = quiet(asyncio.run, flow.drive())
+    ok(outcome.startswith("RCH decision 'incomplete'"), outcome)
+    eq(len(posts), 1, "no further approvals")
+    close(s)
+
+
+@test("bt: the BT request is the new-request body + request='bt application'")
+def _():
+    s = suite()
+    s.customer_id, s.customer_unique_id, s.mobile_number = "9397", "MWK5D1YA", "7000000000"
+    s.first_name, s.last_name, s.module_id, s.appraiser_id, s.customer_branch_id = "A", "B", "1", "1473", "1"
+    calls = record_requests(s, lambda p: {"message": "Request Created"} if p == "/api/appraiser-request" else {
+        "data": [{"id": 15235, "customer": {"customerUniqueId": "MWK5D1YA"},
+                  "customerLoanBusinessTransfer": {"id": 169, "btUniqueId": "AUGM-BT-90168",
+                                                   "customerBtStage": {"id": 1}}}]})
+    async def no_appraisers(): return None
+    s._fetch_appraisers = no_appraisers
+    async def role_token(role): return "tok-" + role
+    s._role_token = role_token
+    flow = BT.BtLoanFlow(s)
+    quiet(asyncio.run, flow.create_request())
+    method, path, body = calls[0]
+    eq((method, path), ("POST", "/api/appraiser-request"), "create call")
+    eq(body["request"], "bt application", "BT marker")
+    eq(body["loanType"], "Fresh Loan", "dialog's loanType")
+    eq((flow.request_id, flow.bt_id, flow.bt_unique_id), ("15235", "169", "AUGM-BT-90168"), "ids from admin view-all")
+    ok(calls[1][1].startswith("/api/appraiser-request/view-all?") and "search=MWK5D1YA" in calls[1][1], calls[1][1])
+    close(s)
+
+
+@test("bt: CLI refuses --resume without --customer and an out-of-range ornament count")
+def _():
+    errors = []
+    def fail(msg): errors.append(msg)
+    bt_validate(bt_parser().parse_args(["--resume"]), fail)
+    bt_validate(bt_parser().parse_args(["--customer", "X", "--ornaments", "21"]), fail)
+    bt_validate(bt_parser().parse_args(["--bt", "AUGM-BT-1", "--stop-before-documents"]), fail)
+    eq(len(errors), 2, f"errors: {errors}")
+
+
+# --------------------------------------------------------------------------------------------
+# GROUP: cpv -- customer CPV form (CpvFormComponent) with the placeholder signature
+# --------------------------------------------------------------------------------------------
+
+from gold_loan import cpv as CPV  # noqa: E402
+from flows.complete_cpv import build_parser as cpv_parser, validate as cpv_validate  # noqa: E402
+
+
+@test("cpv: state = none / valid / expired / re-kyc, like Applied KYC's CPV status")
+def _():
+    now = _dt.datetime(2026, 11, 17, tzinfo=_dt.timezone.utc)
+    eq(CPV.cpv_state(None, now), "none", "no record")
+    eq(CPV.cpv_state({"expiresAt": "2027-11-17T04:06:30.379Z"}, now), "valid", "in date")
+    eq(CPV.cpv_state({"expiresAt": "2026-11-16T00:00:00.000Z"}, now), "expired", "past expiry")
+    eq(CPV.cpv_state({"expiresAt": "2027-11-17T04:06:30.379Z", "isReKycInitiated": True}, now), "re-kyc", "re-KYC wins")
+
+
+def _cpv_suite(existing=None, branch=None):
+    s = suite()
+    s.customer_id, s.customer_unique_id, s.customer_kyc_id = "9395", "MWK4XHP4", "2755"
+    s.first_name, s.last_name = "Abhishek", "Jangra"
+    calls = []
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        calls.append((method, path, json_data))
+        if path.startswith("/api/customer-cpv/customer/"):
+            if existing is None:
+                raise http_error(404, {"message": "No CPV record found for this customer"}, path)
+            payload = {"data": existing}
+        elif path.startswith("/api/kyc/kyc-form-review"):
+            payload = {"customerKycReview": {"firstName": "Abhishek", "lastName": "Jangra", "kycStatus": "approved",
+                                             "internalBranch": branch or {},
+                                             "customerKycAddress": [{"addressType": "permanent", "address": "P"},
+                                                                    {"addressType": "residential", "address": "118, Park Street"}]}}
+        else:
+            payload = {"data": {"id": 71, "cpvStatus": "Approved", "expiresAt": "2027-11-17T00:00:00.000Z",
+                                "photos": (json_data or {}).get("photos")}}
+        class R:
+            content = b"{}"
+            def json(self_inner): return payload
+        return R()
+    s._make_authenticated_request = fake
+    uploads = iter(range(100))
+    async def up(reason, file_type="image", document_type=None, is_mask=False, file_path_override=None):
+        n = next(uploads)
+        return {"uploadFile": {"path": f"uploads/customer/9395/{n}.png", "URL": f"https://h/uploads/customer/9395/{n}.png"},
+                "reason": reason}
+    s._upload_file = up
+    return s, calls
+
+
+@test("cpv: create body = CPV form + 2 labelled photos at the branch + placeholder signature")
+def _():
+    s, calls = _cpv_suite(branch={"latitude": 18.9522622, "longitude": 72.8314101})
+    cpv = CPV.CustomerCpv(s)
+    record, _ = quiet(asyncio.run, cpv.complete())
+    creates = [c for c in calls if c[1] == "/api/customer-cpv/create"]
+    eq(len(creates), 1, "one create")
+    body = creates[0][2]
+    eq((body["customerId"], body["customerKycId"]), ("9395", "2755"), "ids as strings (query params in the portal)")
+    for field in ("personMetName", "relationshipWithCustomer", "isNameSameAsSystem", "isAddressSameAsSystem",
+                  "verifiedAddress", "residenceOwnership", "yearsAtCurrentAddress", "neighbourhoodFeedback", "endUser"):
+        ok(body.get(field) not in (None, ""), f"required form field {field}")
+    eq(body["verifiedAddress"], "118, Park Street", "residential address")
+    eq([p["label"] for p in body["photos"]], list(CPV.PHOTO_LABELS), "photo labels")
+    ok(all((p["lat"], p["lng"]) == (18.9522622, 72.8314101) for p in body["photos"]), "tagged at the branch")
+    ok(body["customerSignatureUrl"].startswith("https://"), "signature URL present (server requires it)")
+    eq(len({p["path"] for p in body["photos"]} | {body["customerSignatureUrl"]}), 3, "three separate uploads")
+    ok(cpv.created and record["id"] == 71, "created")
+    close(s)
+
+
+@test("cpv: a valid CPV is not redone; an expired / re-KYC one is")
+def _():
+    s, calls = _cpv_suite(existing={"id": 69, "cpvStatus": "Approved", "expiresAt": "2099-01-01T00:00:00.000Z"})
+    quiet(asyncio.run, CPV.CustomerCpv(s).complete())
+    ok(not any(c[1] == "/api/customer-cpv/create" for c in calls), "valid CPV left alone")
+    close(s)
+    for stale in ({"id": 1, "expiresAt": "2020-01-01T00:00:00.000Z"},
+                  {"id": 2, "expiresAt": "2099-01-01T00:00:00.000Z", "isReKycInitiated": True}):
+        s, calls = _cpv_suite(existing=stale)
+        quiet(asyncio.run, CPV.CustomerCpv(s).complete())
+        ok(any(c[1] == "/api/customer-cpv/create" for c in calls), f"new CPV for {stale}")
+        close(s)
+
+
+@test("cpv: CLI refuses --count with --customer and --status without --customer")
+def _():
+    errors = []
+    cpv_validate(cpv_parser().parse_args(["--customer", "A", "--count", "2"]), errors.append)
+    cpv_validate(cpv_parser().parse_args(["--status"]), errors.append)
+    cpv_validate(cpv_parser().parse_args(["--customer", "A", "--customer", "B", "--status"]), errors.append)
+    eq(len(errors), 2, f"errors: {errors}")
+
+
+def _bt_bank_flow(system, manual, ops_flag, ops_fixes=True):
+    """BtLoanFlow.bank() with a canned penny-drop verdict (bankTxnStatus always True)."""
+    s = suite()
+    s.customer_id, s.first_name, s.last_name = "9404", "A", "B"
+    flow = BT.BtLoanFlow(s)
+    flow.bt_id, flow.app = "176", {"customerId": 9404}
+    calls = []
+    async def validate():
+        s.bank_account_number, s.bank_ifsc_code = "0062002100154881", "PUNB0006200"
+        s.bank_name, s.bank_branch_name, s.account_holder_name = "PNB", "MUMBAI", "LIC MUTUAL FUND"
+        s.bank_account_verified = True                      # bankTxnStatus -- not a verdict
+        s.bank_system_verified, s.bank_manually_verified, s.bank_for_ops_approval = system, manual, ops_flag
+    s.validate_account = validate
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        calls.append((method, path, json_data, s.auth_token))
+        payload = {"message": "Success"}
+        if path.endswith("bank-verification-manual"):
+            payload = {"message": "success", "data": {"isManuallyVerified": ops_fixes, "isVerified": False,
+                                                      "forOpsApproval": not ops_fixes}}
+        class R:
+            content = b"{}"
+            def json(self_inner): return payload
+        return R()
+    s._make_authenticated_request = fake
+    async def role_token(role): return "tok-" + role
+    s._role_token = role_token
+    return s, flow, calls
+
+
+@test("bt: a pending bank account is verified by OPS at the bank stage, before bank-details")
+def _():
+    s, flow, calls = _bt_bank_flow(system=False, manual=False, ops_flag=True)
+    quiet(asyncio.run, flow.bank())
+    eq([c[1] for c in calls], ["/api/loan-process/bank-verification-manual", "/api/bt-process/bank-details"], "order")
+    ops = calls[0]
+    eq(ops[3], "tok-ops", "ops login")
+    eq((ops[2]["requestFrom"], ops[2]["businessTransferId"], ops[2]["status"], ops[2]["detailsFor"]),
+       ("bt application", 176, "approved", "customer"), "ops body")
+    bank = calls[1][2]
+    eq((bank["isVerified"], bank["isManuallyVerified"], bank["forOpsApproval"]), (False, True, False),
+       "bank-details carries the real verdict (not bankTxnStatus)")
+    close(s)
+
+
+@test("bt: a system-verified account skips ops; bankTxnStatus alone is never 'verified'")
+def _():
+    s, flow, calls = _bt_bank_flow(system=True, manual=False, ops_flag=False)
+    quiet(asyncio.run, flow.bank())
+    eq([c[1] for c in calls], ["/api/bt-process/bank-details"], "no ops call")
+    eq(calls[0][2]["isVerified"], True, "system verified")
+    close(s)
+    s, flow, calls = _bt_bank_flow(system=True, manual=False, ops_flag=True)   # verified but flagged for ops
+    quiet(asyncio.run, flow.bank())
+    ok(calls[0][1].endswith("bank-verification-manual"), "forOpsApproval alone triggers ops")
+    close(s)
+
+
+@test("bt: an account ops cannot verify stops the run instead of sending an unverified bank")
+def _():
+    s, flow, calls = _bt_bank_flow(system=False, manual=False, ops_flag=True, ops_fixes=False)
+    try:
+        quiet(asyncio.run, flow.bank())
+        raise Fail("unverified account passed")
+    except BT.BtLoanError as e:
+        ok("still not verified" in str(e), str(e))
+    ok(not any(c[1] == "/api/bt-process/bank-details" for c in calls), "bank-details never sent")
+    close(s)
+
+
+@test("bt: documents send the CPV image already on the application instead of a new upload")
+def _():
+    s = suite()
+    flow = BT.BtLoanFlow(s)
+    flow.app = {"cpvImage": ["uploads/customer/9402/cpv.png"]}
+    flow.flags = {"isCpvRequired": True}
+    eq(asyncio.run(flow._cpv_image()), "uploads/customer/9402/cpv.png", "on file")
+    flow.app, flow.flags = {}, {"isCpvRequired": False}
+    eq(asyncio.run(flow._cpv_image()), None, "not required, none on file")
+    close(s)
+
+
+# --------------------------------------------------------------------------------------------
+# GROUP: audit -- open audit (assign-multiple + branch custodian), portal chunk 13
+# --------------------------------------------------------------------------------------------
+
+from gold_loan import audit as AUD  # noqa: E402
+from flows.e2e_audit import build_parser as audit_parser  # noqa: E402
+
+
+def _audit_flow(responder, custodian_branch="33", **kw):
+    """An open-audit AuditFlow over a stubbed API. `responder(method, path, body)` answers each call;
+    every call is recorded as (role, method, path, body) -- the role being whose token was used."""
+    s = suite("manual")
+    tokens = {"admin": "tok-admin", "auditor": "tok-auditor", "appraiser": "tok-appraiser"}
+    claims = {"tok-appraiser": {"id": 1473, "internalBranchId": custodian_branch},
+              "tok-switched": {"id": 1473, "internalBranchId": "1"}}
+    who = {"tok-admin": "admin", "tok-auditor": "auditor", "tok-appraiser": "appraiser",
+           "tok-switched": "custodian@1", "tok-home": "custodian@home"}
+    calls = []
+
+    async def role_token(role):
+        return tokens[role]
+
+    async def fake(method, path, json_data=None, **kw2):
+        calls.append((who.get(s.auth_token, s.auth_token), method, path, json_data))
+        if path.startswith("/api/auth/change-user-branch"):
+            payload = {"Token": "tok-switched" if path.endswith("=1") else "tok-home", "userDetails": {}}
+        else:
+            payload = responder(method, path, json_data) or {}
+
+        class R:
+            content = b"{}"
+            def json(self_inner): return payload
+        return R()
+    s._role_token = role_token
+    s._make_authenticated_request = fake
+    stored = []
+    s._session_store = lambda mobile, token, details: stored.append((mobile, token))
+    import jwt as _jwt
+    real_decode = _jwt.decode
+    _jwt.decode = lambda token, **k: claims.get(token) or real_decode(token, **k)
+    flow = AUD.AuditFlow(s, master_loan_id="12431", audit_type=AUD.OPEN_AUDIT, **kw)
+    flow.auditor_id, flow.auditor_branch, flow.branch_id = 2828, "1", "1"
+    flow.loan = {"loanStartDate": "2026-11-17T00:00:00.000Z", "internalBranchId": 1}
+    return s, flow, calls, stored, (lambda: setattr(_jwt, "decode", real_decode))
+
+
+def _status_responder(states):
+    """custodian-status-requests answers `states` in turn (the last one repeats)."""
+    seq = list(states)
+
+    def answer(method, path, body):
+        if "custodian-status-requests" in path:
+            value = seq.pop(0) if len(seq) > 1 else seq[0]
+            return {"data": {"custodianStatus": value} if value else None}
+        if "internal-branch-user-list" in path:
+            return {"data": [{"id": 540}, {"id": 1473}]}
+        return {"message": "Success"}
+    return answer
+
+
+@test("audit: open-audit assignment and custodian approval bodies match the portal")
+def _():
+    eq(AUD.open_audit_assignment_body("1", 2828, "2026-11-17T00:00:00Z", "2026-11-17"),
+       {"internalBranchId": 1, "auditorId": 2828, "startDate": "2026-11-17", "endDate": "2026-11-17",
+        "auditType": "Open-audit"}, "assign-multiple body")
+    eq(AUD.open_audit_assignment_body(1, 2828)["startDate"], None, "no date -> null")
+    eq(AUD.custodian_loan_approval_body("1", [{"id": 7, "masterLoanId": 12431}]),
+       {"status": "accepted", "internalBranchId": 1, "ids": [7], "masterLoanIds": [12431]},
+       "custodian-requests-status body")
+    ok("Open-audit" in AUD.AUDIT_TYPES, "Open-audit is a supported audit type")
+
+
+@test("audit: our custodian already Accepted -> no custodian request, no accept")
+def _():
+    s, flow, calls, _st, undo = _audit_flow(_status_responder(["Accepted"]))
+    try:
+        quiet(lambda: asyncio.run(flow.ensure_custodian()))
+    finally:
+        undo(); close(s)
+    paths = [c[2] for c in calls]
+    ok(not any("custodian-assign" in p or p == "/api/audit/custodian-status" for p in paths),
+       f"nothing to request or accept: {paths}")
+    eq(calls[0][:3], ("appraiser", "GET", "/api/auth/change-user-branch?branchId=1"),
+       "the custodian switches to the loan's branch first")
+
+
+@test("audit: another user's custodian -> auditor requests ours, ours accepts in the loan's branch")
+def _():
+    s, flow, calls, _st, undo = _audit_flow(_status_responder([None, "Pending", "Accepted"]))
+    try:
+        quiet(lambda: asyncio.run(flow.ensure_custodian()))
+    finally:
+        undo(); close(s)
+    assign = [c for c in calls if c[2] == "/api/audit/custodian-assign"]
+    eq([(c[0], c[3]) for c in assign], [("auditor", {"internalBranchId": 1, "custodianId": 1473})],
+       "the AUDITOR requests the custodian")
+    accept = [c for c in calls if c[2] == "/api/audit/custodian-status"]
+    eq([(c[0], c[3]) for c in accept], [("custodian@1", {"internalBranchId": 1, "status": "Accepted"})],
+       "the custodian accepts, with its branch-1 token")
+
+
+@test("audit: a custodian request already Pending for us is accepted without re-requesting")
+def _():
+    s, flow, calls, _st, undo = _audit_flow(_status_responder(["Pending", "Accepted"]))
+    try:
+        quiet(lambda: asyncio.run(flow.ensure_custodian()))
+    finally:
+        undo(); close(s)
+    paths = [c[2] for c in calls]
+    ok("/api/audit/custodian-assign" not in paths, "no second request")
+    ok("/api/audit/custodian-status" in paths, "accepted")
+
+
+@test("audit: a custodian login outside the loan's branch is refused before any change")
+def _():
+    def answer(method, path, body):
+        if "custodian-status-requests" in path:
+            return {"data": None}
+        if "internal-branch-user-list" in path:
+            return {"data": [{"id": 540}]}
+        return {}
+    s, flow, calls, _st, undo = _audit_flow(answer)
+    try:
+        (_r, out) = quiet(lambda: _expect_audit_error(flow.ensure_custodian()))
+    finally:
+        undo(); close(s)
+    ok(not any(c[1] == "POST" for c in calls), "no POST at all")
+
+
+def _expect_audit_error(coro):
+    try:
+        asyncio.run(coro)
+    except AUD.AuditError:
+        return True
+    raise Fail("expected AuditError")
+
+
+@test("audit: the custodian approves exactly the audited loan's pending request (audit attached)")
+def _():
+    def answer(method, path, body):
+        if path.startswith("/api/audit/custodian-requests-list"):
+            return {"data": [{"id": 5, "masterLoanId": 999, "status": "pending", "auditorReqData": {"body": {}}},
+                             {"id": 8, "masterLoanId": 12431, "status": "accepted"},
+                             {"id": 9, "masterLoanId": 12431, "status": "pending", "auditorReqData": {"body": {}},
+                              "masterLoan": {"auditStatus": "Custodian Approval"}}],
+                    "totalCount": 3}
+        return {"message": "Success"}
+    s, flow, calls, _st, undo = _audit_flow(answer)
+    try:
+        quiet(lambda: asyncio.run(flow.custodian_approve_audit()))
+    finally:
+        undo(); close(s)
+    approve = [c for c in calls if c[2] == "/api/audit/custodian-requests-status"]
+    eq([(c[0], c[3]) for c in approve],
+       [("custodian@1", {"status": "accepted", "internalBranchId": 1, "ids": [9], "masterLoanIds": [12431]})],
+       "only loan 12431's row")
+
+
+@test("audit: a custodian row without the audit attached is never accepted (server 500s on it)")
+def _():
+    def answer(method, path, body):
+        if path.startswith("/api/audit/custodian-requests-list"):
+            return {"data": [{"id": 3, "masterLoanId": 12431, "status": "pending", "auditorReqData": None}],
+                    "totalCount": 1}
+        return {"message": "Success"}
+    s, flow, calls, _st, undo = _audit_flow(answer)
+    try:
+        quiet(lambda: _expect_audit_error(flow.custodian_approve_audit()))
+    finally:
+        undo(); close(s)
+    ok(not any(c[2] == "/api/audit/custodian-requests-status" for c in calls), "nothing accepted")
+
+
+@test("audit: a loan already awaiting the custodian resumes at the approval (no re-assign, no re-submit)")
+def _():
+    def answer(method, path, body):
+        if path.startswith("/api/audit/un-audited-loan"):
+            return {"data": [{"id": 12431, "auditStatus": "Custodian Approval", "auditType": "Open-audit",
+                              "internalBranchId": 1}]}
+        if "custodian-status-requests" in path:
+            return {"data": {"custodianStatus": "Accepted"}}
+        if path.startswith("/api/audit/custodian-requests-list"):
+            return {"data": [{"id": 9, "masterLoanId": 12431, "status": "pending",
+                              "auditorReqData": {"body": {}}}], "totalCount": 1}
+        return {"message": "Success"}
+    s, flow, calls, _st, undo = _audit_flow(answer)
+    s.env_name = "test"
+    async def nothing(*a, **k): return None
+    flow.auditor_identity = nothing
+    flow.resolve_loan = nothing
+    flow.load_loan = nothing
+    flow.verify = nothing
+    flow.report = lambda: None
+    try:
+        quiet(lambda: asyncio.run(flow.run()))
+    finally:
+        undo(); close(s)
+    paths = [c[2] for c in calls]
+    for never in ("/api/audit/assign-multiple", "/api/audit/submit", "/api/packet"):
+        ok(never not in paths, f"must not call {never} again")
+    ok("/api/audit/custodian-requests-status" in paths, "approves the held audit")
+
+
+@test("audit: the custodian is switched back to its branch and that session is the saved one")
+def _():
+    s, flow, calls, stored, undo = _audit_flow(_status_responder(["Accepted"]))
+    try:
+        quiet(lambda: asyncio.run(flow.ensure_custodian()))
+        quiet(lambda: asyncio.run(flow.restore_custodian_branch()))
+    finally:
+        undo()
+    mobile = s._get_mobile_number_for_login_type("appraiser")
+    close(s)
+    eq(calls[-1][2], "/api/auth/change-user-branch?branchId=33", "switched back to the home branch")
+    eq(stored, [(mobile, "tok-home")], "the home-branch token is saved")
+    eq(s._role_token_cache.get(mobile), "tok-home", "and cached for this run")
+
+
+@test("audit: --audit-type Open-audit and --custodian parse")
+def _():
+    args = audit_parser().parse_args(["--audit-type", "Open-audit", "--custodian", "bm"])
+    eq((args.audit_type, args.custodian), ("Open-audit", "bm"), "parsed")
+    eq(audit_parser().parse_args([]).custodian, "appraiser", "default custodian")
+
+
 
 def main():
     wanted = sys.argv[1] if len(sys.argv) > 1 else ""

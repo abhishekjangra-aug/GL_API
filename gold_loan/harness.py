@@ -29,6 +29,11 @@ class KycDocumentAlreadyExistsError(Exception):
     """
 
 
+class LoanLimitReachedError(RuntimeError):
+    """max-loan-limit refused: the customer already has five active loans (counted in the branch
+    of their current appraiser request)."""
+
+
 class GoldLoanApiTest:
 
     # --- Environment profiles -----------------------------------------------------------------
@@ -49,7 +54,8 @@ class GoldLoanApiTest:
             # server answers {"message": "This request is not permitted."}.
             "origin": "https://ap.gfat.augmont.com",
             "role_mobiles": {"admin": "8880008880", "appraiser": "8880008881",
-                             "ops": "8880008882", "bm": "8880008883"},
+                             "ops": "8880008882", "bm": "8880008883",
+                             "auditor": "8880008886"},   # flows/e2e_audit.py (TEST only for now)
             "partner_mobiles": {"152": "8767002003", "10": "9375876473"},  # ROSHAN / ARVOG ARV10
             "partner_user_mobiles": {"152": "8652849318",   # roshan ghadge (id 170)
                                      "10": "7777777788"},   # arvog: newbranch user
@@ -309,6 +315,8 @@ class GoldLoanApiTest:
         # An already-existing appraiser request is RESUMED by default; --fresh-request /
         # GOLD_LOAN_FRESH_APPRAISER_REQUEST=true cancels it and creates a new one instead.
         self.reuse_existing_request = os.getenv("GOLD_LOAN_FRESH_APPRAISER_REQUEST", "").lower() not in ("1", "true", "yes")
+        # A refused appraiser-request create is retried in the login's other branches FIRST.
+        self.request_other_branch_enabled = os.getenv("GOLD_LOAN_REQUEST_OTHER_BRANCH", "true").strip().lower()             not in ("0", "false", "no", "off")
         self._existing_request_status = ''
         self._existing_process_complete = False
         self._existing_loan_completed = False
@@ -466,6 +474,7 @@ class GoldLoanApiTest:
         # Verification outcomes, sent on submit-basic-info / customer-kyc-address and reported.
         self.pan_verified = False
         self.aadhaar_verified = False
+        self.aadhaar_xml_details = {}  # offline-aadhaar-xml data (name, address, pincode, state, city)
         self.ovd_verified = False
         self.kyc_verification_log = []  # (step, outcome, detail) trail shown in the run summary
         self.ovd_type = ""            # the string submit-basic-info expects, e.g. "VoterID"
@@ -1785,6 +1794,7 @@ class GoldLoanApiTest:
             decoded_jwt = jwt.decode(self.auth_token, options={"verify_signature": False})
             self.logged_in_user_id = decoded_jwt.get('id')
             self._print_json_block("Decoded JWT Payload", decoded_jwt)
+            self.login_branch_id = str(decoded_jwt.get("internalBranchId") or "")
             if not self.internal_branch_id:
                 self.internal_branch_id = str(decoded_jwt.get("internalBranchId") or "")
             assert self.internal_branch_id, "The login token did not include internalBranchId."
@@ -2754,6 +2764,8 @@ class GoldLoanApiTest:
                           "but isAahaarVerified is false.")
                     continue
                 self.aadhaar_verified = True
+                # Kept for the address step: the verified XML is the KYC permanent address.
+                self.aadhaar_xml_details = dict(data)
                 # A verified XML is authoritative for the name (CR-1: Aadhaar name overrides LOS).
                 aadhaar_name = data.get("aahaarName") or data.get("name")
                 if aadhaar_name:
@@ -3326,6 +3338,109 @@ class GoldLoanApiTest:
         except httpx.HTTPStatusError as e:
             print(f"Geo-location lookup failed (non-fatal): {e.response.status_code}")
 
+    @staticmethod
+    def aadhaar_address_from_xml(details) -> dict:
+        """The address a verified Aadhaar XML carries, as UserAddressComponent.patchAaddarValue
+        reads it: {address, pinCode, landmark, state, city}, or {} when there is no address.
+
+        The live offline-aadhaar-xml answer uses the aadhaar* names (aadhaarAddress,
+        aadhaarPinCode, aadhaarState, aadhaarCity, aadhaarLandmark); the persisted e-KYC record
+        (customerKycDocs.aadhaarXmlData) keeps the raw UIDAI ones (address, pc, state, vtc/dist,
+        landmark). Both are accepted, the aadhaar* names first."""
+        if not isinstance(details, dict):
+            return {}
+
+        def pick(*keys):
+            for key in keys:
+                value = details.get(key)
+                if value not in (None, ""):
+                    return str(value).strip()
+            return ""
+
+        address = pick("aadhaarAddress", "address")
+        if not address:
+            return {}
+        return {
+            "address": address,
+            "pinCode": re.sub(r"\D", "", pick("aadhaarPinCode", "pc", "pincode", "pinCode")),
+            "landmark": pick("aadhaarLandmark", "landmark"),
+            "state": pick("aadhaarState", "state"),
+            "city": pick("aadhaarCity", "vtc", "dist", "district"),
+        }
+
+    @staticmethod
+    def _match_by_name(rows, name):
+        """The row whose name equals `name` (case and spacing ignored), as the portal matches."""
+        wanted = " ".join(str(name or "").split()).lower()
+        if not wanted:
+            return None
+        return next((r for r in rows or [] if isinstance(r, dict)
+                     and " ".join(str(r.get("name") or "").split()).lower() == wanted), None)
+
+    async def _resolve_state_city_by_name(self, state_name: str, city_name: str):
+        """(stateId, cityId) for the Aadhaar's state and city, as the portal resolves them: the
+        state by name from /api/state, the city by name from /api/city?stateId -- and a city the
+        master list lacks is created with POST /api/city/new-city {stateId, cityName,
+        cityUniqueId: null}, exactly as patchAaddarValue does. (None, None) when the state is not
+        in the master list (the portal then leaves state/city for the user to pick)."""
+        states = (await self._make_authenticated_request('GET', "/api/state")).json().get('data') or []
+        state = self._match_by_name(states, state_name)
+        if not state:
+            return None, None
+        state_id = str(state.get("id"))
+
+        async def cities():
+            response = await self._make_authenticated_request('GET', f"/api/city?stateId={state_id}")
+            return response.json().get('data') or []
+
+        city = self._match_by_name(await cities(), city_name)
+        if not city and city_name:
+            await self._make_authenticated_request('POST', "/api/city/new-city", json_data={
+                "stateId": int(state_id) if state_id.isdigit() else state_id,
+                "cityName": city_name, "cityUniqueId": None})
+            print(f"City {city_name!r} was not in {state.get('name')}'s list -- created it, as the portal does.")
+            city = self._match_by_name(await cities(), city_name)
+        return state_id, (str(city.get("id")) if city else None)
+
+    async def _aadhaar_permanent_address(self) -> dict:
+        """The KYC permanent address taken from the verified Aadhaar XML (auto KYC), with the
+        Aadhaar as its proof (addressProofTypeId 2) -- or {} when there is nothing to take, and
+        the generated address is used instead. Sets state_id / city_id / random_pincode to the
+        Aadhaar's so everything after this step agrees with it."""
+        if not (self.kyc_mode == self.KYC_MODE_AUTO and self.aadhaar_verified):
+            return {}
+        fields = self.aadhaar_address_from_xml(self.aadhaar_xml_details)
+        if not fields:
+            print("Aadhaar XML verified but carried no address -- using a generated address.")
+            return {}
+        state_id, city_id = await self._resolve_state_city_by_name(fields["state"], fields["city"])
+        if state_id:
+            self.state_id = state_id
+        else:
+            print(f"Aadhaar state {fields['state']!r} is not in the state list -- keeping state {self.state_id}.")
+        if city_id:
+            self.city_id = city_id
+        elif state_id:
+            raise RuntimeError(f"Aadhaar city {fields['city']!r} could not be found or created in state "
+                               f"{fields['state']!r}.")
+        if fields["pinCode"]:
+            self.random_pincode = fields["pinCode"]
+        print(f"KYC address from the verified Aadhaar XML: {fields['address']} | {fields['city']}, "
+              f"{fields['state']} {fields['pinCode']} (state {self.state_id}, city {self.city_id}).")
+        return {
+            "addressType": "permanent",
+            "addressProofTypeId": self.AADHAAR_ADDRESS_PROOF_TYPE_ID,
+            "addressProofNumber": self.identity_proof_number,
+            "address": fields["address"],
+            "stateId": int(self.state_id) if self.state_id else None,
+            "cityId": int(self.city_id) if self.city_id else None,
+            "pinCode": self.random_pincode,
+            "landmark": fields["landmark"],
+            # Aadhaar as the address proof re-uses the identity images (checkForAadhar).
+            "addressProof": [self.masked_identity_proof],
+            "unMaskedAddressProof": [self.unmasked_identity_proof],
+        }
+
     async def save_customer_address(self):
         # NOTE: This intentionally does NOT call POST /api/kyc/customer-kyc-address.
         # That endpoint runs Aadhaar auto-verification and rejects unverifiable (test) Aadhaar
@@ -3380,8 +3495,13 @@ class GoldLoanApiTest:
         self.address_proof = (await self._upload_file("customer", file_type="pdf"))['uploadFile']['path']
 
         addresses = []
+        # Auto KYC: the verified Aadhaar XML's address IS the customer's KYC address (the portal
+        # fills the permanent address from it and locks it). The residence is the same address.
+        aadhaar_address = await self._aadhaar_permanent_address()
+        if aadhaar_address:
+            same_as_permanent = True
         permanent_address_details = self._generate_random_address()
-        permanent_address = {
+        permanent_address = aadhaar_address or {
             "addressType": "permanent",
             "addressProofTypeId": int(self.address_proof_type_id) if self.address_proof_type_id else None, # Convert to int
             "addressProofNumber": self.identity_proof_number,
@@ -3440,7 +3560,8 @@ class GoldLoanApiTest:
                     "addressProof": [enc(p) for p in (a.get("addressProof") or [])],
                     "unMaskedAddressProof": [],
                     "addressProofImg": [f"{self.BASE_URL}/{p}" for p in (a.get("addressProof") or [])],
-                    "addressProofFileName": [enc(self.address_proof)] if self.address_proof else [],
+                    "addressProofFileName": [enc((a.get("addressProof") or [self.address_proof])[0])]
+                                            if (a.get("addressProof") or self.address_proof) else [],
                 })
             v2_body = {
                 "customerId": int(self.customer_id) if str(self.customer_id).isdigit() else self.customer_id,
@@ -3750,14 +3871,23 @@ class GoldLoanApiTest:
         request id). NOTE: item["customer"]["id"] is the CUSTOMER id, not the request
         id — do not use it here.
         """
+        matches = []
         for item in items:
             customer = item.get("customer") if isinstance(item.get("customer"), dict) else {}
             uid = str(customer.get("customerUniqueId") or item.get("customerUniqueId") or "")
             cid = str(item.get("customerId") or customer.get("id") or "")
             if (self.customer_unique_id and uid == str(self.customer_unique_id)) or \
                (self.customer_id and cid == str(self.customer_id)):
-                return item
-        return None
+                matches.append(item)
+        # After the request was opened in another branch, the customer has one request per branch:
+        # take the one in that branch.
+        branch = str(getattr(self, "request_branch_id", "") or "")
+        if branch:
+            for item in matches:
+                ib = item.get("internalBranch") if isinstance(item.get("internalBranch"), dict) else {}
+                if str(item.get("internalBranchId") or ib.get("id") or "") == branch:
+                    return item
+        return matches[0] if matches else None
 
     async def _lookup_appraiser_request(self):
         """Find this customer's appraiser-request item using the CURRENT token, or None.
@@ -3884,7 +4014,7 @@ class GoldLoanApiTest:
             return " (no alternate branch was available to try)"
         return " (tried " + "; ".join(self._branch_attempts) + ")"
 
-    async def _create_request_in_another_branch(self, request_body, max_branches: int = 3):
+    async def _create_request_in_another_branch(self, request_body, max_branches: int = 3, exclude=()):
         """Retry the appraiser-request create in another branch, keeping OUR OWN appraiserId.
 
         The non-destructive answer to "This product Request already Exists" on a request owned
@@ -3899,8 +4029,18 @@ class GoldLoanApiTest:
         """
         self._branch_attempts = []
         branches = await self._fetch_my_branches()
-        current = str(self.internal_branch_id or "")
-        candidates = [b for b in branches if str(b.get("id")) != current]
+        # The branch that just refused is the one in the request body (the customer's branch), not
+        # necessarily the login's -- the login's own branch is a valid alternative.
+        current = str(request_body.get("internalBranchId") or self.internal_branch_id or "")
+        skip = {current} | {str(x) for x in exclude}
+        candidates = [b for b in branches if str(b.get("id")) not in skip]
+        # Preference: the login's own branch, then GOLD_LOAN_REQUEST_BRANCHES (comma-separated ids, in
+        # order), then the server's (alphabetical) list -- otherwise the first picks are whatever test
+        # branches sort first ("1q2q", "aaa", ...).
+        preferred = [str(getattr(self, "login_branch_id", "") or self.internal_branch_id or "")] + [
+            x.strip() for x in os.getenv("GOLD_LOAN_REQUEST_BRANCHES", "").split(",") if x.strip()]
+        rank = {bid: i for i, bid in reversed(list(enumerate(preferred))) if bid}
+        candidates.sort(key=lambda br: rank.get(str(br.get("id")), len(rank)))
         if not candidates:
             print("No alternate branch is available to this login, so the create cannot be retried elsewhere.")
             return None
@@ -3923,10 +4063,32 @@ class GoldLoanApiTest:
                 print(f"  branch {branch_id} rejected it: {e.response.status_code} - {detail}")
                 continue
             self.internal_branch_id = str(branch_id)
+            self.request_branch_id = str(branch_id)
             print(f"Created the appraiser request in branch {branch_id}; using that branch for the "
                   "rest of the run.")
             return response
         return None
+
+    async def _appraiser_request_body(self) -> dict:
+        return {
+            "id": None,
+            "customerId": int(self.customer_id) if self.customer_id else None,
+            "customerName": self.full_name,
+            "customerUniqueId": self.customer_unique_id,
+            "mobileNumber": self.mobile_number,
+            "moduleId": int(self.module_id) if self.module_id else None,
+            "internalBranchId": await self.appraiser_request_branch_id(),
+            "appraiserId": int(self.appraiser_id) if self.appraiser_id else None,
+            "loanType": "Fresh Loan",
+            "trackProccesingTime": True,
+        }
+
+    async def ensure_loan_allowed(self):
+        """max-loan-limit for the current request. A refusal ("five active loans") stops the run:
+        the rule counts ALL the customer's active loans, in every branch -- verified 13 Nov on TEST,
+        where MSSU4GTG was refused in branches 1, 152, 40, 76 and 72 alike -- so moving the request to
+        another branch does not help."""
+        return await self.fetch_max_loan_limit()
 
     async def create_appraiser_request(self):
         api_path = "/api/appraiser-request"
@@ -3949,6 +4111,7 @@ class GoldLoanApiTest:
         # only a finished request is cancelled and recreated. `--fresh-request` forces the
         # cancel-and-recreate path.
         response = None
+        tried_other_branches = False
         for attempt in range(2):
             try:
                 response = await self._make_authenticated_request('POST', api_path, json_data=request_body)
@@ -3957,6 +4120,21 @@ class GoldLoanApiTest:
                 break
             except httpx.HTTPStatusError as e:
                 text = e.response.text or ""
+                if (e.response.status_code == 400 and attempt == 0 and not tried_other_branches
+                        and self.request_other_branch_enabled):
+                    # The default (customer's) branch refused a NEW request -- "already Exists", or
+                    # any other 400. Ask for one in another branch this login can use first; the old
+                    # handling below (reuse an existing request / explain the refusal) only runs if
+                    # no branch accepts. GOLD_LOAN_REQUEST_OTHER_BRANCH=false restores reuse-first.
+                    tried_other_branches = True
+                    print(f"Branch {request_body.get('internalBranchId')} refused a new appraiser request "
+                          f"({self._short_error_body(text, 120)}); trying another branch.")
+                    branch_response = await self._create_request_in_another_branch(request_body)
+                    if branch_response is not None:
+                        response = branch_response
+                        break
+                    print("No other branch accepted a new request" + self._branch_attempt_summary()
+                          + "; falling back to the usual handling.")
                 if e.response.status_code == 400 and "already Exists" in text:
                     print(f"Appraiser request for customer {self.customer_unique_id} already exists.")
                     found = await self._fetch_existing_appraiser_request(required=False)
@@ -3964,7 +4142,8 @@ class GoldLoanApiTest:
                         # The server rejects the create but the request is invisible even to
                         # admin, so there is nothing to reuse and a plain retry would fail
                         # identically. Still worth trying another branch before giving up.
-                        branch_response = await self._create_request_in_another_branch(request_body)
+                        branch_response = (None if tried_other_branches
+                                           else await self._create_request_in_another_branch(request_body))
                         if branch_response is not None:
                             response = branch_response
                             break
@@ -4028,7 +4207,8 @@ class GoldLoanApiTest:
                     # Try to create OUR OWN request in another branch this user has access to
                     # instead -- non-destructive, and it succeeds if the server's uniqueness key
                     # includes the branch.
-                    branch_response = await self._create_request_in_another_branch(request_body)
+                    branch_response = (None if tried_other_branches
+                                       else await self._create_request_in_another_branch(request_body))
                     if branch_response is not None:
                         response = branch_response
                         break
@@ -6365,6 +6545,16 @@ class GoldLoanApiTest:
             print(f"Fetched max loan limit: {self.max_loan_limit}")
             return data
         except httpx.HTTPStatusError as e:
+            text = e.response.text or ""
+            if e.response.status_code == 400 and "active loan" in text.lower():
+                # "You have five active loans in the system. As per bank rule, for the new loan
+                # creation you must close a previous active loan." Every later step would fail with
+                # a misleading "loan already initiated", so stop here and say why.
+                raise LoanLimitReachedError(
+                    f"Customer {self.customer_unique_id or self.customer_id} cannot take a new loan: "
+                    f"{self._short_error_body(text, 200)} Close one of their active loans (e.g. "
+                    "flows/e2e_repayment.py --scenario full-release --loan AUGM-...) or use another "
+                    "customer.") from None
             print(f"Fetch max loan limit failed (non-fatal): {e.response.status_code}")
             return {}
 
@@ -8212,6 +8402,7 @@ class GoldLoanApiTest:
         # KYC verdicts are per-customer, and so is a degrade back to manual.
         self.pan_verified = False
         self.aadhaar_verified = False
+        self.aadhaar_xml_details = {}
         self.ovd_verified = False
         self.kyc_verification_log = []
         self.kyc_mode_effective = self.kyc_mode_requested
@@ -8321,6 +8512,7 @@ class GoldLoanApiTest:
                 await self._use_existing_customer()
                 if await self._existing_customer_kyc_ready():
                     print("Existing customer KYC is already approved — skipping KYC, going to the loan process.")
+                    await self.fetch_max_loan_limit()   # stop before creating anything if the customer is capped
                     await self._prepare_loan_fields_from_existing()
                 else:
                     self._log_step(f"KYC Process (existing customer, status={self.kyc_status or 'unknown'})")
@@ -8344,7 +8536,7 @@ class GoldLoanApiTest:
             self._log_step("Appraiser Request & Loan Basics")
             await self.create_appraiser_request()
             await self.track_loan_history(3)  # Assuming action 3 is a relevant tracking step
-            await self.fetch_max_loan_limit()
+            await self.ensure_loan_allowed()   # max-loan-limit; moves the request to another branch if capped
             await self.fetch_customer_loan_details()
             await self.store_loan_basic_details()
             await self.fetch_rating_reasons()
