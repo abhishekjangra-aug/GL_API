@@ -468,6 +468,7 @@ The upload-documents step mirrors the web portal, driven by the loan record (`si
 | **IGL income documents** | purpose's `incomeGeneratingDocumentTypes` minus `hiddenDocuments` | by default one PDF under one randomly chosen visible document type (at least one is mandatory); `--igl-docs N\|all` fills N (or every) visible type and `--igl-doc-files M` puts M PDFs under each (1–10, the page's limit). The LIP form goes in the same request whenever it is required. |
 | Consumption (CB) loans | `showConsumptionSupportingDocs` on the loan | none on TEST (the LIP form replaced them); one consumption supporting document only when the server flags it (UAT's older portal) |
 | **Arvog** (co-lender not DCB) | `isArvog`, `masterLoan.bankId` | loan application, gold receipt and KFS copies |
+| **CPV document** | Any one of: `totalOutstandingAmount` above global setting `intimationBankValidation.cpvLoanAmountLimit` (TEST: ₹5,00,000), `isCpvPosThresholdCrossed` (customer POS above `cpvPosThresholdLakhs`, TEST: 1 lakh), or the loan's `customerLoanDocument.isCpvEditable` | `cpvImage` / `cpvImageFullUrl`: the customer's CPV on file (`customer.cpvImage`, which the portal pre-fills), else a CPV PDF uploaded with reason `loan`. The server saves it as the customer's CPV. |
 | Stamp paper | `stampDutyDefinitionType == "stampPaper"` | stamp paper copy |
 
 A rejected upload now stops the run (it used to be logged and ignored).
@@ -639,6 +640,9 @@ python flows/e2e_bt_loan.py --customer MWK4X6YU --amount 600000
 python flows/e2e_bt_loan.py --bt AUGM-BT-90168               # RESUME a BT from its current stage
 python flows/e2e_bt_loan.py --customer MWK5D1YA --resume     # resume that customer's open BT
 python flows/e2e_bt_loan.py --rch-decision incomplete        # negative path at RCH
+python flows/e2e_bt_loan.py --gold-loan                      # COMPLETE: BT -> manual advance -> gold loan
+python flows/e2e_bt_loan.py --bt AUGM-BT-77380 --complete-advance   # only stage 11 -> 12
+python flows/e2e_bt_loan.py --bt AUGM-BT-77380 --gold-loan   # finish a BT: advance (if needed) + gold loan
 ```
 
 | Stage | Screen | Call |
@@ -650,7 +654,10 @@ python flows/e2e_bt_loan.py --rch-decision incomplete        # negative path at 
 | 4 | Bank Details | IFSC lookup + penny-drop (the harness's account list); when the account is pending (name mismatch → `forOpsApproval`), **ops verifies it here** (`POST /api/loan-process/bank-verification-manual`, `requestFrom: "bt application"`, `businessTransferId`) → `POST /api/bt-process/bank-details` with the real verdict. The advance request then shows *Verified by Operations*. |
 | 5 | Upload Documents | `generate-undertaking`, then `POST /api/bt-process/upload-document` (pawn ticket, one cheque per 5L, undertaking, live image; CPV / statement when the server requires them) |
 | 6–10 | RCH / RH / ZH / ZAH / CEO | `POST /api/bt-process/update-rating-<rch\|rh\|zh\|zah\|ceo>` — the server decides which are needed (3L and 6.5L: RCH only; 12L: RCH + RH) |
-| 11 | Advance Transfer Initiated | **The run ends here.** |
+| 11 | Advance Transfer Initiated | Without `--complete-advance` / `--gold-loan`, **the run ends here.** |
+| 11 → 12 | Funds Approvals → Advance Approval | `--complete-advance`: `PUT /api/advance-transfer/request-status?requestId=<advance>` `{status: "approved", paymentThrough: "NEFT", transactionId: <UTR>, paymentGatewayId: <OFFLINE>}`, a **manual** transfer recorded by its UTR |
+| 12 | Advance Transfer Completed | The end of the BT application. The BT's appraiser request is now `complete`. |
+| then | Appraiser Requests → Apply Loan (on the BT request) | `--gold-loan`: the full gold-loan journey (`flows/e2e_full_loan.py`) **on the BT's own appraiser request**, with the BT's partner. The loan's `advanceTransfer` (`bTMoney`, `toBePaid`) shows it settling the BT. |
 
 - Every step reads the application first (`GET /api/bt-process/applied-bt-application/<id>`) and acts
   on `btCurrentStageId`, so a stopped or failed run is resumed with `--bt`; the run prints that command.
@@ -658,12 +665,29 @@ python flows/e2e_bt_loan.py --rch-decision incomplete        # negative path at 
   with the admin token. Approvals are given by the admin (`--approver` to change).
 - One BT per customer at a time: a second request is refused with *"This customer's loan transfer is in
   process"* — also after approval (stage 11). The run then names the customer's BT so it can be resumed.
-- Stage 11 is the end on purpose: next, finance approves the **advance transfer** that pays the old
-  lender through the ICICI payout gateway, which this harness never triggers.
+- **Paying the old lender, without real money.** The portal's Advance Approval lists the payout gateways
+  from `GET /api/payment-gateway/payout-details?module=Loan`. On TEST these are **OFFLINE**, RazorpayX and
+  icici; the portal shows OFFLINE as "Approve with NEFT / IMPS / RTGS". `--complete-advance` uses
+  **only OFFLINE**: it records a manual transfer with a test UTR (`--utr`, default 12 random digits) and
+  a mode (`--transfer-mode`, default NEFT). No bank API is called. The run refuses when:
+  - there is no OFFLINE gateway;
+  - the advance's bank account isn't verified (`bankVerificationStatus` not `approved`, or
+    `forOpsApproval`);
+  - the advance isn't `processing`.
+
+  An advance that is already approved is left alone.
+- **The gold loan** goes on the BT's request because `GOLD_LOAN_APPRAISER_REQUEST_ID` pins the
+  request (the harness checks it is the customer's, assigned to this login and has no loan yet).
+  Without the pin, the gold-loan flow would open a separate request. The loan amount defaults to the
+  BT amount (`--gl-amount` to change). The disbursement nets off stamp duty and processing, which the
+  customer then still owes on the advance: `toBePaid` comes out negative, for example −300 with Roshan
+  and −10,780 with Arvog.
 - `--reupload-cpv` also sends a CPV re-upload with the documents (APNT-350).
 
 Verified live on TEST (17 Nov): AUGM-BT-96444 (full, 3L), AUGM-BT-90168 (stopped before documents at
-6.5L, then resumed to stage 11), AUGM-BT-68011 (12L, RCH + RH). Offline tests: group `bt`.
+6.5L, then resumed to stage 11), AUGM-BT-68011 (12L, RCH + RH). Complete BTs: **AUGM-BT-13332**
+(`--gold-loan`, new customer, Roshan: manual NEFT advance 2212, gold loan AUGM-82518) and AUGM-BT-77380
+(Arvog: advance 2208 manual NEFT, gold loan AUGM-48694 on request 15243). Offline tests: group `bt`.
 
 ## Customer CPV (TEST/UAT)
 
@@ -953,6 +977,11 @@ and `flows/e2e_stop_before_disbursement.py` (stops after ops rating), which reus
 | `--rch-decision` | `approved` \| `incomplete` \| `rejected` | approved | RCH's decision; anything but approved ends the run there. |
 | `--complete-cpv` | flag | off | Complete the customer's CPV before the BT (skipped when a valid CPV exists). |
 | `--reupload-cpv` | flag | off | Send a CPV re-upload with the documents. |
+| `--complete-advance` | flag | off | Stage 11 → 12: approve the advance as a manual transfer (OFFLINE gateway, NEFT/IMPS/RTGS + UTR). |
+| `--transfer-mode` | `NEFT` \| `IMPS` \| `RTGS` | `NEFT` | Mode recorded for the manual transfer. |
+| `--utr` | text | 12 random digits | UTR recorded for the manual transfer. |
+| `--gold-loan` | flag | off | The complete BT: `--complete-advance`, then the gold loan on the BT's appraiser request. |
+| `--gl-amount` | rupees | the BT amount | Gold-loan amount for `--gold-loan`. |
 | `--env`, `--login`, `--fresh-login` | as the other flows | test / appraiser / off | |
 
 ### `flows/complete_cpv.py` — customer CPV (TEST/UAT)

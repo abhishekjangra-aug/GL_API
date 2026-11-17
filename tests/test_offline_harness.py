@@ -3173,7 +3173,8 @@ def single_loan(**over):
     data.update(over)
     return {"data": data}
 
-def run_loan_documents(loan, lip_validation=True, stored_lip=None, igl_docs="1", igl_files=1, uploads=None):
+def run_loan_documents(loan, lip_validation=True, stored_lip=None, igl_docs="1", igl_files=1, uploads=None,
+                       settings=None):
     """Drive store_loan_documents against a mocked server. After loan-documents is posted the
     mock's single-loan carries the LIP assessment the server would store (eligible, with
     existingLoanEmis = the sent presentInterest) unless `stored_lip` overrides it."""
@@ -3185,7 +3186,7 @@ def run_loan_documents(loan, lip_validation=True, stored_lip=None, igl_docs="1",
     s.igl_docs_choice, s.igl_doc_files = igl_docs, igl_files   # set directly: env vars would leak
     def responder(path):
         if "single-loan" in path: return loan
-        if "global-setting" in path: return {"LIPEligibilityValidation": lip_validation}
+        if "global-setting" in path: return {"LIPEligibilityValidation": lip_validation, **(settings or {})}
         if "upload-file" in path:
             if uploads is None:
                 return {"uploadFile": {"path": "uploads/x/doc.pdf", "filename": "doc.pdf"}}
@@ -3216,6 +3217,42 @@ def run_loan_documents(loan, lip_validation=True, stored_lip=None, igl_docs="1",
     quiet(lambda: asyncio.run(s.store_loan_documents()))
     close(s)
     return next(b for m, p, b in calls if p == "/api/loan-process/loan-documents")
+
+CPV_SETTINGS = {"intimationBankValidation": {"cpvLoanAmountLimit": 500000}, "cpvPosThresholdLakhs": 1}
+
+
+@test("upload-docs: outstanding above the CPV limit -> the CPV document is sent (uploaded when none on file)")
+def _():
+    loan = single_loan(totalOutstandingAmount=600150, isLIPFormRequired=False,
+                       loanPersonalDetail={"purpose": "Marriage", "purposeType": "Consumption Based"})
+    body = run_loan_documents(loan, settings=CPV_SETTINGS)
+    eq((body["cpvImage"], body["cpvImageFullUrl"]),
+       ("uploads/loan/doc.pdf", "https://gold-loan-backend-api.gfat.augmont.com/uploads/loan/doc.pdf"),
+       "an uploaded CPV document")
+
+
+@test("upload-docs: the customer's CPV on file is re-used (as the portal pre-fills it)")
+def _():
+    loan = single_loan(totalOutstandingAmount=600150, isLIPFormRequired=False,
+                       loanPersonalDetail={"purpose": "Marriage", "purposeType": "Consumption Based"})
+    loan["data"]["customer"]["cpvImage"] = "uploads/customer/9/cpv.pdf"
+    loan["data"]["customer"]["cpvImageFullUrl"] = "https://host/uploads/customer/9/cpv.pdf"
+    body = run_loan_documents(loan, settings=CPV_SETTINGS)
+    eq((body["cpvImage"], body["cpvImageFullUrl"]),
+       ("uploads/customer/9/cpv.pdf", "https://host/uploads/customer/9/cpv.pdf"), "the customer's CPV")
+
+
+@test("upload-docs: the POS threshold or isCpvEditable also require the CPV; below every threshold none")
+def _():
+    cb = {"isLIPFormRequired": False, "loanPersonalDetail": {"purpose": "Marriage", "purposeType": "Consumption Based"}}
+    for extra in ({"isCpvPosThresholdCrossed": True, "cpvTotalOutstandingAmount": 250000},
+                  {"customerLoanDocument": {"isCpvEditable": True}}):
+        body = run_loan_documents(single_loan(totalOutstandingAmount=150000, **cb, **extra), settings=CPV_SETTINGS)
+        ok(body["cpvImage"], f"CPV sent for {extra}")
+    body = run_loan_documents(single_loan(totalOutstandingAmount=150000, isCpvPosThresholdCrossed=False, **cb),
+                              settings=CPV_SETTINGS)
+    eq((body["cpvImage"], body["cpvImageFullUrl"]), (None, None), "no CPV below every threshold")
+
 
 @test("upload-docs: an IGL loan sends a LIP form whose net income clears the interest obligation")
 def _():
@@ -4837,6 +4874,133 @@ def _():
     bt_validate(bt_parser().parse_args(["--customer", "X", "--ornaments", "21"]), fail)
     bt_validate(bt_parser().parse_args(["--bt", "AUGM-BT-1", "--stop-before-documents"]), fail)
     eq(len(errors), 2, f"errors: {errors}")
+
+
+def _bt_advance_flow(advance_before, advance_after=None, gateways=None):
+    """BtLoanFlow at stage 11 with a stubbed Advance Approval list and payout gateways."""
+    s = suite()
+    flow = BT.BtLoanFlow(s, complete_advance=True, transfer_mode="NEFT", utr="123456789012")
+    flow.bt_id, flow.bt_unique_id = "176", "AUGM-BT-77380"
+    flow.app = {"advanceRequestId": 2208, "btCurrentStageId": 11}
+    calls, rows = [], [advance_before, advance_after or advance_before]
+    gateways = gateways if gateways is not None else [{"id": 7, "paymentGateway": "OFFLINE"},
+                                                      {"id": 6, "paymentGateway": "RazorpayX"},
+                                                      {"id": 5, "paymentGateway": "icici"}]
+
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        calls.append((method, path, json_data, s.auth_token))
+        if path.startswith("/api/advance-transfer/approval"):
+            payload = {"data": [rows.pop(0) if len(rows) > 1 else rows[0]]}
+        elif path.startswith("/api/payment-gateway/payout-details"):
+            payload = {"data": gateways}
+        else:
+            payload = {"message": "success"}
+
+        class R:
+            content = b"{}"
+            def json(self_inner): return payload
+        return R()
+    s._make_authenticated_request = fake
+    async def role_token(role): return "tok-" + role
+    s._role_token = role_token
+    return s, flow, calls
+
+
+ADVANCE_PENDING = {"id": 2208, "status": "processing", "paymentGatewayStatus": "pending", "amount": "300000.00",
+                   "bankVerificationStatus": "approved", "forOpsApproval": False, "accountNumber": "0062002100154881"}
+
+
+@test("bt: stage 11 advance is approved as a MANUAL NEFT transfer through the OFFLINE gateway only")
+def _():
+    s, flow, calls, = _bt_advance_flow(ADVANCE_PENDING, dict(ADVANCE_PENDING, status="approved",
+                                                             paymentGatewayStatus="completed"))
+    eq(flow.step_for(11), "complete_advance", "stage 11 step when enabled")
+    eq(BT.BtLoanFlow(s).step_for(11), None, "stage 11 stays the end without --complete-advance")
+    quiet(lambda: asyncio.run(flow.complete_advance()))
+    close(s)
+    puts = [c for c in calls if c[0] == "PUT"]
+    eq([(c[1], c[2], c[3]) for c in puts],
+       [("/api/advance-transfer/request-status?requestId=2208",
+         {"status": "approved", "paymentThrough": "NEFT", "transactionId": "123456789012", "paymentGatewayId": 7},
+         "tok-admin")], "one admin PUT with the OFFLINE gateway id")
+
+
+@test("bt: the advance is never approved through a payout API, an unverified bank, or twice")
+def _():
+    for mode in ("icici", "RazorpayX", "OFFLINE", ""):
+        try:
+            BT.offline_advance_approval_body(mode, "1", 7)
+            raise Fail(f"mode {mode!r} must be refused")
+        except BT.BtLoanError:
+            pass
+    s, flow, calls = _bt_advance_flow(ADVANCE_PENDING, gateways=[{"id": 5, "paymentGateway": "icici"}])
+    ok(quiet(lambda: _expect_bt_error(flow.complete_advance()))[0], "no OFFLINE gateway -> refused")
+    close(s)
+    ok(not any(c[0] == "PUT" for c in calls), "nothing sent without the OFFLINE gateway")
+    for bad in (dict(ADVANCE_PENDING, forOpsApproval=True), dict(ADVANCE_PENDING, bankVerificationStatus="pending"),
+                dict(ADVANCE_PENDING, status="rejected")):
+        s, flow, calls = _bt_advance_flow(bad)
+        ok(quiet(lambda: _expect_bt_error(flow.complete_advance()))[0], f"refused: {bad}")
+        close(s)
+        ok(not any(c[0] == "PUT" for c in calls), "no PUT")
+    s, flow, calls = _bt_advance_flow(dict(ADVANCE_PENDING, status="approved", paymentGatewayStatus="completed"))
+    (result, _o) = quiet(lambda: asyncio.run(flow.complete_advance()))
+    close(s)
+    eq(result, "already approved", "an approved advance is left alone")
+    ok(not any(c[0] == "PUT" for c in calls), "no second approval")
+
+
+def _expect_bt_error(coro):
+    try:
+        asyncio.run(coro)
+    except BT.BtLoanError:
+        return True
+    raise Fail("expected BtLoanError")
+
+
+@test("bt: --gold-loan implies --complete-advance; the advance flags are validated")
+def _():
+    args = bt_parser().parse_args(["--gold-loan"])
+    bt_validate(args, lambda m: (_ for _ in ()).throw(Fail(m)))
+    eq((args.complete_advance, args.transfer_mode), (True, "NEFT"), "advance enabled, NEFT default")
+    for bad in (["--gold-loan", "--stop-before-documents"], ["--utr", "1"], ["--gl-amount", "5"],
+                ["--gold-loan", "--gl-amount", "0"]):
+        errors = []
+        bt_validate(bt_parser().parse_args(bad), errors.append)
+        ok(errors, f"refused: {bad}")
+
+
+@test("bt: the pinned appraiser request is used as-is (no create), and must be ours and loan-free")
+def _():
+    s = suite()
+    s.customer_unique_id, s.customer_id, s.logged_in_user_id = "MWK6XCCJ", "9404", 1473
+    rows = [{"id": 15243, "appraiserId": 1473, "internalBranchId": 1, "status": "complete", "masterLoan": None,
+             "customerLoanBusinessTransfer": {"btUniqueId": "AUGM-BT-77380",
+                                              "customerBtStage": {"name": "Advance Transfer Completed"}}}]
+    async def listing(search="", **kw): return rows
+    async def role_token(role): return "tok-" + role
+    async def appraisers(): return None
+    posts = []
+    async def fake(method, path, json_data=None, **kw):
+        posts.append((method, path))
+        raise Fail("no request may be sent")
+    s._list_appraiser_requests, s._role_token, s._fetch_appraisers = listing, role_token, appraisers
+    s._make_authenticated_request = fake
+    os.environ["GOLD_LOAN_APPRAISER_REQUEST_ID"] = "15243"
+    try:
+        quiet(lambda: asyncio.run(s.create_appraiser_request()))
+        eq((s.appraiser_request_id, s.internal_branch_id), ("15243", "1"), "pinned request + its branch")
+        eq(posts, [], "no appraiser-request POST")
+        for bad in (dict(rows[0], appraiserId=999), dict(rows[0], masterLoan={"id": 1}), dict(rows[0], id=1)):
+            rows[:] = [bad]
+            try:
+                quiet(lambda: asyncio.run(s.create_appraiser_request()))
+                raise Fail(f"must refuse {bad}")
+            except RuntimeError:
+                pass
+    finally:
+        os.environ.pop("GOLD_LOAN_APPRAISER_REQUEST_ID", None)
+        close(s)
 
 
 # --------------------------------------------------------------------------------------------

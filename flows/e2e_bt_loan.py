@@ -7,6 +7,8 @@
     python flows/e2e_bt_loan.py --bt AUGM-BT-24551                # RESUME a BT from wherever it is parked
     python flows/e2e_bt_loan.py --customer MWK4X6YU --resume      # resume that customer's open BT
     python flows/e2e_bt_loan.py --rch-decision incomplete         # negative path at RCH
+    python flows/e2e_bt_loan.py --gold-loan                       # COMPLETE: BT + manual advance + gold loan
+    python flows/e2e_bt_loan.py --bt AUGM-BT-77380 --complete-advance   # stage 11 -> 12 only (manual NEFT + UTR)
 
 Modes, mirroring the gold-loan flows:
   full (default)            customer -> KYC -> BT request -> existing loan -> ornaments -> scheme ->
@@ -34,7 +36,12 @@ import httpx  # noqa: E402
 from gold_loan.harness import GoldLoanApiTest  # noqa: E402
 from gold_loan.cpv import CustomerCpv  # noqa: E402
 from gold_loan.bt_loan import (  # noqa: E402
-    APPROVAL_DECISIONS, BtLoanError, BtLoanFlow, DEFAULT_TENURE)
+    ADVANCE_COMPLETED_STAGE, APPROVAL_DECISIONS, BtLoanError, BtLoanFlow, DEFAULT_TENURE,
+    OFFLINE_TRANSFER_MODES)
+
+# BT partner id -> the GOLD_LOAN_PARTNER_NAME the gold-loan flow matches (GoldLoanApiTest
+# ROSHAN_PARTNER_ID / ARVOG_PARTNER_ID).
+BT_PARTNER_NAMES = {GoldLoanApiTest.ROSHAN_PARTNER_ID: "ROSHAN PARTNER", GoldLoanApiTest.ARVOG_PARTNER_ID: "ARVOG"}
 
 TENURES = ("30", "60", "90", "120", "150", "180")   # SharedService.loanTenure
 
@@ -77,6 +84,21 @@ def build_parser():
                              "skipped when a valid CPV exists) -- flows/complete_cpv.py.")
     parser.add_argument("--reupload-cpv", action="store_true",
                         help="Also send a CPV re-upload with the documents (APNT-350).")
+    parser.add_argument("--complete-advance", action="store_true",
+                        help="After the approvals (stage 11), approve the advance to the existing lender as a "
+                             "MANUAL transfer (OFFLINE gateway: NEFT/IMPS/RTGS + UTR, no payout API) -> stage 12 "
+                             "'Advance Transfer Completed'.")
+    parser.add_argument("--transfer-mode", choices=list(OFFLINE_TRANSFER_MODES), default="NEFT",
+                        help="Manual transfer mode for --complete-advance (default NEFT).")
+    parser.add_argument("--utr", help="UTR to record for --complete-advance (default: a random 12-digit test UTR).")
+    parser.add_argument("--gold-loan", action="store_true",
+                        help="The COMPLETE BT: --complete-advance, then the gold loan on the BT's own appraiser "
+                             "request (Appraiser Requests -> Apply Loan): ornaments, scheme, bank, packet, "
+                             "documents, ops, disbursement, submit packet -- the flows/e2e_full_loan.py journey "
+                             "with the BT's partner. The loan repays the BT advance.")
+    parser.add_argument("--gl-amount", type=int, metavar="RUPEES",
+                        help="Gold-loan amount for --gold-loan (default: the BT amount). The disbursement nets off "
+                             "stamp duty + processing, which the customer then owes on the advance (toBePaid).")
     parser.add_argument("--fresh-login", action="store_true",
                         help="Log every role in again instead of reusing saved sessions.")
     return parser
@@ -89,6 +111,18 @@ def validate(args, fail):
         fail("--ornaments must be 1-20 (the portal allows 20)")
     if args.amount < 1:
         fail("--amount must be positive")
+    if args.gold_loan:
+        args.complete_advance = True          # the loan needs the advance transfer completed first
+    if args.complete_advance and args.stop_before_documents:
+        fail("--complete-advance / --gold-loan cannot be combined with --stop-before-documents")
+    if args.gl_amount is not None and not args.gold_loan:
+        fail("--gl-amount only applies with --gold-loan")
+    if args.gl_amount is not None and args.gl_amount < 1:
+        fail("--gl-amount must be positive")
+    if args.utr is not None and not args.complete_advance:
+        fail("--utr only applies with --complete-advance (or --gold-loan)")
+    if args.complete_advance and args.env not in ("test", "uat"):
+        fail("--complete-advance is for TEST/UAT only")
 
 
 class BtLoanRun:
@@ -98,7 +132,8 @@ class BtLoanRun:
         self.flow = BtLoanFlow(
             self.suite, amount=args.amount, tenure=args.tenure, approver=args.approver,
             rch_decision=args.rch_decision, lender=args.lender or "", company_type=args.company_type,
-            scheme_id=args.scheme or "", ornament_count=args.ornaments, reupload_cpv=args.reupload_cpv)
+            scheme_id=args.scheme or "", ornament_count=args.ornaments, reupload_cpv=args.reupload_cpv,
+            complete_advance=args.complete_advance, transfer_mode=args.transfer_mode, utr=args.utr)
 
     async def _customer(self):
         """The customer for a NEW BT: existing (KYC run if not approved) or a fresh one."""
@@ -167,11 +202,20 @@ class BtLoanRun:
             outcome = await flow.drive(stop_before_documents=args.stop_before_documents,
                                        log_step=suite._log_step)
 
+            gold_loan = {}
+            if args.gold_loan:
+                if flow.stage < ADVANCE_COMPLETED_STAGE:
+                    raise BtLoanError(f"BT {flow.bt_unique_id} is at stage {flow.stage} ({flow.stage_name}); the gold "
+                                      "loan needs 'Advance Transfer Completed'.")
+                gold_loan = await self._gold_loan()
+                outcome = "complete: advance transferred + gold loan " + str(gold_loan.get("Gold loan", "")).split(" ")[0]
+
             suite._print_summary_table("BT LOAN DETAILS", {
                 "Environment": f"{suite.env_name.upper()} ({suite.BASE_URL})",
                 "Customer": f"{suite.customer_unique_id} (id {suite.customer_id})",
                 **flow.summary(),
-                "Steps run": ", ".join(flow.steps_done) or "none",
+                **gold_loan,
+                "Steps run": ", ".join(flow.steps_done + (["gold loan"] if gold_loan else [])) or "none",
                 "Outcome": outcome,
             })
             print(f"\nResume later with:  python flows/e2e_bt_loan.py --bt {flow.bt_unique_id} --env {args.env}")
@@ -193,6 +237,59 @@ class BtLoanRun:
             return False
         finally:
             await suite.client.aclose()
+
+    async def _gold_loan(self) -> dict:
+        """The gold loan on the BT's appraiser request, run as the full-loan journey in its own
+        GoldLoanApiTest (fresh state; the saved sessions are reused). The request is pinned with
+        GOLD_LOAN_APPRAISER_REQUEST_ID and the partner is the BT's. Returns summary rows."""
+        flow, suite, args = self.flow, self.suite, self.args
+        app = flow.app
+        partner_id = str((app.get("partner") or {}).get("id") or app.get("partnerId") or "")
+        partner_name = BT_PARTNER_NAMES.get(partner_id)
+        if not partner_name:
+            raise BtLoanError(f"BT partner {app.get('partner')} is not one the gold-loan flow knows "
+                              f"({sorted(BT_PARTNER_NAMES.values())}).")
+        amount = args.gl_amount or int(float(app.get("requiredLoanAmount") or args.amount))
+        if not flow.request_id:
+            raise BtLoanError(f"BT {flow.bt_unique_id} has no appraiser request id.")
+        suite._log_step(f"Gold loan on BT request {flow.request_id} ({partner_name}, {amount})")
+        pinned = {"GOLD_LOAN_APPRAISER_REQUEST_ID": str(flow.request_id), "GOLD_LOAN_AMOUNT": str(amount),
+                  "GOLD_LOAN_PARTNER_NAME": partner_name,
+                  "GOLD_LOAN_EXISTING_CUSTOMER_UNIQUE_ID": suite.customer_unique_id}
+        before = {k: os.environ.get(k) for k in pinned}
+        os.environ.update(pinned)
+        try:
+            gl = GoldLoanApiTest()
+            gl.existing_customer_id = ""
+            gl.existing_customer_unique_id = suite.customer_unique_id
+            try:
+                await gl.run_e2e_test(login_type=args.login)
+            finally:
+                await gl.client.aclose()
+        finally:
+            for key, value in before.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        # How the loan settles the BT: the server's advanceTransfer on the master loan.
+        settle = {}
+        if gl.master_loan_id:
+            saved = suite.auth_token
+            try:
+                suite.auth_token = await suite._role_token("admin")
+                response = await suite._make_authenticated_request(
+                    "GET", f"/api/loan-process/single-loan-customer?masterLoanId={gl.master_loan_id}")
+                settle = ((response.json() or {}).get("data") or {}).get("advanceTransfer") or {}
+            finally:
+                suite.auth_token = saved
+        rows = {"Gold loan": f"{gl.loan_unique_id or '-'} (master {gl.master_loan_id or '-'}), {amount}, "
+                             f"{partner_name}"}
+        if settle:
+            rows["BT settlement"] = (f"BT money {settle.get('bTMoney')}, to be paid {settle.get('toBePaid')}"
+                                     + (" (the customer still owes this)" if float(settle.get("toBePaid") or 0) < 0
+                                        else ""))
+        return rows
 
     def _resume_hint(self):
         if self.flow.bt_unique_id or self.flow.bt_id:

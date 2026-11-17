@@ -49,12 +49,20 @@ BT_STAGE_NAMES = {
     1: "Existing BT Info", 2: "Ornament Details", 3: "Scheme Details", 4: "Bank Details",
     5: "Upload Documents", 6: "RCH Approval", 7: "RH Approval", 8: "ZH Approval",
     9: "ZAH Approval", 10: "CEO Approval", 11: "Advance Transfer Initiated",
+    12: "Advance Transfer Completed",
 }
 DOCUMENTS_STAGE = 5
 # ApprovalsComponent.approvalStages + the BTLoanService method each stage calls.
 APPROVAL_STAGES = {6: ("rch", "RCH Approval"), 7: ("rh", "RH Approval"), 8: ("zh", "ZH Approval"),
                    9: ("zah", "ZAH Approval"), 10: ("ceo", "CEO Approval")}
 APPLICATION_APPROVED_STAGE = 11
+ADVANCE_COMPLETED_STAGE = 12       # the end of the BT application (the portal stops its timer)
+# Advance Approval (Funds Approvals, chunk 4 AdvanceApprovalComponent): the payout gateways come from
+# GET payment-gateway/payout-details?module=Loan; the portal shows OFFLINE as "Approve with NEFT /
+# IMPS / RTGS" -- a manual transfer recorded by its UTR, no bank API involved. The harness uses ONLY
+# that: approving with icici / RazorpayX would send real money.
+OFFLINE_GATEWAY = "OFFLINE"
+OFFLINE_TRANSFER_MODES = ("NEFT", "IMPS", "RTGS")
 APPROVAL_DECISIONS = ("approved", "incomplete", "rejected")
 # ApprovalsComponent.rejectionReasons (a rejection with any of these sends the reason as comment).
 REJECTION_REASON = "Documents Not Clear / Legible"
@@ -155,6 +163,23 @@ def build_approval(customer_id, bt_id, stage, decision="approved", comment=None)
     return key, body
 
 
+def make_utr(rng=random) -> str:
+    """A test UTR for the manual transfer (12 digits, like the one entered on advance 2210)."""
+    return "".join(str(rng.randint(0, 9)) for _ in range(12))
+
+
+def offline_advance_approval_body(transfer_mode, utr, gateway_id) -> dict:
+    """AdvanceApprovalComponent.submitStatus(item, 'transactionStatus', 'utr') for an OFFLINE
+    (NEFT/IMPS/RTGS) approval: PUT advance-transfer/request-status?requestId=<id>."""
+    if transfer_mode not in OFFLINE_TRANSFER_MODES:
+        raise BtLoanError(f"Transfer mode must be one of {OFFLINE_TRANSFER_MODES} (manual, no payout API), "
+                          f"not {transfer_mode!r}.")
+    if not str(utr or "").strip():
+        raise BtLoanError("A UTR number is required for a manual transfer.")
+    return {"status": "approved", "paymentThrough": transfer_mode, "transactionId": str(utr).strip(),
+            "paymentGatewayId": gateway_id}
+
+
 def cheques_required(required_loan_amount) -> int:
     """RegulatoryDocumentsComponent: one signed cheque per 5L, at least one."""
     return max(1, math.ceil(float(required_loan_amount or 0) / CHEQUE_LIMIT))
@@ -195,7 +220,8 @@ class BtLoanFlow:
 
     def __init__(self, suite, *, amount=300000, tenure=DEFAULT_TENURE, approver="admin",
                  rch_decision="approved", lender="", company_type="NBFC", scheme_id="",
-                 ornament_count=3, reupload_cpv=False, rng=None):
+                 ornament_count=3, reupload_cpv=False, rng=None, complete_advance=False,
+                 transfer_mode="NEFT", utr=None):
         self.suite = suite
         self.amount = int(amount)
         self.tenure = str(tenure)
@@ -215,6 +241,10 @@ class BtLoanFlow:
         self.steps_done = []
         self.decisions = []     # (stage label, decision)
         self.chosen_scheme = {}
+        self.complete_advance_enabled = complete_advance
+        self.transfer_mode = transfer_mode
+        self.utr = utr
+        self.advance_row = {}
 
     # --- plumbing -------------------------------------------------------------------------
 
@@ -575,7 +605,70 @@ class BtLoanFlow:
             return self.STEP_BY_STAGE[stage]
         if stage in APPROVAL_STAGES:
             return "approve"
+        if stage == APPLICATION_APPROVED_STAGE and self.complete_advance_enabled:
+            return "complete_advance"
         return None
+
+    # --- stage 11 -> 12: the advance to the existing lender, approved as a MANUAL transfer ----------
+
+    async def advance(self) -> dict:
+        """The BT's advance request, as the Advance Approval list shows it (admin)."""
+        request_id = self.app.get("advanceRequestId")
+        if not request_id:
+            raise BtLoanError(f"BT {self.bt_unique_id} has no advance request yet (stage {self.stage}).")
+
+        async def fetch():
+            return await self._get(f"/api/advance-transfer/approval?from=1&to=25&search={request_id}")
+        rows = (await self._as_role("admin", fetch)).get("data") or []
+        row = next((r for r in rows if str(r.get("id")) == str(request_id)), None)
+        if not row:
+            raise BtLoanError(f"Advance request {request_id} is not in the Advance Approval list.")
+        self.advance_row = row
+        return row
+
+    async def offline_gateway_id(self):
+        async def fetch():
+            return await self._get("/api/payment-gateway/payout-details?module=Loan")
+        gateways = (await self._as_role("admin", fetch)).get("data") or []
+        offline = next((g for g in gateways if g.get("paymentGateway") == OFFLINE_GATEWAY), None)
+        if not offline:
+            raise BtLoanError(f"No {OFFLINE_GATEWAY} payout gateway on {self.suite.env_name.upper()} "
+                              f"({[g.get('paymentGateway') for g in gateways]}); the harness never approves "
+                              "an advance through a payout API.")
+        return offline["id"]
+
+    async def complete_advance(self):
+        """Advance Approval -> "Approve with NEFT/IMPS/RTGS" + UTR: records a MANUAL transfer to the
+        existing lender (no ICICI / RazorpayX call), which moves the BT to stage 12."""
+        row = await self.advance()
+        request_id = row["id"]
+        if row.get("status") == "approved" and row.get("paymentGatewayStatus") == "completed":
+            print(f"Advance {request_id} is already approved ({row.get('paymentThrough')}, UTR "
+                  f"{row.get('transactionId')}).")
+            return "already approved"
+        if row.get("status") != "processing":
+            raise BtLoanError(f"Advance {request_id} is {row.get('status')!r}, not 'processing'; not approving it.")
+        if row.get("bankVerificationStatus") != "approved" or row.get("forOpsApproval"):
+            raise BtLoanError(f"Advance {request_id}'s bank account is not verified (bankVerificationStatus="
+                              f"{row.get('bankVerificationStatus')!r}, forOpsApproval={row.get('forOpsApproval')}); "
+                              "ops must verify it first.")
+        utr = self.utr or make_utr(self.rng)
+        body = offline_advance_approval_body(self.transfer_mode, utr, await self.offline_gateway_id())
+        print(f"Advance {request_id}: {row.get('amount')} to {row.get('accountHolderName')} "
+              f"({row.get('bankName')}, a/c ...{str(row.get('accountNumber'))[-4:]}) -- approving as a MANUAL "
+              f"{self.transfer_mode} transfer, UTR {utr} (no payout API).")
+
+        async def put():
+            response = await self.suite._make_authenticated_request(
+                "PUT", f"/api/advance-transfer/request-status?requestId={request_id}", json_data=body)
+            return response.json() if response.content else {}
+        answer = await self._as_role("admin", put)
+        print(f"Advance approved: {answer.get('message')}")
+        after = await self.advance()
+        print(f"Advance {request_id} now: status={after.get('status')!r}, payment={after.get('paymentGatewayStatus')!r}, "
+              f"through={after.get('paymentThrough')!r}, UTR={after.get('transactionId')!r}, "
+              f"manual={after.get('isTransactionCompleteManually')}.")
+        return "approved"
 
     async def drive(self, stop_before_documents=False, log_step=print):
         """Run the application from its current stage. Returns the reason it stopped."""
@@ -586,6 +679,8 @@ class BtLoanFlow:
                 return "stopped before documents" if stage == DOCUMENTS_STAGE else f"already past documents ({self.stage_name})"
             step = self.step_for(stage)
             if step is None:
+                if stage >= ADVANCE_COMPLETED_STAGE:
+                    return "advance transfer completed"
                 return "approved" if stage >= APPLICATION_APPROVED_STAGE else f"stage {stage} ({self.stage_name})"
             log_step(f"BT {self.bt_unique_id} - stage {stage}: {BT_STAGE_NAMES.get(stage, self.stage_name)}")
             result = await getattr(self, step)()
@@ -611,4 +706,7 @@ class BtLoanFlow:
             "Collateral value": app.get("collateralValueOfOrnaments") or "-",
             "Approvals": ", ".join(f"{label} {d}" for label, d in self.decisions) or "-",
             "Advance request": app.get("advanceRequestId") or "-",
+            **({"Advance transfer": f"{self.advance_row.get('status')} / {self.advance_row.get('paymentGatewayStatus')}"
+                                    f" -- manual {self.advance_row.get('paymentThrough')}, UTR "
+                                    f"{self.advance_row.get('transactionId')}"} if self.advance_row else {}),
         }

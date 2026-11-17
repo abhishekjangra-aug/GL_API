@@ -87,7 +87,7 @@ request body, signature and domain rule stays defined once in `gold_loan/harness
   can hold several.
 - **`tests/test_offline_harness.py`** — offline regression suite, **no network and no extra deps** (there is
   no pytest here). `python tests/test_offline_harness.py [group-prefix]`. Request bodies are byte-compared
-  against `reference/*.har`; control flow is mock-driven. 275 tests (17 Nov; incl. groups `bt`, `cpv`, `kyc-address`, `audit`), groups: `kyc-body`, `kyc-verify`,
+  against `reference/*.har`; control flow is mock-driven. 282 tests (17 Nov; incl. groups `bt`, `cpv`, `kyc-address`, `audit`), groups: `kyc-body`, `kyc-verify`,
   `duplicate`, `profile`, `packets`, `appraiser`, `bank`, `resume`, `stage`, `batch`, `gateway`, `kyc-runner`. Node is required (CryptoJS tests).
   **This suite was mutation-tested** — the code was deliberately broken to confirm each test fails.
   When adding a KYC behaviour, add a test AND check a mutation trips it; the first version of the
@@ -518,6 +518,15 @@ The GL flow hands the loan between roles. Static OTP **1234** for all; each role
 
 ## Upload documents (`store_loan_documents`)
 - **Driven by `single-loan` (read first)**, exactly like the web app's UploadDocumentsComponent (source: portal bundle chunk `11.js`, `LipFormComponent` in `main.js`). Failure is now FATAL (it used to be swallowed, which hid LIP rejections).
+- **CPV document on upload docs** (`cpv_document_reasons` / `_cpv_document`, 17 Nov). Portal
+  UploadDocumentsComponent makes cpvImage REQUIRED when single-loan `totalOutstandingAmount` >
+  global-setting `intimationBankValidation.cpvLoanAmountLimit` (TEST 500000) or `customerLoanDocument
+  .isCpvEditable`; the harness also counts `isCpvPosThresholdCrossed` (`cpvPosThresholdLakhs`, TEST 1 →
+  loan form's "CPV Pending — Customer Outstanding Exceeds Threshold"). It sends `cpvImage`/`cpvImageFullUrl`:
+  `customer.cpvImage` if on file (the portal pre-fills it), else a PDF uploaded with reason 'loan' (the
+  page's 'cpv' upload). Before this fix it always sent null — and the SERVER ACCEPTED that (AUGM-48694,
+  6L outstanding, no CPV), so the gap was silent. The server stores it as customer.cpvImage (seen live:
+  AUGM-56505, 6L → customer.cpvImage = the uploaded PDF); the loan document's cpvImage stays null.
 - **LIP (Liquid Income Program) assessment** -> `lipForm` in the loan-documents body, only when `single-loan` `isLIPFormRequired` is true. The SERVER applies the thresholds from `/api/global-setting`: `IGLLIPApplicability` (TEST 1 -> every IGL loan) and `consumptionLipApplicability` (TEST 2000000 for CB). `lipForm` = the form's `getRawValue()`: borrower profile (loanUniqueId, customer name, `occupation.category`, occupationTypeOther (required for 'Others'), yearsInCurrentOccupation, purpose, assessmentDate), incomes (`salary`/`primaryBusinessIncome`/`agriculturalIncome`/`rentalAssetIncome`/`otherBusinessIncome`; the category's field is mandatory: Salary->salary, Self Employed->primaryBusinessIncome (+businessOperatingExpenses), Farmer / Agricultural Labourer->agriculturalIncome; fields the category disables are ''), expenses (householdLivingExpenses required), remarks 'Self-Declared', newLoanRequested=`loanAmount`, presentInterest (2dp), totalExistingOutstanding=`customer.tillDateOutstanding`, isOtherIncome, maker from the JWT, checker = `masterLoan.bm` when commentByBM != 'auto approved'. Computed totals are NOT sent.
 - **LIP eligibility** (when `LIPEligibilityValidation`): net monthly income > `currentLoanPresentInterest + presentInterest`. `_build_lip_form` declares income = obligation + expenses + 25000.
 - **IGL documents**: `--igl-docs N|all` (GOLD_LOAN_IGL_DOCS, default 1) distinct visible types, each with
@@ -712,7 +721,25 @@ first when no `--loan/--master-loan-id` is given, then drives any NEW loan with
   isCpvRequired / isStatementItrSsRequired at top level): 1 existing-bt-info, 2 ornament-details,
   3 scheme-details, 4 bank-details, 5 upload-document, 6-10 update-rating-rch/rh/zh/zah/ceo (server picks
   which; 3L/6.5L RCH only, 12L RCH+RH), 11 "Advance Transfer Initiated" (advanceRequestId) = END: the
-  next step is the finance advance-transfer approval -> ICICI payout; never driven.
+  next step is the finance advance-transfer approval. **Now driven, OFFLINE only**:
+  `--complete-advance` = AdvanceApprovalComponent.submitStatus(item,'transactionStatus','utr'):
+  `PUT advance-transfer/request-status?requestId=` `{status:"approved", paymentThrough:"NEFT|IMPS|RTGS",
+  transactionId:<UTR>, paymentGatewayId:<OFFLINE id>}`. Gateways from `GET payment-gateway/payout-details
+  ?module=Loan` (TEST: OFFLINE 7, RazorpayX 6, icici 5); the portal turns OFFLINE into "Approve with
+  NEFT/IMPS/RTGS". Result: status approved, paymentGatewayStatus completed, isTransactionCompleteManually
+  true → BT stage 12 "Advance Transfer Completed" (end of the BT; the portal stops its timer). Guards:
+  OFFLINE must exist, bank verified (bankVerificationStatus approved, !forOpsApproval), status processing.
+  The advance list is `GET advance-transfer/approval?search=<advance id>` (admin); `GET
+  advance-transfer/request-status` is a 404 (it's PUT-only).
+  - `--gold-loan`: the BT request (status `complete`) carries the gold loan, as the portal's Appraiser
+    Requests → Apply Loan (checkPermission: complete + loanApplicationAdd). Harness pin
+    `GOLD_LOAN_APPRAISER_REQUEST_ID` (`_use_pinned_appraiser_request`: customer's, ours, no masterLoan;
+    takes its branch) + `run_e2e_test` in a fresh suite, BT partner (10 ARVOG / 152 ROSHAN PARTNER).
+    Server links it: master loan `advanceTransfer {bTMoney, toBePaid, advanceBankTransfer}`; toBePaid =
+    loan net of charges − BT money (negative = customer owes: −300 Roshan, −10780 Arvog stamp duty).
+    The GL picks its own scheme + ornaments (not the BT's) — the server accepted it.
+  - Live 17 Nov: AUGM-BT-13332 complete in one run (adv 2212 → AUGM-82518); AUGM-BT-77380 (adv 2208 →
+    AUGM-48694). Someone had tried RazorpayX on 2208 earlier ("webhook token not found") — not the harness.
 - Bodies: see the module docstrings. Scheme: partner-scheme-amount/<branch>?isFromLoanTransfer=true,
   billing-cycle?tenure&isFromBt=true (`billingCycles[].value`), loan-scheme-calculator (truthy params only,
   loanType=BT, netWeightAfterPurity from the application) -> rows {schemeId, eligibilityAmount}.

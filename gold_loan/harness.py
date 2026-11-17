@@ -4090,9 +4090,45 @@ class GoldLoanApiTest:
         another branch does not help."""
         return await self.fetch_max_loan_limit()
 
+    async def _use_pinned_appraiser_request(self, request_id: str) -> None:
+        """GOLD_LOAN_APPRAISER_REQUEST_ID: put the loan on THIS appraiser request instead of creating
+        or reusing one -- e.g. a BT's request after "Advance Transfer Completed", where the portal's
+        Appraiser Requests list offers Apply Loan on the BT request itself. Resolved under the admin
+        scope (BT requests are only listed there); it must be the customer's and ours."""
+        saved = self.auth_token
+        try:
+            self.auth_token = await self._role_token("admin")
+            items = await self._list_appraiser_requests(search=self.customer_unique_id or "")
+        finally:
+            self.auth_token = saved
+        match = next((r for r in items or [] if str(r.get("id")) == str(request_id)), None)
+        if not match:
+            raise RuntimeError(f"Appraiser request {request_id} (GOLD_LOAN_APPRAISER_REQUEST_ID) is not one of "
+                               f"customer {self.customer_unique_id}'s requests.")
+        self._existing_request_appraiser_id = match.get("appraiserId")
+        if not self._existing_request_is_mine():
+            raise RuntimeError(f"Appraiser request {request_id} is assigned to appraiser {match.get('appraiserId')}, "
+                               f"not to this login ({self.logged_in_user_id or self.appraiser_id}).")
+        if match.get("masterLoan"):
+            raise RuntimeError(f"Appraiser request {request_id} already carries a loan "
+                               f"(masterLoan {(match.get('masterLoan') or {}).get('id')}).")
+        self.appraiser_request_id = str(request_id)
+        if match.get("internalBranchId"):
+            self.internal_branch_id = str(match["internalBranchId"])
+            self.request_branch_id = str(match["internalBranchId"])
+        bt = match.get("customerLoanBusinessTransfer") or {}
+        print(f"Using the pinned appraiser request {request_id} (status={match.get('status')}, branch "
+              f"{match.get('internalBranchId')})"
+              + (f" -- BT {bt.get('btUniqueId')} at '{(bt.get('customerBtStage') or {}).get('name')}'" if bt else "")
+              + ".")
+
     async def create_appraiser_request(self):
         api_path = "/api/appraiser-request"
         await self._fetch_appraisers()
+        pinned = (os.getenv("GOLD_LOAN_APPRAISER_REQUEST_ID") or "").strip()
+        if pinned:
+            await self._use_pinned_appraiser_request(pinned)
+            return
 
         request_body = {
             "id": None,
@@ -7512,6 +7548,43 @@ class GoldLoanApiTest:
         upload.setdefault('originalname', os.path.basename(upload['path']))
         return upload
 
+    def cpv_document_reasons(self, loan: dict) -> list:
+        """Why this loan's upload page needs the CPV document ([] = it does not).
+
+        UploadDocumentsComponent makes cpvImage REQUIRED when single-loan's totalOutstandingAmount is
+        above global-setting intimationBankValidation.cpvLoanAmountLimit (TEST: 500000), or when the
+        loan's customerLoanDocument.isCpvEditable is set. The customer-POS threshold
+        (cpvPosThresholdLakhs; single-loan isCpvPosThresholdCrossed -- the loan form's "CPV Pending --
+        Customer Outstanding Exceeds Threshold") is treated the same way, so a loan that crosses
+        either threshold always carries its CPV document."""
+        reasons = []
+        limit = (self.global_setting.get('intimationBankValidation') or {}).get('cpvLoanAmountLimit')
+        outstanding = loan.get('totalOutstandingAmount')
+        try:
+            if limit not in (None, "") and outstanding not in (None, "") and float(outstanding) > float(limit):
+                reasons.append(f"total outstanding {outstanding} > CPV loan-amount limit {limit}")
+        except (TypeError, ValueError):
+            pass
+        document = loan.get('customerLoanDocument') if isinstance(loan.get('customerLoanDocument'), dict) else {}
+        if document.get('isCpvEditable'):
+            reasons.append("the loan's CPV is editable (isCpvEditable)")
+        if loan.get('isCpvPosThresholdCrossed'):
+            reasons.append(f"customer POS {loan.get('cpvTotalOutstandingAmount')} crossed the CPV threshold "
+                           f"({self.global_setting.get('cpvPosThresholdLakhs')} lakh)")
+        return reasons
+
+    async def _cpv_document(self, loan: dict) -> dict:
+        """{cpvImage, cpvImageFullUrl} for loan-documents: the customer's CPV document on file (the
+        portal pre-fills it from customer.cpvImage), else a CPV PDF uploaded like the page's own
+        'cpv' upload (reason 'loan')."""
+        customer = loan.get('customer') if isinstance(loan.get('customer'), dict) else {}
+        if customer.get('cpvImage'):
+            path = customer['cpvImage']
+            return {"cpvImage": path, "cpvImageFullUrl": customer.get('cpvImageFullUrl') or f"{self.BASE_URL}/{path}",
+                    "_source": "the customer's CPV on file"}
+        upload = await self._upload_loan_pdf()
+        return {"cpvImage": upload['path'], "cpvImageFullUrl": upload['URL'], "_source": "uploaded CPV document"}
+
     async def store_loan_documents(self):
         api_path = "/api/loan-process/loan-documents"
 
@@ -7572,6 +7645,17 @@ class GoldLoanApiTest:
             upload = await self.upload_income_document()
             consumption_supporting_docs = [{"path": upload['path']}]
             print("Consumption supporting document uploaded (server flag showConsumptionSupportingDocs).")
+
+        # CPV document, whenever a CPV threshold is crossed (see cpv_document_reasons).
+        cpv_docs = {}
+        cpv_reasons = self.cpv_document_reasons(loan)
+        if cpv_reasons:
+            cpv = await self._cpv_document(loan)
+            cpv_docs = {"cpvImage": cpv["cpvImage"], "cpvImageFullUrl": cpv["cpvImageFullUrl"]}
+            print(f"CPV document required ({'; '.join(cpv_reasons)}): sending {cpv['_source']} {cpv['cpvImage']}.")
+        else:
+            print(f"CPV document not required (outstanding {loan.get('totalOutstandingAmount')}, limit "
+                  f"{(self.global_setting.get('intimationBankValidation') or {}).get('cpvLoanAmountLimit')}).")
 
         # LIP assessment, when the server says this loan needs one.
         self.lip_form = self._build_lip_form(loan) if loan.get('isLIPFormRequired') else None
@@ -7670,6 +7754,7 @@ class GoldLoanApiTest:
         }
         request_body.update(arvog_docs)
         request_body.update(stamp_paper_docs)
+        request_body.update(cpv_docs)
         async def send():
             return await self._make_authenticated_request('POST', api_path, json_data=request_body)
         # A rejected upload is FATAL: the loan cannot leave the upload-documents stage, so every
