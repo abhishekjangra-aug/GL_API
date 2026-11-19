@@ -2892,6 +2892,88 @@ def _():
 
 
 # --------------------------------------------------------------------------------------------
+# cpv-reupload: --reupload-cpv on basic details (BasicDetailsComponent.uploadCpvDocument)
+# --------------------------------------------------------------------------------------------
+
+def cpv_reupload_suite(cpv_on_file, flag=True, basic_details=None):
+    """A suite whose basic-details call is recorded; uploads record their reason."""
+    s = suite("manual")
+    s.reupload_cpv = flag
+    s.customer_id, s.appraiser_request_id = "9406", "15291"
+    s.age, s.dob = 30, "1990-01-01"
+    s.customer_loan_data = {"cpvImageFullUrl": "https://host/uploads/customer/cpv.pdf" if cpv_on_file else None}
+    calls = record_requests(s, lambda path: PURPOSES if "/api/purpose" in path
+                            else basic_details or {"loanId": 1, "masterLoanId": 2})
+    uploads = []
+    async def up(reason, file_type="image", document_type=None, is_mask=False, file_path_override=None):
+        uploads.append((reason, file_type))
+        return {"uploadFile": {"path": "uploads/customer/9406/re-cpv.pdf"}}
+    s._upload_file = up
+    return s, calls, uploads
+
+def basic_details_body(calls):
+    return next(b for m, p, b in calls if p == "/api/loan-process/basic-details")
+
+@test("cpv-reupload: with a CPV on file the document is uploaded (reason customer) and sent as reUploadCpv")
+def _():
+    s, calls, uploads = cpv_reupload_suite(cpv_on_file=True)
+    quiet(lambda: asyncio.run(s.store_loan_basic_details()))
+    close(s)
+    eq(uploads, [("customer", "pdf")], "the page's upload reason")
+    eq(basic_details_body(calls)["reUploadCpv"], "uploads/customer/9406/re-cpv.pdf", "basic-details reUploadCpv")
+    eq([p for m, p, b in calls if "re-upload-cpv-doc" in p], [], "a new loan needs no separate call")
+
+@test("cpv-reupload: skipped when the customer has no CPV on file ('CPV Done: No')")
+def _():
+    s, calls, uploads = cpv_reupload_suite(cpv_on_file=False)
+    quiet(lambda: asyncio.run(s.store_loan_basic_details()))
+    close(s)
+    eq(uploads, [], "nothing uploaded")
+    eq(basic_details_body(calls)["reUploadCpv"], None, "reUploadCpv stays null")
+
+@test("cpv-reupload: off by default -- reUploadCpv is null, as the page's untouched control")
+def _():
+    s, calls, uploads = cpv_reupload_suite(cpv_on_file=True, flag=False)
+    quiet(lambda: asyncio.run(s.store_loan_basic_details()))
+    close(s)
+    eq(uploads, [], "nothing uploaded")
+    eq(basic_details_body(calls)["reUploadCpv"], None, "reUploadCpv")
+
+@test("cpv-reupload: an already-initiated loan gets POST re-upload-cpv-doc on its master loan")
+def _():
+    s, calls, uploads = cpv_reupload_suite(cpv_on_file=True)
+    recorded = s._make_authenticated_request
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        if path == "/api/loan-process/basic-details":
+            await recorded(method, path, json_data)
+            raise http_error(400, {"message": "Your loan already initiated"}, path)
+        return await recorded(method, path, json_data)
+    s._make_authenticated_request = fake
+    async def found():
+        s.loan_id, s.master_loan_id = "14465", "12460"
+    s._find_and_set_existing_loan_ids = found
+    quiet(lambda: asyncio.run(s.store_loan_basic_details()))
+    close(s)
+    sent = [b for m, p, b in calls if p == "/api/loan-process/re-upload-cpv-doc"]
+    eq(sent, [{"masterLoanId": 12460, "reUploadCpv": "uploads/customer/9406/re-cpv.pdf", "customerId": 9406}],
+       "re-upload-cpv-doc body")
+
+@test("cpv-reupload: --reupload-cpv sets GOLD_LOAN_REUPLOAD_CPV and the batch reset clears the upload")
+def _():
+    os.environ["GOLD_LOAN_REUPLOAD_CPV"] = "true"
+    try:
+        s = suite("manual")
+    finally:
+        del os.environ["GOLD_LOAN_REUPLOAD_CPV"]
+    ok(s.reupload_cpv, "flag read from the environment")
+    s.reuploaded_cpv = "uploads/customer/1/x.pdf"
+    s._reset_for_next_loan()
+    close(s)
+    ok(not s.reuploaded_cpv, "per-loan re-upload cleared")
+    ok(s.reupload_cpv, "the run-wide flag survives the reset")
+
+
+# --------------------------------------------------------------------------------------------
 # server-sourced values: request fields come from earlier responses, as in the web app
 # --------------------------------------------------------------------------------------------
 
@@ -4856,7 +4938,7 @@ def _():
     async def role_token(role): return "tok-" + role
     s._role_token = role_token
     flow = BT.BtLoanFlow(s)
-    quiet(asyncio.run, flow.create_request())
+    quiet(asyncio.run, flow.create_request("new-only"))   # --new-bt: always the create call
     method, path, body = calls[0]
     eq((method, path), ("POST", "/api/appraiser-request"), "create call")
     eq(body["request"], "bt application", "BT marker")
@@ -5402,6 +5484,221 @@ def _():
     eq((args.audit_type, args.custodian), ("Open-audit", "bm"), "parsed")
     eq(audit_parser().parse_args([]).custodian, "appraiser", "default custodian")
 
+
+
+def _bureau_run(review, report):
+    s = suite()
+    s.master_loan_id = "12490"
+    sent = []
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        sent.append((method, path))
+        if path.endswith("/review"):
+            payload = {"data": review}
+        elif path.endswith("/report"):
+            payload = {"data": report}
+        elif path.startswith("/api/upload-file"):
+            payload = {"uploadFile": {"URL": "https://h/uploads/loan/b.pdf"}}
+        else:
+            payload = {}
+        class R:
+            def json(self_inner): return payload
+        return R()
+    s._make_authenticated_request = fake
+    extra = asyncio.run(quiet_async(s.bureau_for_ops_rating))
+    close(s)
+    return extra, sent, s.bureau_summary
+
+@test("bureau: report fetched + ops review required -> only the mandatory credit-bureau comment")
+def _():
+    extra, sent, summary = _bureau_run(
+        {"requiresOpsReview": True, "apiFailure": False, "scoreStatus": "NTC", "creditScore": None,
+         "bureauReportId": "CCR1"},
+        {"reportDocument": "https://h/r.pdf", "bureauProvider": "CRIF"})
+    eq(sorted(extra), ["commentOnCreditBureau"], "comment only")
+    ok(not any(p.startswith("/api/upload-file") for _, p in sent), "nothing uploaded")
+    ok("CRIF" in summary and "NTC" in summary and "CCR1" in summary, summary)
+
+@test("bureau: bureau API failed (no report) -> ops attaches a report: file, id, today, score 300-900")
+def _():
+    extra, sent, summary = _bureau_run({"requiresOpsReview": True, "apiFailure": True, "scoreStatus": None}, None)
+    rep = extra["bureauReport"]
+    eq((rep["reportDocument"], rep["reportDate"]), ("https://h/uploads/loan/b.pdf", __import__("datetime").date.today().isoformat()),
+       "uploaded file + today")
+    ok(rep["bureauReportId"].startswith("CRIF") and 300 <= rep["creditScore"] <= 900, str(rep))
+    ok("commentOnCreditBureau" in extra and summary.startswith("added by ops"), summary)
+
+@test("bureau: no review for the loan -> ops rating unchanged")
+def _():
+    extra, _, summary = _bureau_run(None, None)
+    eq((extra, summary), ({}, "no bureau review for this loan"), "nothing added")
+
+@test("bureau: flow type per loan type (portal checkBureau)")
+def _():
+    s = suite()
+    s.final_loan_amount, s.secured_top_up_amount, s.unsecured_top_up_amount = 400000, 0, 0
+    for kind, want in (("Fresh Loan", ("NEW_LOAN", 400000.0)), ("Renewal", None), ("Part Release", None),
+                       ("Top Up", ("TOP_UP", 0.0))):
+        s.loan_type = kind
+        eq(s._bureau_flow(), want, kind)
+    s.loan_type, s.secured_top_up_amount = "Renewal + Top Up", 5000
+    eq(s._bureau_flow(), ("RENEWAL_TOP_UP", 5000.0), "renewal with top-up")
+    close(s)
+
+
+@test("bt-flags: --until maps onto the stop flags; --all-steps turns every optional step on")
+def _():
+    def parsed(*argv):
+        args = bt_parser().parse_args(list(argv))
+        bt_validate(args, lambda m: (_ for _ in ()).throw(Fail(m)))
+        return (args.stop_before_documents, args.complete_advance, args.gold_loan)
+    eq(parsed("--until", "documents"), (True, False, False), "documents = stage 5")
+    eq(parsed("--until", "approvals"), (False, False, False), "approvals = stage 11 (default)")
+    eq(parsed("--until", "advance"), (False, True, False), "advance = stage 12")
+    eq(parsed("--until", "complete"), (False, True, True), "complete = gold loan")
+    eq(parsed("--gold-loan"), (False, True, True), "the old flag still works")
+    args = bt_parser().parse_args(["--customer", "9352", "--all-steps"])
+    bt_validate(args, lambda m: (_ for _ in ()).throw(Fail(m)))
+    eq((args.until, args.complete_cpv, args.reupload_cpv, args.gold_loan), ("complete", True, True, True), "all steps")
+    errors = []
+    bt_validate(bt_parser().parse_args(["--until", "documents", "--gold-loan"]), errors.append)
+    bt_validate(bt_parser().parse_args(["--all-steps", "--until", "documents"]), errors.append)
+    eq(len(errors), 2, f"conflicts refused: {errors}")
+
+
+def _bt_rows(*specs):
+    return [{"id": rid, "masterLoan": ml, "isProcessComplete": done,
+             "customerLoanBusinessTransfer": {"id": rid * 10, "btUniqueId": f"AUGM-BT-{rid}",
+                                              "customerBtStage": {"id": stage}}}
+            for rid, stage, ml, done in specs]
+
+@test("bt-reuse: --reuse-bt continues the customer's open BT without asking for a new request")
+def _():
+    from gold_loan.bt_loan import BtLoanFlow
+    s = suite()
+    s.customer_unique_id = "MWN4DZUY"
+    flow = BtLoanFlow(s)
+    async def rows(uid): return _bt_rows((300, 12, {"id": 1}, True), (200, 5, None, False))
+    posted = []
+    async def post(path, body): posted.append(path); return {}
+    flow._requests_for_customer, flow._post = rows, post
+    asyncio.run(quiet_async(flow.create_request, "reuse-first"))
+    eq((flow.bt_unique_id, flow.request_id, s.appraiser_request_id, flow.reused, posted),
+       ("AUGM-BT-200", "200", "200", True, []), "stage-5 BT reused; the finished one (gold loan made) skipped")
+    close(s)
+
+@test("bt-reuse: a stage-12 BT without a gold loan is reusable; finished ones are not")
+def _():
+    from gold_loan.bt_loan import BtLoanFlow
+    s = suite()
+    flow = BtLoanFlow(s)
+    async def rows12(uid): return _bt_rows((400, 12, None, False))
+    flow._requests_for_customer = rows12
+    eq(asyncio.run(flow.reusable_bt("X"))["id"], 400, "advance done, gold loan still to make")
+    async def done(uid): return _bt_rows((500, 12, {"id": 9}, True))
+    flow._requests_for_customer = done
+    eq(asyncio.run(flow.reusable_bt("X")), None, "nothing to continue")
+    close(s)
+
+@test("bt-reuse: --new-bt cannot be combined with --resume / --bt")
+def _():
+    errors = []
+    bt_validate(bt_parser().parse_args(["--customer", "X", "--new-bt", "--resume"]), errors.append)
+    bt_validate(bt_parser().parse_args(["--bt", "AUGM-BT-1", "--new-bt"]), errors.append)
+    eq(len(errors), 2, str(errors))
+
+
+@test("bt-reuse: default = a NEW request even with a BT in the applied list; the existing one only if refused")
+def _():
+    from gold_loan.bt_loan import BtLoanFlow
+    def run(refuse):
+        s = suite()
+        s.customer_unique_id = "MWN4DZUY"
+        flow = BtLoanFlow(s)
+        state = {"created": False}
+        async def rows(uid):
+            new = [(600, 1, None, False)] if state["created"] else []
+            return _bt_rows(*new, (200, 5, None, False))
+        async def post(path, body):
+            if refuse:
+                req = httpx.Request("POST", "http://h" + path)
+                raise httpx.HTTPStatusError("400", request=req, response=httpx.Response(
+                    400, request=req, json={"message": "Balance transfer is in process"}))
+            state["created"] = True
+            return {"message": "Request Created"}
+        async def no_appraisers(): return None
+        async def body(): return {"internalBranchId": 1}
+        flow._requests_for_customer, flow._post = rows, post
+        s._fetch_appraisers, s._appraiser_request_body = no_appraisers, body
+        asyncio.run(quiet_async(flow.create_request))
+        close(s)
+        return flow.bt_unique_id, flow.reused
+    eq(run(refuse=False), ("AUGM-BT-600", False), "the server allowed another: new BT used")
+    eq(run(refuse=True), ("AUGM-BT-200", True), "refused: the open BT from the applied list continued")
+
+
+@test("upload: a loan upload carries loanId=<master loan id> (else the server files it under loan/undefined/)")
+def _():
+    s = suite()
+    s.customer_id, s.master_loan_id = "9430", "14495"
+    seen = []
+    async def fake(method, path, json_data=None, params=None, files=None, headers=None):
+        seen.append(path)
+        class R:
+            def json(self_inner): return {"uploadFile": {"path": "uploads/loan/14495/x.png", "URL": "u", "originalname": "x.png"}}
+        return R()
+    s._make_authenticated_request = fake
+    asyncio.run(quiet_async(s._upload_file, "loan", "image"))
+    asyncio.run(quiet_async(s._upload_file, "customer", "image"))
+    ok("reason=loan" in seen[0] and "loanId=14495" in seen[0], seen[0])
+    ok("loanId=" not in seen[1], "other reasons unchanged: " + seen[1])
+    s.master_loan_id = ""
+    asyncio.run(quiet_async(s._upload_file, "loan", "image"))
+    ok("loanId=" not in seen[2], "no master loan yet -> no loanId")
+    close(s)
+
+
+@test("audit: a round purity is sent as 90 / 100, never '9E+1' / '1E+2'")
+def _():
+    from gold_loan.audit import AuditFlow
+    s = suite()
+    flow = AuditFlow(s, master_loan_id=1)
+    eq([flow._new_purity({"ltvPercent": v, "ltvRange": r}) for v, r in
+        (("91", ["90", "91"]), ("101", []), ("92.6", ["91.6", "92.6"]), ("100", ["99", "100"]))],
+       ["90", "100", "91.6", "99"], "plain numbers")
+    flow.purity_change = 1
+    eq(flow._new_purity({"ltvPercent": "91"}), "90", "explicit change too")
+    close(s)
+
+
+@test("ornaments: --ornaments / GOLD_LOAN_ORNAMENT_COUNT sets the new loan's count (1-20, default 4)")
+def _():
+    import types
+    from gold_loan.harness import validate_cli
+    s = suite()
+    os.environ.pop("GOLD_LOAN_ORNAMENT_COUNT", None)
+    eq(s.ornament_count(), 4, "default")
+    for value, want in (("15", 15), ("1", 1), ("20", 20)):
+        os.environ["GOLD_LOAN_ORNAMENT_COUNT"] = value
+        eq(s.ornament_count(), want, value)
+    for bad in ("0", "21", "x"):
+        os.environ["GOLD_LOAN_ORNAMENT_COUNT"] = bad
+        try:
+            s.ornament_count()
+        except ValueError:
+            pass
+        else:
+            raise Fail(f"{bad} must be refused")
+    os.environ.pop("GOLD_LOAN_ORNAMENT_COUNT", None)
+    close(s)
+    errors = []
+    base = dict(count=1, kyc="manual", customer=None, release_kyc_docs=False)
+    for n in (0, 21, 15):
+        args = types.SimpleNamespace(**base, ornaments=n)
+        try:
+            validate_cli(args, errors.append)
+        except Exception:
+            pass
+    eq(len([e for e in errors if "--ornaments" in e]), 2, f"0 and 21 refused, 15 fine: {errors}")
 
 
 def main():

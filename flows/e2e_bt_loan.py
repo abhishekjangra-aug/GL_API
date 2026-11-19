@@ -9,6 +9,16 @@
     python flows/e2e_bt_loan.py --rch-decision incomplete         # negative path at RCH
     python flows/e2e_bt_loan.py --gold-loan                       # COMPLETE: BT + manual advance + gold loan
     python flows/e2e_bt_loan.py --bt AUGM-BT-77380 --complete-advance   # stage 11 -> 12 only (manual NEFT + UTR)
+    python flows/e2e_bt_loan.py --customer 9352 --until documents       # numeric customer id, park at stage 5
+    python flows/e2e_bt_loan.py --customer MWK4X6YU --until complete    # same as --gold-loan
+    python flows/e2e_bt_loan.py --customer MWK4X6YU --all-steps         # every optional step, to the gold loan
+
+How far to go (--until; the older flags still work):
+  documents   stop at stage 5 "Upload Documents"           (= --stop-before-documents)
+  approvals   stop at stage 11 "Advance Transfer Initiated" (the default)
+  advance     + manual advance transfer -> stage 12         (= --complete-advance)
+  complete    + the gold loan on the BT's request           (= --gold-loan)
+--all-steps = --until complete + --complete-cpv + --reupload-cpv.
 
 Modes, mirroring the gold-loan flows:
   full (default)            customer -> KYC -> BT request -> existing loan -> ornaments -> scheme ->
@@ -44,6 +54,7 @@ from gold_loan.bt_loan import (  # noqa: E402
 BT_PARTNER_NAMES = {GoldLoanApiTest.ROSHAN_PARTNER_ID: "ROSHAN PARTNER", GoldLoanApiTest.ARVOG_PARTNER_ID: "ARVOG"}
 
 TENURES = ("30", "60", "90", "120", "150", "180")   # SharedService.loanTenure
+UNTIL_CHOICES = ("documents", "approvals", "advance", "complete")
 
 
 def build_parser():
@@ -53,13 +64,27 @@ def build_parser():
         epilog=__doc__.split("\n\n")[1])
     target = parser.add_mutually_exclusive_group()
     target.add_argument("--bt", metavar="AUGM-BT-XXXXX|ID", help="Resume this BT application.")
-    target.add_argument("--customer", metavar="UNIQUE_ID",
-                        help="Existing customer (default: create one with full KYC).")
+    target.add_argument("--customer", metavar="UNIQUE_ID|ID",
+                        help="Existing customer, by unique id (MWK4X6YU) or numeric customer id (9352) "
+                             "(default: create one with full KYC).")
     parser.add_argument("--resume", action="store_true",
                         help="With --customer: continue that customer's newest open BT instead of "
-                             "starting a new one.")
+                             "starting a new one (now the default for --customer; kept for old commands).")
+    request = parser.add_mutually_exclusive_group()
+    request.add_argument("--new-bt", action="store_true",
+                         help="With --customer: a NEW BT request only; never continue the customer's existing "
+                              "one (the run stops if the server refuses the new request).")
+    request.add_argument("--reuse-bt", action="store_true",
+                         help="With --customer: continue the customer's existing BT without asking for a new "
+                              "request first. (Default: ask for a new request, and continue the existing BT only "
+                              "when the server refuses it.)")
     parser.add_argument("--stop-before-documents", action="store_true",
-                        help="Stop when the BT reaches 'Upload Documents' (stage 5).")
+                        help="Stop when the BT reaches 'Upload Documents' (stage 5). Same as --until documents.")
+    parser.add_argument("--until", choices=UNTIL_CHOICES,
+                        help="How far to take the BT: documents (stage 5), approvals (stage 11, default), "
+                             "advance (stage 12, manual transfer), complete (+ gold loan).")
+    parser.add_argument("--all-steps", action="store_true",
+                        help="Every optional step: --until complete with --complete-cpv and --reupload-cpv.")
     parser.add_argument("--env", choices=sorted(GoldLoanApiTest.ENVIRONMENTS), default="test",
                         help="Target environment (default: test).")
     parser.add_argument("--login", default="appraiser", help="Role that runs the BT (default: appraiser).")
@@ -105,6 +130,21 @@ def build_parser():
 
 
 def validate(args, fail):
+    if args.all_steps:
+        if args.until not in (None, "complete"):
+            fail("--all-steps runs to the end; drop --until " + args.until)
+        args.until = "complete"
+        args.complete_cpv = args.reupload_cpv = True
+    if args.until:
+        if (args.stop_before_documents and args.until != "documents") or \
+                (args.gold_loan and args.until != "complete") or \
+                (args.complete_advance and args.until not in ("advance", "complete")):
+            fail(f"--until {args.until} conflicts with the other stop flags given")
+        args.stop_before_documents = args.until == "documents"
+        args.complete_advance = args.until in ("advance", "complete")
+        args.gold_loan = args.until == "complete"
+    if (args.new_bt or args.reuse_bt) and (args.resume or args.bt):
+        fail("--new-bt / --reuse-bt choose how a --customer BT starts; drop --resume / --bt")
     if args.resume and not args.customer:
         fail("--resume needs --customer (or use --bt)")
     if not 1 <= args.ornaments <= 20:
@@ -166,7 +206,9 @@ class BtLoanRun:
 
     async def run(self):
         args, suite, flow = self.args, self.suite, self.flow
-        mode = "STOP BEFORE DOCUMENTS" if args.stop_before_documents else "FULL"
+        mode = ("STOP BEFORE DOCUMENTS" if args.stop_before_documents else
+                "COMPLETE (WITH GOLD LOAN)" if args.gold_loan else
+                "TO ADVANCE COMPLETED" if args.complete_advance else "FULL")
         if args.bt or args.resume:
             mode = "RESUME" + (" (STOP BEFORE DOCUMENTS)" if args.stop_before_documents else "")
         suite._banner(f"BT LOAN - {mode}",
@@ -188,8 +230,9 @@ class BtLoanRun:
                                       "(stage < 11). Drop --resume to start a new one.")
             else:
                 await self._customer()
-                suite._log_step("BT Request (Start New BT Process)")
-                await flow.create_request()
+                suite._log_step("BT Request (Start New BT Process; the customer's existing BT if refused)")
+                await flow.create_request("new-only" if args.new_bt else
+                                          "reuse-first" if args.reuse_bt else "new-first")
 
             if args.complete_cpv:
                 suite._log_step(f"Customer CPV ({suite.customer_unique_id})")
@@ -309,8 +352,13 @@ def main():
     if args.fresh_login:
         os.environ["GOLD_LOAN_FRESH_LOGIN"] = "true"
     # A new customer must not be confused with a stale env choice; --customer sets it explicitly.
-    os.environ["GOLD_LOAN_EXISTING_CUSTOMER_UNIQUE_ID"] = args.customer or ""
-    os.environ.pop("GOLD_LOAN_EXISTING_CUSTOMER_ID", None)
+    # A purely numeric --customer is the customer id, anything else the unique id.
+    numeric = bool(args.customer and args.customer.strip().isdigit())
+    os.environ["GOLD_LOAN_EXISTING_CUSTOMER_UNIQUE_ID"] = "" if numeric else (args.customer or "")
+    if numeric:
+        os.environ["GOLD_LOAN_EXISTING_CUSTOMER_ID"] = args.customer.strip()
+    else:
+        os.environ.pop("GOLD_LOAN_EXISTING_CUSTOMER_ID", None)
     ok = asyncio.run(BtLoanRun(args).run())
     sys.exit(0 if ok else 1)
 

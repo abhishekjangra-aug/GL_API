@@ -441,6 +441,7 @@ This is the most fragile area. Rules verified empirically against captured reque
 ## Server-sourced request values (no hard-coded examples)
 Request fields are filled from earlier responses, mapped from the HAR (same key + value in a prior response):
 - **basic-details** <- `customer-loan-details` `customerData`: `branchName` (`internalBranch.name`), `tillDateOutstanding`, `currentActiveLoans`, `annualIncome` (`customerKycPersonal.annualIncome`), `age`. Stored as `self.customer_loan_data`.
+  `reUploadCpv` = null unless `--reupload-cpv` (GOLD_LOAN_REUPLOAD_CPV): BasicDetailsComponent.uploadCpvDocument (portal chunk 13.js) uploads reason `customer` -> path in the form's reUploadCpv; on an existing master loan also `POST loan-process/re-upload-cpv-doc {masterLoanId, reUploadCpv, customerId}`. The harness only does it when `cpvImageFullUrl` is set ("CPV Done: Yes").
 - **bank-details** <- `final-loan-details` response (`self.final_loan_details_data`): `getBalance.branchTotalHolding/branchTotalBlockedBalance/customerTransferBalance`, `getAdvanceCashParameters.totalLimitForCashDisbursal/multiModeDisbursement`, `actualProcessingCharge`, `upfrontInterestAmount`, `appraiserCharges` (-> `appraiserChargesPercentage` when `appraiserChargesApplied`), `stampDutyCharges`. `createdBy` = logged-in user id; `account` = null (as the UI).
 - **stamp duty**: the server's figure ALWAYS wins, 0 included (final-loan-details, else single-loan); `GOLD_LOAN_STAMP_DUTY` (default 0, as the portal) only when the server states none (ARVOG then errors instead). Live TEST proof: final-loan-details said 0 on an Augmont-branch Roshan loan and bank-details rejected 1500 with "To Be Paid amount is incorrect".
 - **generate-interest-table** <- check-loan-type: `securedExposure` (`posExposureAgainstScheme`), `securedprocessingCharge`, `upfrontInterestAmount`; `paymentFrequency` from `securedScheme.interestBillingCycleType` ("30Days" -> "30 Days").
@@ -771,6 +772,34 @@ first when no `--loan/--master-loan-id` is given, then drives any NEW loan with
 - Live TEST 17 Nov: CPV 69/70/71. A valid CPV is never redone; expired / isReKycInitiated -> new CPV.
 - BT documents: the application's own `cpvImage` is sent when present, else one is uploaded if
   isCpvRequired; that BT image lands on `customer.cpvImage` after approval (APNT-350 behaviour).
+
+## Credit bureau (APH-285) — `bureau_loan_check`, `bureau_for_ops_rating`, `verify_bureau_report`
+- Portal: LoanApplicationFormService (main.js) bureauLoanCheck / getBureauReview / getBureauReport;
+  InterestCalculatorComponent.checkBureau (chunk 13 in the 19 Nov build) runs the check in
+  calcInterestAmount; ApprovalComponent (main.js) stage 7: `bureauReviewRequired` (= review.requiresOpsReview)
+  makes `commentOnCreditBureau` mandatory; `canUploadBureauReport` = requiresOpsReview && (apiFailure ||
+  scoreStatus EXCLUDED/MANUAL_UPLOAD) → optional `bureauReport {reportDocument, bureauReportId, reportDate
+  YYYY-MM-DD, creditScore 300-900}` inside the ops-rating body (upload reason loan).
+- loan-check answer keys are `bureau*`-prefixed (bureauScoreStatus, bureauCreditScore, bureauApiFailure,
+  bureauRequiresOpsReview, bureauBlocked, bureauReportDocument...); review/report use plain keys.
+- Harness: check in `generate_interest_table` (fresh loans only — repayment new loans skip it), flow via
+  `_bureau_flow`; `add_ops_rating` merges `bureau_for_ops_rating()` (comment; manual report also when the
+  loan has no report at all) and then `verify_bureau_report`. Summary row "Bureau Report".
+- Live 19 Nov TEST: new customer → CRIF FRESH_PULL, scoreStatus NTC (no score), requiresOpsReview true,
+  report on file → comment only; review then shows opsRemarks/opsDecision approved. Manual-upload path
+  only offline-tested so far (group `bureau`).
+
+## Upload folders & renewal ornament photos (19 Nov)
+- The server files `upload-file?reason=loan` under `uploads/loan/<loanId>/` where **`loanId` = master
+  loan id** (portal SharedService.uploadFile maps data.masterLoanId → `loanId`). `masterLoanId=` is ignored
+  → `uploads/loan/undefined/`. `_upload_file` adds `&loanId={master_loan_id}` for reason loan; the cash
+  receipt and bureau uploads use `loanId=` too. The portal's own ornament uploads send only reason loan.
+- Renewal / top-up / part-release loans open with the parent's ornaments COPIED (`parentLoanOrnamentId`,
+  parent's photo path). `store_ornament_details` → `_store_inherited_ornaments` re-sends those ids with
+  fresh photos under the new master id, but **the server keeps the copied photo paths anyway** (live:
+  AUGM-01860 / 12503 still shows the parent's `uploads/loan/undefined/...`). Backend fix needed.
+- Audit purity: `AuditFlow._plain` — str(Decimal('90').normalize()) is '9E+1' and the server stored it
+  (AUGM-72139 → copied by renewal to AUGM-68150, AUGM-01860).
 
 ## Full E2E order (`run_e2e_test`)
 

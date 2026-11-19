@@ -298,6 +298,10 @@ class GoldLoanApiTest:
         # --release-kyc-docs / GOLD_LOAN_RELEASE_KYC_DOCS: free the identity profile's REAL PAN (and full
         # Aadhaar) on TEST/UAT before KYC, so --kyc auto can register them on a new customer again.
         self.release_kyc_docs = os.getenv("GOLD_LOAN_RELEASE_KYC_DOCS", "").lower() in ("1", "true", "yes")
+        # --reupload-cpv / GOLD_LOAN_REUPLOAD_CPV: re-upload the CPV document on basic details (the
+        # page's "Re-upload" next to "CPV Done"), only when the customer already has a CPV on file.
+        self.reupload_cpv = os.getenv("GOLD_LOAN_REUPLOAD_CPV", "").lower() in ("1", "true", "yes")
+        self.reuploaded_cpv = None        # the path sent as reUploadCpv, once uploaded
         # --record-har PATH / GOLD_LOAN_HAR_PATH: write every request/response of the run as a HAR 1.2
         # file (entry comment = the run step), e.g. to refresh reference/gold-loan-e2e-flow.har.
         self.har_path = os.getenv("GOLD_LOAN_HAR_PATH", "").strip()
@@ -310,6 +314,8 @@ class GoldLoanApiTest:
         self.submit_all_kyc_response = {}      # submit-all-kyc-info response (feeds the ops approval)
         self.loan_type = ''            # the loan's loanType (basic-details response / single-loan masterLoan)
         self.lip_form = None       # the LIP assessment sent with loan-documents, when the loan needs one
+        self.bureau_check = None   # credit-bureau/loan-check answer (APH-285)
+        self.bureau_summary = ""   # what happened with the bureau report, for the LOAN DETAILS table
         self.appraiser_id = ''
         self.appraiser_request_id = ''
         # An already-existing appraiser request is RESUMED by default; --fresh-request /
@@ -1972,6 +1978,11 @@ class GoldLoanApiTest:
                 raise ValueError(f"Unsupported file_type: {file_type}")
 
         api_path = f"/api/upload-file?reason={reason}&customerId={self.customer_id}"
+        if reason == "loan" and self.master_loan_id:
+            # The server files a loan upload under uploads/loan/<loanId>/ -- loanId is the MASTER
+            # loan id (SharedService.uploadFile maps data.masterLoanId to the `loanId` param).
+            # Without it the path reads uploads/loan/undefined/<file>.
+            api_path += f"&loanId={self.master_loan_id}"
         if document_type:
             api_path += f"&documentType={urllib.parse.quote(document_type)}"
 
@@ -4575,6 +4586,8 @@ class GoldLoanApiTest:
             "incomeGeneratingDocuments": None,
             "purposeType": self.purpose_type or "Consumption Based",  # from the chosen purpose's group
             "checkPointers": {},
+            # The form's reUploadCpv control (getRawValue sends it, null unless re-uploaded).
+            "reUploadCpv": await self._reupload_cpv_document(cld),
         }
         try:
             response = await self._make_authenticated_request(
@@ -4597,8 +4610,36 @@ class GoldLoanApiTest:
                 await self._find_and_set_existing_loan_ids()
                 if not self.loan_id or not self.master_loan_id:
                     raise RuntimeError(f"Failed to retrieve existing loan IDs for customer {self.customer_id} after 'loan already initiated' error.")
+                # The page re-uploads onto an existing master loan through its own call.
+                await self._send_cpv_reupload_to_loan()
             else:
                 raise # Re-raise other HTTP errors
+
+    async def _reupload_cpv_document(self, cld: dict):
+        """--reupload-cpv: BasicDetailsComponent.uploadCpvDocument. Uploads the CPV document
+        (reason 'customer') and returns its path for basic-details reUploadCpv; None when the flag
+        is off or the customer has no CPV on file (the page's "CPV Done: No",
+        customerData.cpvImageFullUrl empty)."""
+        if not self.reupload_cpv:
+            return None
+        if not cld.get('cpvImageFullUrl'):
+            print("CPV re-upload skipped: the customer has no CPV on file (basic details shows "
+                  "'CPV Done: No'); complete the CPV document first.")
+            return None
+        upload = await self._upload_file("customer", file_type="pdf")
+        self.reuploaded_cpv = upload['uploadFile']['path']
+        print(f"CPV re-upload: replacing {cld.get('cpvImageFullUrl')} with {self.reuploaded_cpv}.")
+        return self.reuploaded_cpv
+
+    async def _send_cpv_reupload_to_loan(self):
+        """The page's re-upload on a loan that already has a master loan:
+        POST loan-process/re-upload-cpv-doc {masterLoanId, reUploadCpv, customerId}."""
+        if not (self.reuploaded_cpv and self.master_loan_id):
+            return
+        await self._make_authenticated_request('POST', "/api/loan-process/re-upload-cpv-doc", json_data={
+            "masterLoanId": int(self.master_loan_id), "reUploadCpv": self.reuploaded_cpv,
+            "customerId": int(self.customer_id) if self.customer_id else None})
+        print(f"CPV re-upload sent to master loan {self.master_loan_id}.")
 
 
     async def _fetch_nominee_relations(self):
@@ -4812,8 +4853,80 @@ class GoldLoanApiTest:
             print(f"Fetch gold rate failed (non-fatal): {e.response.status_code}")
         return self.gold_rate
 
+    # The fields of one ornament in the ornaments form (OrnamentsComponent) -- what an inherited
+    # ornament is sent back with, read from the server's copy.
+    ORNAMENT_FORM_KEYS = (
+        "ornamentType", "ornamentTypeId", "quantity", "grossWeight", "netWeight", "deductionWeight",
+        "ornamentImage", "weightMachineZeroWeight", "withOrnamentWeight", "stoneTouch", "acidTest",
+        "karat", "ltvRange", "purityTest", "ltvPercent", "ltvAmount", "loanAmount", "id",
+        "currentLtvAmount", "ornamentImageData", "weightMachineZeroWeightData", "withOrnamentWeightData",
+        "stoneTouchData", "acidTestData", "purityTestImage", "ornamentFullAmount", "netWtAfterPurity",
+        "remark", "isReleased",
+    )
+
+    async def _inherited_ornaments(self) -> list:
+        """A renewal / top-up / part-release loan opens with the parent's ornaments COPIED by the
+        server (each carries parentLoanOrnamentId) -- the portal's ornaments form is filled from them.
+        Returns those (single-loan data.loanOrnamentsDetail), or [] for a fresh loan."""
+        if not self.loan_id:
+            return []
+        try:
+            loan = await self._loan_record()
+        except httpx.HTTPStatusError:
+            return []
+        rows = [o for o in (loan.get("loanOrnamentsDetail") or []) if isinstance(o, dict)]
+        return rows if any(o.get("parentLoanOrnamentId") for o in rows) else []
+
+    async def _store_inherited_ornaments(self, inherited: list):
+        """Send the inherited ornaments back as they are (same ids, weights, purity), each with a
+        NEW ornament photo uploaded under THIS loan's master id (uploads/loan/<masterLoanId>/...):
+        the server copies the parent's photo path into the new loan, so without a new upload a
+        renewal shows the parent's master id (or 'undefined' for photos uploaded without loanId)."""
+        api_path = "/api/loan-process/ornaments-details"
+        ornaments = []
+        for orn in inherited:
+            row = {k: orn.get(k) for k in self.ORNAMENT_FORM_KEYS}
+            upload = (await self._upload_file("loan", file_type="image",
+                                              file_path_override=self.random_asset("image")))["uploadFile"]
+            row["ornamentImage"] = upload["path"]
+            row["ornamentImageData"] = upload.get("URL") or f"{self.BASE_URL}/{upload['path']}"
+            ornaments.append(row)
+        request_body = {
+            "loanOrnaments": ornaments, "totalEligibleAmt": 0,
+            "loanId": int(self.loan_id), "masterLoanId": int(self.master_loan_id) if self.master_loan_id else None,
+            "fullAmount": 0, "checkPointers": {},
+            "latitude": self.latitude or None, "longitude": self.longitude or None,
+        }
+        resp_json = (await self._make_authenticated_request('POST', api_path, json_data=request_body)).json()
+        self._diagnostics['ornaments_details_response'] = resp_json
+        server_ornaments = self._extract_ornaments_from_response(resp_json)
+        if isinstance(resp_json, dict) and resp_json.get('netWtAfterPurity') is not None:
+            self.ornaments_total_nwap = float(resp_json['netWtAfterPurity'])
+        server_total = self._find_key_recursive(resp_json, 'totalEligibleAmt')
+        self.loan_ornaments_details = server_ornaments or ornaments
+        self.total_eligible_amount = float(server_total) if server_total is not None else 0
+        kept = [o.get("ornamentImage") for o in self.loan_ornaments_details if isinstance(o, dict)]
+        wrong = [k for k in kept if k and f"/loan/{self.master_loan_id}/" not in k]
+        print(f"Inherited ornaments re-sent with new photos under loan {self.master_loan_id}: "
+              f"{len(ornaments)} ornament(s), ids={[o.get('id') for o in ornaments]}"
+              + (f"; the server still holds other photo paths: {wrong}" if wrong else "."))
+
+    MAX_ORNAMENTS = 20   # the portal's ornaments form allows 20
+
+    def ornament_count(self) -> int:
+        """How many ornaments a NEW loan gets: GOLD_LOAN_ORNAMENT_COUNT (--ornaments), 1-20, default
+        4. The total weight is sized to the loan amount either way, so more ornaments means smaller
+        ones."""
+        raw = (os.getenv("GOLD_LOAN_ORNAMENT_COUNT") or "4").strip()
+        if not raw.isdigit() or not 1 <= int(raw) <= self.MAX_ORNAMENTS:
+            raise ValueError(f"GOLD_LOAN_ORNAMENT_COUNT must be 1-{self.MAX_ORNAMENTS}, not {raw!r}.")
+        return int(raw)
+
     async def store_ornament_details(self):
         api_path = "/api/loan-process/ornaments-details"
+        inherited = await self._inherited_ornaments()
+        if inherited:
+            return await self._store_inherited_ornaments(inherited)
 
         # Use the REAL gold rate (not a random one) so the server's eligibility calc is sane.
         await self._fetch_gold_rate()
@@ -4825,7 +4938,7 @@ class GoldLoanApiTest:
         ltv_gold_value = float(settings.get('ltvGoldValue') or 0)
         if ltv_gold_value <= 0:
             raise RuntimeError("Global setting ltvGoldValue is missing; the portal needs it to value ornaments.")
-        num_ornaments = 4  # fixed count; total weight is sized to the target loan below
+        num_ornaments = self.ornament_count()  # --ornaments / GOLD_LOAN_ORNAMENT_COUNT (default 4)
         loan_ornaments = []
 
         # Size the gold so eligibility (sum of netWtAfterPurity * schemeRpg) comfortably exceeds the
@@ -5428,7 +5541,129 @@ class GoldLoanApiTest:
         print('Get interest rate successful.')
 
 
+    def _bureau_flow(self):
+        """(flowType, amount) the portal's InterestCalculatorComponent.checkBureau sends, or None when
+        it skips the check (part release, transfer, renewal without top-up)."""
+        kind = (self.loan_type or "Fresh Loan").lower()
+        top_up = float(self.secured_top_up_amount or 0) + float(self.unsecured_top_up_amount or 0)
+        if "part" in kind or "transfer" in kind:
+            return None
+        if "renewal" in kind:
+            return ("RENEWAL_TOP_UP", top_up) if "top" in kind and top_up > 0 else None
+        if "top" in kind:
+            return "TOP_UP", top_up
+        return "NEW_LOAN", float(self.final_loan_amount or 0)
+
+    async def bureau_loan_check(self):
+        """APH-285: POST credit-bureau/loan-check before the interest table (the portal runs it in
+        calcInterestAmount). Like the portal, a failure never stops the loan; ops handles a missing
+        report at the ops rating (bureau_for_ops_rating)."""
+        flow = self._bureau_flow()
+        if not flow or not self.master_loan_id:
+            print("Bureau check skipped (the portal does not run it for this loan type).")
+            return None
+        flow_type, amount = flow
+        try:
+            answer = (await self._make_authenticated_request('POST', "/api/credit-bureau/loan-check", json_data={
+                "masterLoanId": int(self.master_loan_id), "newAmount": amount, "flowType": flow_type})).json()
+        except httpx.HTTPStatusError as e:
+            print(f"Bureau check failed ({e.response.status_code}: {self._short_error_body(e.response.text, 150)}); "
+                  "ops will handle the report.")
+            return None
+        data = answer.get("data") if isinstance(answer, dict) and isinstance(answer.get("data"), dict) else answer
+        self.bureau_check = data if isinstance(data, dict) else {}
+        c = self.bureau_check
+        print(f"Bureau check ({flow_type}, {amount}): required={c.get('isBureauCheckRequired')}, "
+              f"source={c.get('bureauSource')}, score={c.get('bureauCreditScore')}, "
+              f"status={c.get('bureauScoreStatus')}, apiFailure={c.get('bureauApiFailure')}, "
+              f"opsReview={c.get('bureauRequiresOpsReview')}, blocked={c.get('bureauBlocked')} "
+              f"-- {c.get('bureauMessage')}")
+        return self.bureau_check
+
+    async def _bureau_get(self, what: str):
+        """GET credit-bureau/loan/{id}/review|report -> its data, or None (the portal shows nothing
+        when these fail)."""
+        try:
+            answer = (await self._make_authenticated_request(
+                'GET', f"/api/credit-bureau/loan/{self.master_loan_id}/{what}")).json()
+        except httpx.HTTPStatusError as e:
+            print(f"Bureau {what} unavailable ({e.response.status_code}).")
+            return None
+        data = answer.get("data") if isinstance(answer, dict) else None
+        return data if isinstance(data, dict) else None
+
+    BUREAU_NO_REPORT_STATUSES = ("EXCLUDED", "MANUAL_UPLOAD")
+
+    async def bureau_for_ops_rating(self) -> dict:
+        """What the ops rating must carry for the bureau (ApprovalComponent, stage 7):
+        - review.requiresOpsReview -> commentOnCreditBureau is mandatory;
+        - no usable report (apiFailure, scoreStatus EXCLUDED / MANUAL_UPLOAD, or no report on the
+          loan) -> ops attaches one by hand: bureauReport {reportDocument (upload, reason loan),
+          bureauReportId, reportDate YYYY-MM-DD, creditScore 300-900}.
+        Returns the extra fields for the ops-rating body (empty when the loan needs nothing)."""
+        if not self.master_loan_id:
+            return {}
+        review = await self._bureau_get("review")
+        report = await self._bureau_get("report")
+        has_report = bool(report and report.get("reportDocument"))
+        if not review:
+            self.bureau_summary = ("report on file" if has_report else "no bureau review for this loan")
+            print(f"Bureau: {self.bureau_summary}.")
+            return {}
+        print(f"Bureau review: requiresOpsReview={review.get('requiresOpsReview')}, score={review.get('creditScore')}, "
+              f"status={review.get('scoreStatus')}, apiFailure={review.get('apiFailure')}, "
+              f"report={'yes' if has_report else 'no'}.")
+        extra = {}
+        if review.get("requiresOpsReview"):
+            extra["commentOnCreditBureau"] = (os.getenv("GOLD_LOAN_BUREAU_COMMENT")
+                                              or "Bureau report reviewed by operations (API test).")
+        no_report = (review.get("apiFailure") or review.get("scoreStatus") in self.BUREAU_NO_REPORT_STATUSES
+                     or not has_report)
+        if review.get("requiresOpsReview") and no_report:
+            upload_file = self.random_asset("pdf")
+            content_type = mimetypes.guess_type(upload_file)[0] or "application/pdf"
+            with open(upload_file, "rb") as fh:
+                uploaded = await self._make_authenticated_request(
+                    'POST', f"/api/upload-file?reason=loan&loanId={self.master_loan_id}",
+                    files={"avatar": (os.path.basename(upload_file), fh, content_type)})
+            url = ((uploaded.json() or {}).get("uploadFile") or {}).get("URL")
+            score = int(os.getenv("GOLD_LOAN_BUREAU_SCORE") or self.random.randint(700, 850))
+            if not 300 <= score <= 900:
+                raise ValueError(f"GOLD_LOAN_BUREAU_SCORE must be 300-900, not {score}.")
+            extra["bureauReport"] = {
+                "reportDocument": url,
+                "bureauReportId": f"CRIF{self.random.randint(10**9, 10**10 - 1)}",
+                "reportDate": datetime.date.today().isoformat(),
+                "creditScore": score,
+            }
+            why = ("the bureau API failed" if review.get("apiFailure") else
+                   f"score status {review.get('scoreStatus')}" if review.get("scoreStatus") in self.BUREAU_NO_REPORT_STATUSES
+                   else "no report on the loan")
+            print(self._c(f"Bureau report not fetched ({why}): ops attaches one by hand "
+                          f"(id {extra['bureauReport']['bureauReportId']}, score {score}).", "yellow"))
+            self.bureau_summary = f"added by ops ({why}; score {score})"
+        else:
+            score = review.get("creditScore")
+            self.bureau_summary = (
+                f"fetched from {(report or {}).get('bureauProvider') or 'bureau'} "
+                f"({review.get('scoreStatus') or 'no status'}"
+                f"{f', score {score}' if score is not None else ''}; report {review.get('bureauReportId')})"
+                + ("; ops remarks added" if review.get("requiresOpsReview") else "")
+                if has_report else "not required")
+        return extra
+
+    async def verify_bureau_report(self):
+        """After the ops rating: the loan must now have a bureau report when one was needed."""
+        if not self.master_loan_id or not self.bureau_summary.startswith("added by ops"):
+            return
+        report = await self._bureau_get("report")
+        if not (report and report.get("reportDocument")):
+            raise RuntimeError(f"Ops attached a bureau report to master loan {self.master_loan_id}, but "
+                               "credit-bureau/loan/{id}/report still has none.")
+        print(f"Bureau report on file after ops: id {report.get('bureauReportId')}, score {report.get('creditScore')}.")
+
     async def generate_interest_table(self):
+        await self.bureau_loan_check()
         api_path = "/api/loan-process/generate-interest-table"
         # Use the tenure/interest-rate/dates the server returned at check-loan-type (fall back to
         # defaults). The server bases the schedule on the scheme's tenure; a mismatched tenure makes
@@ -5824,7 +6059,7 @@ class GoldLoanApiTest:
         content_type = mimetypes.guess_type(receipt_file)[0] or "application/pdf"
         with open(receipt_file, "rb") as fh:
             uploaded = await self._make_authenticated_request(
-                'POST', f"/api/upload-file?reason=loan&masterLoanId={self.master_loan_id}",
+                'POST', f"/api/upload-file?reason=loan&loanId={self.master_loan_id}",
                 files={"avatar": (os.path.basename(receipt_file), fh, content_type)})
         upload = (uploaded.json() or {}).get("uploadFile") or {}
         plan.update(receiptPaths=[upload.get("path")], receiptUrls=[upload.get("URL")],
@@ -6100,12 +6335,14 @@ class GoldLoanApiTest:
             "goldValuationForOperatinalTeam": True,
             "loanStatusForOperatinalTeam": "approved",
         })
+        request_body.update(await self.bureau_for_ops_rating())   # APH-285: comment / manual report
         response = await self._make_authenticated_request(
             'POST',
             api_path,
             json_data=request_body
         )
         print('Add Ops rating successful.')
+        await self.verify_bureau_report()
 
     # 5-lakh threshold above which a Branch Manager approval (BM rating) is required.
     BM_RATING_THRESHOLD = 500000
@@ -8347,6 +8584,7 @@ class GoldLoanApiTest:
                               + (f" + cash {self.cash_given}" if self.cash_given else "")),
             "Packet": getattr(self, "_created_packet_unique", None) or "-",
             "LIP Assessment": lip,
+            "Bureau Report": self.bureau_summary or "-",
         }
 
     async def fetch_loan_details(self) -> dict:
@@ -8425,7 +8663,7 @@ class GoldLoanApiTest:
         "secured_exposure", "secured_rebate_interest", "loan_start_date", "loan_end_date",
         "max_loan_limit", "min_loan_amount", "max_loan_amount", "purpose_id", "purpose_type",
         "nominee_relation_id", "ornament_type_id", "karat_id", "reference_code",
-        "lead_converter_id", "cash_given", "bank_dummy_details",
+        "lead_converter_id", "cash_given", "bank_dummy_details", "reuploaded_cpv",
     )
 
     def _reset_for_next_loan(self) -> None:
@@ -8757,6 +8995,8 @@ def validate_cli(args, fail):
     """
     if args.count < 1:
         fail("--count must be at least 1")
+    if getattr(args, "ornaments", None) is not None and not 1 <= args.ornaments <= GoldLoanApiTest.MAX_ORNAMENTS:
+        fail(f"--ornaments must be 1-{GoldLoanApiTest.MAX_ORNAMENTS} (the portal allows {GoldLoanApiTest.MAX_ORNAMENTS})")
     releases_pan = args.kyc == "auto" and getattr(args, "release_kyc_docs", False)
     if args.count > 1 and args.kyc in ("auto", "ovd") and not args.customer and not releases_pan:
         # One real person's documents can only be registered against ONE customer, so a batch of
@@ -8870,6 +9110,10 @@ def main():
                         help="TEST/UAT only: before KYC, free the identity profile's REAL PAN (and full "
                              "Aadhaar) from the KYC records (POST /api/e-kyc/remove), so --kyc auto can "
                              "register them on a new customer again. Allows --kyc auto with --count > 1.")
+    parser.add_argument("--reupload-cpv", action="store_true",
+                        help="Re-upload the CPV document on basic details (the page's 'Re-upload' next to "
+                             "'CPV Done'), sent as reUploadCpv. Only for a customer whose CPV is done "
+                             "(a CPV document on file); otherwise it is skipped with a note.")
     parser.add_argument("--record-har", metavar="PATH",
                         help="Record every request/response of the run to a HAR 1.2 file at PATH "
                              "(tokens redacted), e.g. reference/gold-loan-e2e-flow.har.")
@@ -8877,6 +9121,9 @@ def main():
                         help="If an appraiser request already exists for the customer, cancel its "
                              "loan and create a new request. Default is to RESUME the existing "
                              "request when it is still in progress.")
+    parser.add_argument("--ornaments", type=int, metavar="N",
+                        help="Number of ornaments on the new loan, 1-20 (default 4). The total gold is "
+                             "sized to the loan amount, so more ornaments are each smaller.")
     parser.add_argument("--count", type=int, default=1, metavar="N",
                         help="Create N loans back to back in ONE logged-in session (default 1). "
                              "Every role logs in once for the whole batch, so the OTP endpoint's "
@@ -8899,6 +9146,8 @@ def main():
     os.environ["GOLD_LOAN_PARTNER_NAME"] = partner_env
     if args.amount:
         os.environ["GOLD_LOAN_AMOUNT"] = str(args.amount)
+    if args.ornaments is not None:
+        os.environ["GOLD_LOAN_ORNAMENT_COUNT"] = str(args.ornaments)
     if args.scheme:
         os.environ["GOLD_LOAN_SCHEME_ID"] = args.scheme
     if args.fresh_request:
@@ -8917,6 +9166,8 @@ def main():
         os.environ["GOLD_LOAN_HAR_PATH"] = args.record_har
     if args.release_kyc_docs:
         os.environ["GOLD_LOAN_RELEASE_KYC_DOCS"] = "true"
+    if args.reupload_cpv:
+        os.environ["GOLD_LOAN_REUPLOAD_CPV"] = "true"
     if args.purpose:
         os.environ["GOLD_LOAN_PURPOSE"] = args.purpose
 

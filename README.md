@@ -114,6 +114,7 @@ python flows/e2e_full_loan.py --env uat --customer MS35QNJP # existing customer,
 | `--igl-doc-files M` | `1` | IGL loans: PDFs per income document type (1–10). |
 | `--cash-amount N\|full` | *(off — all by bank)* | Pay part of the loan in **cash** at bank details (the portal's advance cash), the rest by bank; `full` = all in cash. |
 | `--release-kyc-docs`| off         | TEST/UAT: free the profile's real PAN (+ Aadhaar) before KYC — see below. |
+| `--reupload-cpv`    | off         | Re-upload the CPV document on basic details (the page's **Re-upload** by "CPV Done"), for a customer whose CPV is done. |
 | `--fresh-request`   | off         | Cancel an existing appraiser request's loan and start a new request. |
 | `--count N`         | `1`         | Create N loans back to back in one logged-in session.          |
 
@@ -323,9 +324,12 @@ All optional; sensible defaults are baked in. Common ones:
 | `GOLD_LOAN_PARTNER_USER_MOBILE`       | Partner-branch user for submit-packet (overrides the environment's) |
 | `GOLD_LOAN_AUTH_TOKEN`                | Supply a JWT to skip login (must contain `internalBranchId`, `id`) |
 | `GOLD_LOAN_AMOUNT`                    | Requested loan amount (also settable via `--amount`)       |
+| `GOLD_LOAN_ORNAMENT_COUNT`            | Ornaments on a new loan, 1–20 (default 4; `--ornaments`). Also used by resume / repayment / stop-before runners that create a loan |
 | `GOLD_LOAN_HTTP_TIMEOUT`              | Seconds to wait for a server reply (default `60`; httpx's own default of 5 s was too short) |
 | `GOLD_LOAN_TRANSFER_MODE`             | Disbursement transfer mode `neft` / `imps` / `rtgs` (also settable via `--transfer-mode`) |
 | `GOLD_LOAN_LOGIN_METHOD`              | `password` (password + MFA OTP; TEST default) or `otp` (UAT default) |
+| `GOLD_LOAN_BUREAU_SCORE`              | Credit score ops enters when attaching a bureau report by hand (300–900; default random 700–850) |
+| `GOLD_LOAN_BUREAU_COMMENT`            | The ops credit-bureau comment (when the bureau check needs ops review) |
 | `GOLD_LOAN_LOGIN_PASSWORD`            | Login password for every account (else `config/login_passwords.json`) |
 | `GOLD_LOAN_NEW_PASSWORD`              | Password to set when an account must enroll / be reset (else `"new_password"` in `config/login_passwords.json`) |
 | `GOLD_LOAN_PASSWORD_FALLBACK`         | `false` = stop on a rejected password instead of OTP login → enroll / reset (default `true`) |
@@ -335,6 +339,7 @@ All optional; sensible defaults are baked in. Common ones:
 | `GOLD_LOAN_SESSION_FILE`              | Where login sessions are saved (default `config/session_tokens.json`) |
 | `GOLD_LOAN_CASH_AMOUNT`               | Advance cash at bank details, rupees or `full` (also settable via `--cash-amount`; default none = all by bank) |
 | `GOLD_LOAN_RELEASE_KYC_DOCS`          | `true` = free the profile's real PAN (+ Aadhaar) before KYC, TEST/UAT only (also `--release-kyc-docs`) |
+| `GOLD_LOAN_REUPLOAD_CPV`              | `true` = re-upload the CPV document on basic details when the customer has one on file (also `--reupload-cpv`) |
 | `GOLD_LOAN_STAMP_DUTY`                | Stamp duty used **only** when the server states none (default `0`, as the portal) |
 | `GOLD_LOAN_CO_LENDER_OVERRIDE_REASON` | Reason sent when a server-default co-lender is overridden / declined |
 | `GOLD_LOAN_GATEWAY_RETRIES`           | Retries for 502/503/504 and lost replies on GETs and file uploads (default `3`) |
@@ -643,7 +648,22 @@ python flows/e2e_bt_loan.py --rch-decision incomplete        # negative path at 
 python flows/e2e_bt_loan.py --gold-loan                      # COMPLETE: BT -> manual advance -> gold loan
 python flows/e2e_bt_loan.py --bt AUGM-BT-77380 --complete-advance   # only stage 11 -> 12
 python flows/e2e_bt_loan.py --bt AUGM-BT-77380 --gold-loan   # finish a BT: advance (if needed) + gold loan
+python flows/e2e_bt_loan.py --customer 9428 --until documents      # numeric customer id; park at stage 5
+python flows/e2e_bt_loan.py --customer MWN4DZUY --until complete   # to the end (= --gold-loan)
+python flows/e2e_bt_loan.py --customer MWN4DZUY --all-steps        # every optional step, to the gold loan
 ```
+
+`--customer` takes the unique id (`MWN4DZUY`) or the numeric customer id (`9428`). `--until` says how far
+to go: `documents` (stage 5 "Upload Documents"), `approvals` (stage 11 "Advance Transfer Initiated", the
+default), `advance` (stage 12, manual NEFT/IMPS/RTGS + UTR) or `complete` (+ the gold loan on the BT's
+request). The older `--stop-before-documents`, `--complete-advance` and `--gold-loan` still work.
+`--all-steps` = `--until complete` with `--complete-cpv` and `--reupload-cpv`.
+
+With `--customer` the run first asks for a NEW BT request, even when the customer already has a BT in
+the applied BT list. Only if the server refuses it ("This customer's loan transfer is in process" /
+"already exists") does it continue the customer's existing BT (any stage up to 11, or stage 12 with no
+gold loan made on it yet); the summary then says "existing request continued". `--reuse-bt` continues
+the existing BT without asking for a new one; `--new-bt` asks for a new one and stops if it is refused.
 
 | Stage | Screen | Call |
 |---|---|---|
@@ -717,6 +737,26 @@ python flows/e2e_bt_loan.py --complete-cpv --amount 600000           # CPV first
 
 Verified live on TEST (17 Nov): CPV 69 (MWK4XHP4), 70 (MWK5D1YA), 71 (MWK69ORZ, followed by BT
 AUGM-BT-08613). Offline tests: group `cpv`.
+
+## Credit bureau report (APH-285)
+
+Every fresh loan runs the portal's credit-bureau check before the interest table:
+`POST /api/credit-bureau/loan-check {masterLoanId, newAmount, flowType}` (`NEW_LOAN`; `TOP_UP` /
+`RENEWAL_TOP_UP` use the top-up amount; part release, transfer and plain renewal skip it). A failed check
+never stops the loan, as in the portal.
+
+At the ops rating the harness reads `GET /api/credit-bureau/loan/{masterLoanId}/review` and `/report`:
+- If the review needs ops (`requiresOpsReview`), the ops rating carries the mandatory
+  `commentOnCreditBureau` (`GOLD_LOAN_BUREAU_COMMENT` overrides the text).
+- If no report was fetched (bureau API failure, score status `EXCLUDED` / `MANUAL_UPLOAD`, or no report
+  on the loan), ops attaches one by hand in the same ops rating, as the portal's upload section does:
+  `bureauReport {reportDocument (uploaded file), bureauReportId, reportDate (today), creditScore}`. The
+  score is random 700–850, or `GOLD_LOAN_BUREAU_SCORE` (300–900).
+- After the ops rating the run checks the loan now has a report, and the LOAN DETAILS table shows a
+  "Bureau Report" row.
+
+Live on TEST (19 Nov, AUGM-33480): CRIF returned a report for a new customer with status `NTC` (new to
+credit, no score), so ops review was required; the ops remarks were stored on the loan.
 
 ## How the harness mirrors the portal
 
@@ -873,8 +913,10 @@ and `flows/e2e_stop_before_disbursement.py` (stops after ops rating), which reus
 | `--transfer-mode` | `neft` \| `imps` \| `rtgs` | `neft` | Disbursement bank transfer mode: the portal's manual OFFLINE options, with a UTR (ICICI / RazorpayX payouts are not used). | `GOLD_LOAN_TRANSFER_MODE` |
 | `--cash-amount` | rupees \| `full` | *(off)* | Advance cash handed over at bank details; the bank transfer pays the rest (see *Cash at bank details*). | `GOLD_LOAN_CASH_AMOUNT` |
 | `--release-kyc-docs` | *(switch)* | off | TEST/UAT only: before KYC, free the identity profile's real PAN (and full Aadhaar) via `POST /api/e-kyc/remove`, so `--kyc auto` can register them again; allows `--kyc auto --count N`. | `GOLD_LOAN_RELEASE_KYC_DOCS=true` |
+| `--reupload-cpv` | *(switch)* | off | Basic details' CPV **Re-upload**: uploads a CPV document (reason `customer`) and sends it as `reUploadCpv`; an already-initiated loan also gets `POST /api/loan-process/re-upload-cpv-doc {masterLoanId, reUploadCpv, customerId}`. Only when the customer's CPV is done (`customerData.cpvImageFullUrl`, the page's "CPV Done: Yes"); otherwise skipped with a note. | `GOLD_LOAN_REUPLOAD_CPV=true` |
 | *(env only)* | `true`/`false` | `true` | If the default branch refuses a new appraiser request (e.g. "already Exists"), try the login's other branches (up to 3: its own branch first, then `GOLD_LOAN_REQUEST_BRANCHES`, e.g. `1,66`, then the rest) before reusing an existing request. | `GOLD_LOAN_REQUEST_OTHER_BRANCH=false` |
 | `--fresh-request` | *(switch)* | off | If the customer already has an appraiser request, cancel its loan and create a new request (default: resume it). | `GOLD_LOAN_FRESH_APPRAISER_REQUEST=true` |
+| `--ornaments` | 1–20 | `4` | Number of ornaments on the new loan. The total gold is sized to the loan amount, so more ornaments are each smaller. | `GOLD_LOAN_ORNAMENT_COUNT` |
 | `--count` | N | `1` | Create N loans back to back in one logged-in session. A failed loan does not stop the batch. | — |
 | `-h`, `--help` | | | Show the help text and exit. | |
 

@@ -431,10 +431,17 @@ class AuditFlow:
     def _new_purity(self, ornament) -> str:
         current = Decimal(str(ornament.get("ltvPercent") or 0))
         if self.purity_change is not None:
-            return str((current - Decimal(str(self.purity_change))).normalize())
+            return self._plain(current - Decimal(str(self.purity_change)))
         steps = sorted({Decimal(str(v)) for v in (ornament.get("ltvRange") or []) if str(v).strip()})
         lower = [v for v in steps if v < current]
-        return str((lower[-1] if lower else current - 1).normalize())
+        return self._plain(lower[-1] if lower else current - 1)
+
+    @staticmethod
+    def _plain(value: Decimal) -> str:
+        """A purity as the portal types it: 90, 91.6 -- never '9E+1' (str(Decimal('90').normalize())
+        is scientific notation, and the server stores that string as-is)."""
+        text = format(value.normalize(), "f")
+        return text.rstrip("0").rstrip(".") if "." in text else text
 
     def audited_ornaments(self) -> list:
         """The appraiser's ornaments as the auditor finds them: a little lighter (net weight down,

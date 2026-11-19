@@ -336,9 +336,50 @@ class BtLoanFlow:
                     return
         raise BtLoanError(f"BT {reference} was not found on env '{self.suite.env_name}'.")
 
-    async def create_request(self):
-        """'Start New BT Process': the new-request body + request='bt application'."""
+    @staticmethod
+    def _bt_stage(row) -> int:
+        return int(((row.get("customerLoanBusinessTransfer") or {}).get("customerBtStage") or {}).get("id") or 0)
+
+    async def reusable_bt(self, customer_unique_id):
+        """The customer's newest BT request that can still be continued: a BT below 'Advance
+        Transfer Completed' (stage 12), or at stage 12 with no gold loan made on it yet. None when
+        every BT of the customer is finished."""
+        for row in await self._requests_for_customer(customer_unique_id):
+            stage = self._bt_stage(row)
+            if stage >= ADVANCE_COMPLETED_STAGE and (row.get("masterLoan") or row.get("isProcessComplete")):
+                continue
+            return row
+        return None
+
+    def _take_row(self, row, how):
+        bt = row["customerLoanBusinessTransfer"]
+        self.request_id, self.bt_id, self.bt_unique_id = str(row["id"]), str(bt["id"]), bt.get("btUniqueId", "")
+        self.suite.appraiser_request_id = self.request_id
+        stage = self._bt_stage(row)
+        print(f"{how} BT {self.bt_unique_id} (id {self.bt_id}, appraiser request {self.request_id}), "
+              f"stage {stage}: {BT_STAGE_NAMES.get(stage, '?')}.")
+
+    REQUEST_MODES = ("new-first", "reuse-first", "new-only")
+
+    async def create_request(self, mode="new-first"):
+        """'Start New BT Process': the new-request body + request='bt application'.
+          new-first   (default) ask for a NEW BT request even when the customer has one in the
+                      applied BT list; only when the server refuses ("transfer is in process" /
+                      "already exists") continue the customer's existing BT.
+          reuse-first continue the customer's existing BT without asking for a new one (--reuse-bt).
+          new-only    a new request or nothing (--new-bt)."""
+        if mode is True or mode is False:          # older callers: reuse=True/False
+            mode = "reuse-first" if mode else "new-only"
+        if mode not in self.REQUEST_MODES:
+            raise BtLoanError(f"request mode must be one of {self.REQUEST_MODES}, not {mode!r}")
+        reuse = mode != "new-only"
         suite = self.suite
+        if mode == "reuse-first":
+            row = await self.reusable_bt(suite.customer_unique_id)
+            if row:
+                self._take_row(row, "The customer already has a BT request; continuing")
+                self.reused = True
+                return
         await suite._fetch_appraisers()
         body = await suite._appraiser_request_body()
         body["request"] = BT_REQUEST_MARKER
@@ -347,6 +388,12 @@ class BtLoanFlow:
         except httpx.HTTPStatusError as e:
             text = e.response.text or ""
             existing = ""
+            if reuse and ("transfer is in process" in text.lower() or "already exists" in text.lower()):
+                row = await self.reusable_bt(suite.customer_unique_id)
+                if row:
+                    self._take_row(row, "The server refused a new BT request; continuing the existing")
+                    self.reused = True
+                    return
             if "transfer is in process" in text.lower():
                 # One BT per customer at a time -- also after approval (stage 11), while the
                 # advance transfer is pending. Name the BT(s) so the user can resume one.
@@ -360,6 +407,7 @@ class BtLoanFlow:
                 f"The server refused a new BT request for {suite.customer_unique_id}: "
                 f"{e.response.status_code} {suite._short_error_body(text, 200)}.{existing} Resume an "
                 "open BT with --bt, or use another --customer (or none, to create one).") from None
+        self.reused = False
         print(f"BT request: {answer.get('message') or answer}")
         rows = await self._requests_for_customer(suite.customer_unique_id)
         if not rows:
@@ -696,7 +744,8 @@ class BtLoanFlow:
     def summary(self) -> dict:
         app = self.app
         return {
-            "BT application": f"{self.bt_unique_id} (id {self.bt_id})",
+            "BT application": f"{self.bt_unique_id} (id {self.bt_id})"
+                              + (" - existing request continued" if getattr(self, "reused", False) else ""),
             "Appraiser request": self.request_id or "-",
             "Stage": f"{self.stage} - {self.stage_name}",
             "Existing lender": (app.get("existingBtInfo") or {}).get("bankNbfcName") or "-",
