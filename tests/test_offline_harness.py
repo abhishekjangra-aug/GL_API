@@ -3490,6 +3490,24 @@ def _():
        "no assets folder: the built-in dummies")
     close(s)
 
+@test("upload-docs: an image whose content is another format (WebP named .png) is not uploaded")
+def _():
+    import tempfile
+    s = suite()
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "real.png"), "wb") as fh:
+            fh.write(b"\x89PNG\r\n\x1a\n" + b"\0" * 16)
+        with open(os.path.join(d, "fake.png"), "wb") as fh:
+            fh.write(b"RIFF\x0e\"\0\0WEBPVP8 " + b"\0" * 8)
+        with open(os.path.join(d, "photo.jpg"), "wb") as fh:
+            fh.write(b"\xff\xd8\xff\xe0" + b"\0" * 16)
+        s.ASSETS_DIR = d
+        eq(sorted(os.path.basename(p) for p in s.asset_pool("image")), ["photo.jpg", "real.png"],
+           "the WebP-in-.png file is left out; real PNG / JPEG stay")
+    for name in ("dummy_image.png",):
+        ok(s._image_content_matches(os.path.join(ROOT, "assets", name)), f"assets/{name} is a real PNG")
+    close(s)
+
 @test("upload-docs: a stamp-paper stamp duty sends the stamp paper copy")
 def _():
     body = run_loan_documents(single_loan(stampDutyDefinitionType="stampPaper"))

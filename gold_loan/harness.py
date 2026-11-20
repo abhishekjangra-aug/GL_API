@@ -1904,6 +1904,27 @@ class GoldLoanApiTest:
     PACKET_ASSET_MARKERS = ("pouch", "packet")      # packet photos (sealed-packet images)
     IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg")
 
+    # The upload API checks the file's real content against its extension (422 "File is not a
+    # valid PNG image"), so an image whose bytes are another format (e.g. a WebP named .png) is
+    # left out of the pool instead of failing the run.
+    IMAGE_SIGNATURES = {".png": (b"\x89PNG\r\n\x1a\n",), ".jpg": (b"\xff\xd8\xff",), ".jpeg": (b"\xff\xd8\xff",)}
+    _skipped_assets: set = set()
+
+    def _image_content_matches(self, path: str) -> bool:
+        ext = os.path.splitext(path)[1].lower()
+        try:
+            with open(path, "rb") as fh:
+                head = fh.read(8)
+        except OSError:
+            return False
+        if head.startswith(self.IMAGE_SIGNATURES.get(ext, (b"",))):
+            return True
+        if path not in self._skipped_assets:
+            self._skipped_assets.add(path)
+            print(f"[WARN] assets/{os.path.basename(path)} is not a real {ext[1:].upper()} file "
+                  f"(content does not match the extension); it is not used for uploads.")
+        return False
+
     def asset_pool(self, kind: str) -> list:
         """Files in assets/ usable for an upload of `kind`, read fresh each time so new files are
         picked up: 'pdf' = every PDF; 'image' = every image except the reserved identity / bank
@@ -1918,7 +1939,7 @@ class GoldLoanApiTest:
             pool = [full(n) for n in names if n.lower().endswith(".pdf")]
         else:
             images = [n for n in names if n.lower().endswith(self.IMAGE_EXTENSIONS)
-                      and n.lower() not in self.RESERVED_ASSETS]
+                      and n.lower() not in self.RESERVED_ASSETS and self._image_content_matches(full(n))]
             packets = [n for n in images if any(m in n.lower() for m in self.PACKET_ASSET_MARKERS)]
             if kind == "packet" and packets:
                 pool = [full(n) for n in packets]
