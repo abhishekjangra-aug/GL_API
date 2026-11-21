@@ -324,6 +324,7 @@ All optional; sensible defaults are baked in. Common ones:
 | `GOLD_LOAN_PARTNER_USER_MOBILE`       | Partner-branch user for submit-packet (overrides the environment's) |
 | `GOLD_LOAN_AUTH_TOKEN`                | Supply a JWT to skip login (must contain `internalBranchId`, `id`) |
 | `GOLD_LOAN_AMOUNT`                    | Requested loan amount (also settable via `--amount`)       |
+| `GOLD_LOAN_STOP_AT_LOAN_LIMIT`        | `true` = stop when `max-loan-limit` says "five active loans". Default `false`: only a warning, because the server still creates the loan (UAT, 21 Nov: MPV3Z7LR with 24 active loans got AUGM-32749). If basic-details then refuses, the run stops and names the rule |
 | `GOLD_LOAN_ORNAMENT_COUNT`            | Ornaments on a new loan, 1–20 (default 4; `--ornaments`). Also used by resume / repayment / stop-before runners that create a loan |
 | `GOLD_LOAN_HTTP_TIMEOUT`              | Seconds to wait for a server reply (default `60`; httpx's own default of 5 s was too short) |
 | `GOLD_LOAN_TRANSFER_MODE`             | Disbursement transfer mode `neft` / `imps` / `rtgs` (also settable via `--transfer-mode`) |

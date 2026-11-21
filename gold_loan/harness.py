@@ -30,8 +30,8 @@ class KycDocumentAlreadyExistsError(Exception):
 
 
 class LoanLimitReachedError(RuntimeError):
-    """max-loan-limit refused: the customer already has five active loans (counted in the branch
-    of their current appraiser request)."""
+    """The customer's new loan was refused because of the five-active-loans rule: max-loan-limit
+    said so AND the loan itself could not be created (or GOLD_LOAN_STOP_AT_LOAN_LIMIT=true)."""
 
 
 class GoldLoanApiTest:
@@ -422,6 +422,7 @@ class GoldLoanApiTest:
         self.loan_start_date = ""
         self.loan_end_date = ""
         self.max_loan_limit = 0.0  # From loan-process/max-loan-limit
+        self.loan_limit_refusal = None  # max-loan-limit "five active loans" message (only a warning)
         self.available_packet = {}  # From packet/available-packet
         self.packet_prepared = False  # True once prepare_packet generated this run's packet
         self.lead_converter_id = ''  # From lead/lead-converter
@@ -4116,11 +4117,15 @@ class GoldLoanApiTest:
         }
 
     async def ensure_loan_allowed(self):
-        """max-loan-limit for the current request. A refusal ("five active loans") stops the run:
-        the rule counts ALL the customer's active loans, in every branch -- verified 13 Nov on TEST,
-        where MSSU4GTG was refused in branches 1, 152, 40, 76 and 72 alike -- so moving the request to
-        another branch does not help."""
+        """max-loan-limit for the current request. A "five active loans" refusal is only a warning
+        (see fetch_max_loan_limit): the server still creates the loan."""
         return await self.fetch_max_loan_limit()
+
+    @property
+    def stop_at_loan_limit(self) -> bool:
+        """GOLD_LOAN_STOP_AT_LOAN_LIMIT=true: stop the run as soon as max-loan-limit says
+        "five active loans" (the old behaviour). Default false: warn and carry on."""
+        return os.getenv("GOLD_LOAN_STOP_AT_LOAN_LIMIT", "false").strip().lower() in ("1", "true", "yes")
 
     async def _use_pinned_appraiser_request(self, request_id: str) -> None:
         """GOLD_LOAN_APPRAISER_REQUEST_ID: put the loan on THIS appraiser request instead of creating
@@ -4626,13 +4631,24 @@ class GoldLoanApiTest:
             self.basic_details_response = resp_json if isinstance(resp_json, dict) else {}
             print(f'Loan basic details stored successfully. Loan ID: {self.loan_id}, Master Loan ID: {self.master_loan_id}')
         except httpx.HTTPStatusError as e:
+            limit = getattr(self, "loan_limit_refusal", None)
             if e.response.status_code == 400 and "Your loan already initiated" in e.response.text:
                 print(f"Loan for customer {self.customer_id} is already initiated. Attempting to retrieve existing loan IDs.")
                 await self._find_and_set_existing_loan_ids()
+                if (not self.loan_id or not self.master_loan_id) and limit:
+                    raise LoanLimitReachedError(
+                        f"Customer {self.customer_unique_id or self.customer_id}: basic-details refused the new "
+                        f"loan ({self._short_error_body(e.response.text, 150)}) and no loan exists on the request, "
+                        f"after max-loan-limit said: {limit} Close one of their active loans or use another "
+                        "customer.") from None
                 if not self.loan_id or not self.master_loan_id:
                     raise RuntimeError(f"Failed to retrieve existing loan IDs for customer {self.customer_id} after 'loan already initiated' error.")
                 # The page re-uploads onto an existing master loan through its own call.
                 await self._send_cpv_reupload_to_loan()
+            elif e.response.status_code == 400 and limit:
+                raise LoanLimitReachedError(
+                    f"Customer {self.customer_unique_id or self.customer_id}: basic-details refused the new loan "
+                    f"({self._short_error_body(e.response.text, 150)}), after max-loan-limit said: {limit}") from None
             else:
                 raise # Re-raise other HTTP errors
 
@@ -6842,13 +6858,21 @@ class GoldLoanApiTest:
             text = e.response.text or ""
             if e.response.status_code == 400 and "active loan" in text.lower():
                 # "You have five active loans in the system. As per bank rule, for the new loan
-                # creation you must close a previous active loan." Every later step would fail with
-                # a misleading "loan already initiated", so stop here and say why.
-                raise LoanLimitReachedError(
-                    f"Customer {self.customer_unique_id or self.customer_id} cannot take a new loan: "
-                    f"{self._short_error_body(text, 200)} Close one of their active loans (e.g. "
-                    "flows/e2e_repayment.py --scenario full-release --loan AUGM-...) or use another "
-                    "customer.") from None
+                # creation you must close a previous active loan." The portal only shows this; the
+                # server still creates the loan (21 Nov, UAT: MPV3Z7LR has 24 active loans and
+                # AUGM-32749 was created that day). So warn and carry on; basic-details is where a
+                # real refusal would show (store_loan_basic_details then names this rule).
+                self.loan_limit_refusal = self._short_error_body(text, 200)
+                if self.stop_at_loan_limit:
+                    raise LoanLimitReachedError(
+                        f"Customer {self.customer_unique_id or self.customer_id} cannot take a new loan: "
+                        f"{self.loan_limit_refusal} (GOLD_LOAN_STOP_AT_LOAN_LIMIT=true). Close one of "
+                        "their active loans (flows/e2e_repayment.py --scenario full-release --loan "
+                        "AUGM-...) or use another customer.") from None
+                print(f"[WARN] max-loan-limit refused for customer {self.customer_unique_id or self.customer_id}: "
+                      f"{self.loan_limit_refusal} Carrying on -- the server still lets the loan be created "
+                      "(set GOLD_LOAN_STOP_AT_LOAN_LIMIT=true to stop here instead).")
+                return {}
             print(f"Fetch max loan limit failed (non-fatal): {e.response.status_code}")
             return {}
 
@@ -8856,7 +8880,7 @@ class GoldLoanApiTest:
                 await self._use_existing_customer()
                 if await self._existing_customer_kyc_ready():
                     print("Existing customer KYC is already approved — skipping KYC, going to the loan process.")
-                    await self.fetch_max_loan_limit()   # stop before creating anything if the customer is capped
+                    await self.fetch_max_loan_limit()   # warns if capped (stops with GOLD_LOAN_STOP_AT_LOAN_LIMIT=true)
                     await self._prepare_loan_fields_from_existing()
                 else:
                     self._log_step(f"KYC Process (existing customer, status={self.kyc_status or 'unknown'})")
@@ -8880,7 +8904,7 @@ class GoldLoanApiTest:
             self._log_step("Appraiser Request & Loan Basics")
             await self.create_appraiser_request()
             await self.track_loan_history(3)  # Assuming action 3 is a relevant tracking step
-            await self.ensure_loan_allowed()   # max-loan-limit; moves the request to another branch if capped
+            await self.ensure_loan_allowed()   # max-loan-limit; a "five active loans" refusal only warns
             await self.fetch_customer_loan_details()
             await self.store_loan_basic_details()
             await self.fetch_rating_reasons()

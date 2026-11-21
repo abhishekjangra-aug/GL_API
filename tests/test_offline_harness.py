@@ -4648,7 +4648,7 @@ def _():
     close(s)
 
 
-@test("loan-limit: 'five active loans' from max-loan-limit stops the run with the reason")
+@test("loan-limit: 'five active loans' from max-loan-limit only warns; GOLD_LOAN_STOP_AT_LOAN_LIMIT stops")
 def _():
     s = suite()
     s.customer_id, s.customer_unique_id = "8703", "MSSU4GTG"
@@ -4659,12 +4659,18 @@ def _():
         raise httpx.HTTPStatusError("400", request=req, response=httpx.Response(
             400, request=req, json={"message": msg}))
     s._make_authenticated_request = fake
+    os.environ.pop("GOLD_LOAN_STOP_AT_LOAN_LIMIT", None)
+    eq(asyncio.run(quiet_async(s.fetch_max_loan_limit)), {}, "default: carry on")
+    ok(s.loan_limit_refusal and "five active loans" in s.loan_limit_refusal, "the refusal is remembered")
+    os.environ["GOLD_LOAN_STOP_AT_LOAN_LIMIT"] = "true"
     try:
         asyncio.run(quiet_async(s.fetch_max_loan_limit))
     except RuntimeError as e:
         ok("MSSU4GTG" in str(e) and "five active loans" in str(e), str(e))
     else:
-        raise Fail("must stop")
+        raise Fail("must stop with GOLD_LOAN_STOP_AT_LOAN_LIMIT=true")
+    finally:
+        os.environ.pop("GOLD_LOAN_STOP_AT_LOAN_LIMIT", None)
     async def other(method, path, json_data=None, params=None, files=None, headers=None):
         req = httpx.Request(method, "http://h" + path)
         raise httpx.HTTPStatusError("500", request=req, response=httpx.Response(500, request=req, text="boom"))

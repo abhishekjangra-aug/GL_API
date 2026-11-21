@@ -382,8 +382,13 @@ Set `GOLD_LOAN_EXISTING_CUSTOMER_UNIQUE_ID` or `..._ID`. In `run_e2e_test`:
   **Five-active-loans rule (max-loan-limit 400, `isFiveLoanActive`) is CUSTOMER-WIDE, not per branch:**
   13 Nov MSSU4GTG was refused in branches 1, 152, 40, 76, 72 (0 loans in the last three), and moving the
   request created 4 empty requests that can't be deleted (no cancel/delete endpoint for appraiser
-  requests). So `fetch_max_loan_limit` raises `LoanLimitReachedError` and the run stops — for an existing
-  customer right after loading it, before any request. Global `maxActiveLoans` (2690) is not it.
+  requests). Global `maxActiveLoans` (2690) is not it.
+  **BUT the refusal is advisory (21 Nov, UAT):** MPV3Z7LR (customerId 12223) has 24 active disbursed loans,
+  max-loan-limit 400s `isFiveLoanActive`, and the user still created AUGM-32749 that day through the portal.
+  So `fetch_max_loan_limit` now only WARNS (stores `loan_limit_refusal`) and the run carries on;
+  `store_loan_basic_details` raises `LoanLimitReachedError` only if basic-details then refuses.
+  `GOLD_LOAN_STOP_AT_LOAN_LIMIT=true` (`stop_at_loan_limit`) restores the old stop-at-once. The 13 Nov TEST
+  "Your loan already initiated" seen after the refusal was on a REUSED request that already had a loan.
   The ladder prefers `login_branch_id` (JWT branch, set in `_after_login`) — `internal_branch_id` can
   already be the customer's branch by then. The
   ladder now skips the branch in the request body (the customer's), not the login's branch — the
