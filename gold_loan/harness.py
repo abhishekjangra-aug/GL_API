@@ -6773,6 +6773,26 @@ class GoldLoanApiTest:
               f"(id={self.available_packet.get('id') if isinstance(self.available_packet, dict) else None}, "
               f"assigned to appraiser {appraiser_id}).")
 
+    def _ornaments_from_loan_record(self, single: dict) -> None:
+        """The packet's ornamentsId must name the loan's ornaments: an empty list seals the packet
+        with NO jewel linked (no packetOrnament rows), and every repayment / release screen then
+        shows no jewel details. A loan resumed at assign packet (e.g. made on mobile up to that
+        step) has no ornaments in memory, so take them from single-loan's loanOrnamentsDetail.
+        The record's ids win over memory -- they are what the server will link."""
+        data = (single or {}).get("data") if isinstance(single, dict) else None
+        server = [o for o in ((data or {}).get("loanOrnamentsDetail") or [])
+                  if isinstance(o, dict) and o.get("id") and not o.get("isReleased")]
+        if server:
+            if not self.loan_ornaments_details:
+                print(f"Assign packet: took the loan's {len(server)} ornament(s) from the server "
+                      f"(ids={[o['id'] for o in server]}) -- none were held in memory (resumed loan).")
+            self.loan_ornaments_details = server
+        if not any(isinstance(o, dict) and o.get("id") for o in (self.loan_ornaments_details or [])):
+            raise RuntimeError(
+                f"Assign packet for loan {self.loan_id}: the loan has no ornaments to put in the packet "
+                "(single-loan loanOrnamentsDetail is empty). Sealing it would leave the jewels unlinked; "
+                "add the ornaments first (resume from 'ornaments').")
+
     async def add_packet_images(self):
         # The packet is normally generated up front by prepare_packet (start of the run). Create +
         # assign it here only when that did not happen (e.g. a resumed loan). Packet CREATE + ASSIGN
@@ -6782,7 +6802,8 @@ class GoldLoanApiTest:
         # Fall back to available-packet only if the created packet couldn't be resolved from the listing.
         if not (isinstance(self.available_packet, dict) and self.available_packet.get("id")):
             await self.fetch_available_packet()
-        await self.fetch_single_loan()
+        single = await self.fetch_single_loan()
+        self._ornaments_from_loan_record(single)
 
         api_path = "/api/loan-process/add-packet-images"
         empty_packet_image = await self._upload_file_base(file_type="packet")

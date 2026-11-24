@@ -5694,6 +5694,25 @@ def _():
     close(s)
 
 
+@test("ornaments: assign packet on a resumed loan links the server's ornaments (never an empty ornamentsId)")
+def _():
+    s = suite()
+    s.loan_id = "12254"
+    s.loan_ornaments_details = []
+    single = {"data": {"loanOrnamentsDetail": [
+        {"id": 22390, "ornamentType": {"name": "Chain"}, "isReleased": False},
+        {"id": 22391, "ornamentType": {"name": "Ring"}, "isReleased": True}]}}
+    quiet(s._ornaments_from_loan_record, single)
+    eq([o["id"] for o in s.loan_ornaments_details], [22390], "the loan's unreleased ornaments are used")
+    s.loan_ornaments_details = []
+    try:
+        quiet(s._ornaments_from_loan_record, {"data": {"loanOrnamentsDetail": []}})
+    except RuntimeError as e:
+        ok("no ornaments" in str(e), str(e))
+    else:
+        raise Fail("must not seal a packet with no ornaments")
+    close(s)
+
 @test("ornaments: --ornaments / GOLD_LOAN_ORNAMENT_COUNT sets the new loan's count (1-20, default 4)")
 def _():
     import types
