@@ -405,19 +405,25 @@ class RepaymentScenarios:
                      "full-release": "/api/jewellery-release/full-release"}
     OPEN_STATUSES = ("pending", "completed")   # amountStatus of a request still in progress
 
+    # The lists' default view shows only requests still awaiting the amount approval (UAT 24 Nov:
+    # after amount-status the full release vanished from the default list); the approved ones are
+    # under amountStatus=completed, where assign-releaser / assign-appraiser find them.
+    LIST_FILTERS = ({}, {"amountStatus": "completed"})
+
     async def _scan_requests(self):
         path = self.REQUEST_LISTS[self.scenario]
-        for page in range(1, 9):
-            body = await self._get(path, **{"from": (page - 1) * 25 + 1, "to": page * 25})
-            rows = body.get("data") or []
-            for row in rows:
-                if str(row.get("masterLoanId")) != self.master_loan_id:
-                    continue
-                if self.request_id is not None and str(row.get("id")) != str(self.request_id):
-                    continue
-                return row
-            if len(rows) < 25:
-                return None
+        for extra in self.LIST_FILTERS:
+            for page in range(1, 9):
+                body = await self._get(path, **{"from": (page - 1) * 25 + 1, "to": page * 25}, **extra)
+                rows = body.get("data") or []
+                for row in rows:
+                    if str(row.get("masterLoanId")) != self.master_loan_id:
+                        continue
+                    if self.request_id is not None and str(row.get("id")) != str(self.request_id):
+                        continue
+                    return row
+                if len(rows) < 25:
+                    break
         return None
 
     async def find_request(self, required=True):
@@ -475,13 +481,18 @@ class RepaymentScenarios:
         Read as admin: the lists are branch-scoped and admin sees every branch."""
         async def scan():
             found = []
+            seen = set()
             for kind, path in self.HISTORY_LISTS:
-                for page in range(1, 9):
-                    rows = (await self._get(path, **{"from": (page - 1) * 25 + 1, "to": page * 25})
-                            ).get("data") or []
-                    found += [(kind, r) for r in rows if str(r.get("masterLoanId")) == self.master_loan_id]
-                    if len(rows) < 25:
-                        break
+                for extra in self.LIST_FILTERS:      # pending ones, then the approved ones
+                    for page in range(1, 9):
+                        rows = (await self._get(path, **{"from": (page - 1) * 25 + 1, "to": page * 25},
+                                                **extra)).get("data") or []
+                        for r in rows:
+                            if str(r.get("masterLoanId")) == self.master_loan_id and (kind, r.get("id")) not in seen:
+                                seen.add((kind, r.get("id")))
+                                found.append((kind, r))
+                        if len(rows) < 25:
+                            break
             return found
         return await self._as_role("admin", scan)
 

@@ -3205,7 +3205,8 @@ def _():
     o = body["loanOrnaments"][0]
     eq((body["totalEligibleAmt"], o["currentLtvAmount"], o["ltvPercent"], o["purityReading"]),
        (0, 9255.0, "95", None), "portal ornament values")
-    eq(float(o["netWtAfterPurity"]), round(float(o["netWeight"]) * 95 / 100, 2), "netWtAfterPurity = net * ltv%")
+    eq(float(o["netWtAfterPurity"]), G._round_half_up(float(o["netWeight"]) * 95 / 100, 2),
+       "netWtAfterPurity = net * ltv%, rounded half-up like the server (a tie like 28.215 -> 28.22)")
     eq(s.ornaments_total_nwap, 100.0, "total net weight kept from the response")
 
 @test("server-values: a stated stamp duty of 0 is used as stated for every partner")
@@ -3506,6 +3507,14 @@ def _():
            "the WebP-in-.png file is left out; real PNG / JPEG stay")
     for name in ("dummy_image.png",):
         ok(s._image_content_matches(os.path.join(ROOT, "assets", name)), f"assets/{name} is a real PNG")
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "clean.pdf"), "wb") as fh:
+            fh.write(b"%PDF-1.4\n1 0 obj << /OpenAction 2 0 R /AA << >> >> endobj\n%%EOF")
+        with open(os.path.join(d, "jpeg-bytes.pdf"), "wb") as fh:
+            fh.write(b"%PDF-1.4\nstream\n\xff\xd8 ab/Js9 \nendstream\n%%EOF")
+        s.ASSETS_DIR = d
+        eq([os.path.basename(p) for p in s.asset_pool("pdf")], ["clean.pdf"],
+           "a PDF with '/js' anywhere in its bytes (any case) is left out; /OpenAction, /AA pass")
     close(s)
 
 @test("upload-docs: a stamp-paper stamp duty sends the stamp paper copy")
@@ -3513,6 +3522,23 @@ def _():
     body = run_loan_documents(single_loan(stampDutyDefinitionType="stampPaper"))
     ok(body["stampPaperCopy"] and body["stampPaperCopyFullUrl"], "stamp paper copy sent")
 
+
+@test("bank: renewal without top-up / part release need no bank account; top-up / renewal-topup do")
+def _():
+    f = G.repayment_bank_not_needed
+    renew = {"isNewLoanFromRenew": True}
+    ok(f(renew), "renewal, no new amount: dummy details (penny-drop skipped too)")
+    ok(f(renew, 0.0), "renewal, nothing to pay: dummy")
+    ok(f({"isNewLoanFromPartRelease": True}), "part release: dummy")
+    eq(f({}), "", "fresh loan: real bank details")
+    eq(f({"isNewLoanFromTopUp": True}, 145954.52), "", "top-up: real bank details")
+    rt = {"isNewLoanFromRenew": True, "isTopUpAdded": True}
+    eq(f(rt), "", "renewal-topup before the amount is known: penny-drop runs")
+    eq(f(rt, 50000.0), "", "renewal-topup paying the top-up: real bank details")
+    ok(f(rt, 0.0), "renewal-topup with nothing left to pay: dummy")
+    payout = {"isNewLoanFromRenew": True, "isLoanAmountToDisbursed": True}
+    eq(f(payout, 1000.0), "", "renewal that disburses an amount: real bank details")
+    ok(f(payout, 0.0), "... unless nothing is left to pay")
 
 # --------------------------------------------------------------------------------------------
 # GROUP: repayment -- renewal / top-up / part & full release (gold_loan/repayment.py)
@@ -3602,6 +3628,20 @@ def _():
     eq((lock[2], lock[3]["loanStageId"]), ("tok-admin", "renewLoan"), "admin locks the renewLoan stage")
     eq(put[3], {"loanRenewalId": 2930, "amountStatus": "completed", "utrNumber": "UTR1"},
        "only the enabled controls are sent")
+    close(s)
+
+@test("repayment: an approved request (gone from the default list) is found under amountStatus=completed")
+def _():
+    row = {"id": 2252, "masterLoanId": 12284, "amountStatus": "completed", "fullReleaseStatus": "pending",
+           "masterLoan": {"customer": {"customerUniqueId": "MWUFG9A5"}}}
+    def respond(method, path, token, body):
+        if path.startswith("/api/jewellery-release/full-release?"):
+            return {"data": [row] if "amountStatus=completed" in path else []}
+        return {"message": "Success"}
+    s, r, calls = repayment(responder=respond)
+    r.scenario = "full-release"
+    got = asyncio.run(quiet_async(r.find_request))
+    eq(got["id"], 2252, "found in the approved list")
     close(s)
 
 def quiet_async(fn, *a):
@@ -3881,6 +3921,12 @@ def _():
         return stage_record("disbursement pending", 4)["data"]
     s._loan_record = open_record
     eq(asyncio.run(quiet_async(s._loan_already_complete, "x")), False, "a fresh loan carries on")
+    async def submit_record():
+        return stage_record("submit packet", 11)["data"]
+    s._loan_record = submit_record
+    eq(asyncio.run(quiet_async(s._loan_already_complete, "x", True)), True,
+       "part release with nothing to pay: at 'submit packet' disbursement is not needed")
+    eq(asyncio.run(quiet_async(s._loan_already_complete, "x")), False, "... but submit packet still runs")
     close(s)
 
 @test("repayment: bank details pays out only the TOP-UP on a top-up loan (portal toBePaid rule)")

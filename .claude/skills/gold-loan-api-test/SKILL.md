@@ -358,6 +358,36 @@ Migrated to `/api/kyc/v2/*` (stage A of `gold-loan-e2e-flow.har`). `_run_full_ky
 ## KYC flow — domain rules learned the hard way
 
 - **Manual-validation fallback:** on the real UI, after aadhaar/PAN auto-verification fails 3×, the system accepts any number. The harness relies on this — it does NOT call `customer-kyc-address` (that endpoint auto-verifies and rejects). `save_customer_address` is **prepare-only**; KYC is submitted via `submit_all_kyc_info` (the manual path).
+- **Bank details on repayment loans (user, 24 Nov)** = BankDetailsComponent.calculateToBePaidAmount:
+  `isNewLoanFromPartRelease`, or `isNewLoanFromRenew` with no `isTopUpAdded` (and not
+  `isLoanAmountToDisbursed` with toBePaid > 0) -> addDummyDetails (TO PAID ZERO / 100000000000 /
+  AUGM0000000, isDummyDetails true, no passbook), no penny-drop (`validate_account` skips), no ops
+  manual bank verification. Renewal+top-up / top-up keep the real account unless toBePaid <= 0.
+  `repayment_bank_not_needed(master, to_be_paid=None, upfront)` returns the reason or ''. Live UAT:
+  renewal AUGM-07052 -> AUGM-32556 passed with dummy details, 0 failed calls.
+- **Renewal / part-release scheme step = portal checkForLoanType (24 Nov):** `check_loan_type` first runs
+  `_repayment_scheme_step()`: when masterLoan.isNewLoanFromRenew / isNewLoanFromPartRelease it keeps
+  scheme/partner/co-lender/processingCharge from single-loan, GETs `renewal/renewal-interest-data?
+  masterLoanId&securedSchemeId&topUpAmount` (res.data; topUpAmount = masterLoan.topUpAmount when
+  isTopUpAdded) or `jewellery-release/part-release-interest-data?masterLoanId&securedSchemeId`
+  (res.calculationData), patches loanAmount/tenure/rate/dates/secured+top-up split/upfront/manual
+  charges/rpg, and sets `renewal_top_up` -> interest table + final-loan-details `topUpAmount`.
+  Before, the fresh-loan path sent topUpAmount 0 and the server CLEARED the top-up (AUGM-74846: nothing
+  disbursed). Bureau: renewal -> RENEWAL_TOP_UP only with a top-up; part release -> none.
+  Live UAT: renewal-topup AUGM-74846 -> AUGM-36422 paid 110982.48 by NEFT to the real account;
+  renewal AUGM-36422 -> AUGM-71294 (amount 510982.48, dummy bank); TEST part release BANG-11225 -> BANG-02156.
+- **Part release, nothing to pay:** partner approval moves the loan to stage 11 "submit packet";
+  `disburse_amount` -> `_loan_already_complete(step, past_disbursement=True)` (stages 5/10/11 too) skips
+  partner-wise-disbursement (else 400 "Loan Stage has been changed to: submit packet").
+- **Repayment request lists (UAT 24 Nov):** `/api/renewal`, `jewellery-release/part-release` and
+  `/full-release` show only amountStatus=pending by default; an approved request is listed under
+  `&amountStatus=completed` (amountStatus=approved/all -> 500). `_scan_requests` / `_parent_history`
+  read both (`LIST_FILTERS`) -- without it assign-releaser failed "request ... is not in the list".
+  Live UAT: full release AUGM-94965 closed, top-up AUGM-88948 -> AUGM-58454 (180883.94 by NEFT).
+- **Upload content checks (24 Nov):** 422 "File is not a valid PNG image" (assets/dummy_image.png was a
+  WebP; converted) and 422 "PDF contains active content" -- a case-insensitive raw-byte scan
+  (`mix all.pdf` only has '/js' inside JPEG data; /OpenAction and /AA pass). `asset_pool` skips both
+  kinds (`_image_content_matches`, `_pdf_upload_safe` / `PDF_ACTIVE_MARKERS`).
 - Masked aadhaar upload must use the real `assets/AADHAR.png` image (via `_upload_file(..., file_path_override=...)`) — a dummy PDF gives "Invalid identityProof file".
 - `initiate_kyc` is wrapped by **`_safe_initiate_kyc`** which swallows 400/404 "already submitted/initiated".
 - Existing-customer path uses item-level `id` from the appraiser-request list, NOT the nested customer id (that bug caused "Your loan already initiated").

@@ -883,8 +883,20 @@ Generated at runtime, in the project root (git-ignored): `loan_calc_debug.json`,
   confirmed live: the loan steps **after** KYC on the OVD path (where `panCardNumber` is null), and the
   `auto` Aadhaar rule (random 8 + real last 4) — the real PAN was already registered; run it with
   `--release-kyc-docs`.
-- **Deliberately not modelled** (webcam-only and edge paths): the "nothing to pay" dummy bank
-  details, geo-tagged webcam uploads, the auto-mode address taken from the Aadhaar XML, and the
+- **Repayment loans and bank details** (as the portal's bank-details screen): a **renewal without a
+  top-up** (only the loan period moves, no new amount) and a **part-release** loan need no bank
+  account -- the portal's dummy details ("TO PAID ZERO", `AUGM0000000`) are sent, with no penny-drop
+  and no ops bank verification. **Top-up** and **renewal + top-up** pay out new money, so they keep the
+  real account (dummy only if nothing is left to pay by bank). Rule: `repayment_bank_not_needed`.
+- **Scheme step on renewal / part-release loans** follows the portal: the scheme, partner, co-lender
+  and processing charge stay as the loan record has them, and the figures come from
+  `GET renewal/renewal-interest-data` (renewal, with the renewal's `topUpAmount`) or
+  `GET jewellery-release/part-release-interest-data` (part release) instead of check-loan-type.
+  final-loan-details then carries the renewal's top-up, so a renewal + top-up pays the top-up out.
+- **Upload content checks:** the upload API now rejects an image whose bytes are another format and a
+  PDF whose bytes contain `/js`-style "active content" markers (any case). Such files in `assets/` are
+  skipped with a `[WARN]` line (today: `mix all.pdf`, whose JPEG data happens to contain `/js`).
+- **Deliberately not modelled** (webcam-only and edge paths): geo-tagged webcam uploads, the auto-mode address taken from the Aadhaar XML, and the
   date-of-birth / gender prefills from `e-kyc/data`.
 - For the deep "why", the hard-won domain rules, and per-endpoint gotchas, read
   `.claude/skills/gold-loan-api-test/SKILL.md`.

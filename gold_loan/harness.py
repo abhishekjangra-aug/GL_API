@@ -265,6 +265,8 @@ class GoldLoanApiTest:
         # check-loan-type outputs the portal patches into the interest calculator
         self.secured_loan_amount = None
         self.secured_top_up_amount = 0
+        self.renewal_top_up = 0.0         # a renewal loan's topUpAmount (masterLoan), sent as topUpAmount
+        self.repayment_kind = ""          # 'renewal' / 'part-release' when the scheme step used its interest data
         self.unsecured_top_up_amount = 0
         self.manual_charges = []
         self.auto_assigned_co_lender_id = None  # check-loan-type's default co-lender (portal autoAssignedCoLenderBank)
@@ -1926,10 +1928,32 @@ class GoldLoanApiTest:
                   f"(content does not match the extension); it is not used for uploads.")
         return False
 
+    # The upload API refuses a PDF with "active content (JavaScript/actions/embedded files)" (422).
+    # Its scan is a case-insensitive search of the raw bytes: TEST 24 Nov refused assets/mix all.pdf,
+    # which has no script at all -- only '/js' inside its JPEG image data -- while /OpenAction
+    # (sample_pdf.pdf) and /AA (LIP.pdf) pass. Such PDFs are left out of the pool.
+    PDF_ACTIVE_MARKERS = (b"/js", b"/javascript", b"/launch", b"/embeddedfile", b"/richmedia")
+
+    def _pdf_upload_safe(self, path: str) -> bool:
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read().lower()
+        except OSError:
+            return False
+        found = [m.decode() for m in self.PDF_ACTIVE_MARKERS if m in raw]
+        if not found:
+            return True
+        if path not in self._skipped_assets:
+            self._skipped_assets.add(path)
+            print(f"[WARN] assets/{os.path.basename(path)} contains {found} in its bytes; the upload API "
+                  "refuses it as active content, so it is not used for uploads.")
+        return False
+
     def asset_pool(self, kind: str) -> list:
         """Files in assets/ usable for an upload of `kind`, read fresh each time so new files are
-        picked up: 'pdf' = every PDF; 'image' = every image except the reserved identity / bank
-        images and the packet photos; 'packet' = the packet photos (falls back to 'image')."""
+        picked up: 'pdf' = every PDF the upload API accepts; 'image' = every real image except the
+        reserved identity / bank images and the packet photos; 'packet' = the packet photos (falls
+        back to 'image')."""
         try:
             names = sorted(os.listdir(self.ASSETS_DIR))
         except OSError:
@@ -1937,7 +1961,7 @@ class GoldLoanApiTest:
         def full(n):
             return os.path.join(self.ASSETS_DIR, n)
         if kind == "pdf":
-            pool = [full(n) for n in names if n.lower().endswith(".pdf")]
+            pool = [full(n) for n in names if n.lower().endswith(".pdf") and self._pdf_upload_safe(full(n))]
         else:
             images = [n for n in names if n.lower().endswith(self.IMAGE_EXTENSIONS)
                       and n.lower() not in self.RESERVED_ASSETS and self._image_content_matches(full(n))]
@@ -5414,8 +5438,98 @@ class GoldLoanApiTest:
               f"(partner: {scheme.get('_partnerName')}).")
 
 
+    async def _repayment_scheme_step(self) -> bool:
+        """InterestCalculatorComponent for a loan opened by a renewal / renewal-top-up / part release
+        (masterLoan.isNewLoanFromRenew / isNewLoanFromPartRelease). The portal does NOT pick a scheme
+        or call check-loan-type for these: scheme, partner, co-lender and processing charge stay as
+        the loan record has them, and checkForLoanType reads the renewal's own figures instead --
+          renewal:      GET renewal/renewal-interest-data?masterLoanId&securedSchemeId&topUpAmount
+                        (topUpAmount = masterLoan.topUpAmount; 0 for a plain renewal) -> res.data
+          part release: GET jewellery-release/part-release-interest-data?masterLoanId&securedSchemeId
+                        -> res.calculationData
+        interestCalculation then patches the calculator from it (loanAmount, tenure, rate, dates,
+        secured / top-up split, upfront interest, manual charges, rpg) -- the processing charge is NOT
+        replaced for these loans. final-loan-details later sends topUpAmount = the renewal's top-up.
+        Re-running the fresh-loan path here sent topUpAmount 0 and the server dropped the renewal's
+        top-up (UAT 24 Nov, AUGM-74846: isTopUpAdded true -> false, nothing disbursed).
+        Returns False for any other loan."""
+        self.repayment_kind, self.renewal_top_up = "", 0.0
+        if not self.loan_id:
+            return False
+        record = await self._loan_record()
+        master = record.get("masterLoan") or {}
+        renew, part = bool(master.get("isNewLoanFromRenew")), bool(master.get("isNewLoanFromPartRelease"))
+        if not (renew or part) or not record.get("schemeId"):
+            return False
+
+        def num(v, default=0.0):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return default
+        self.scheme_id = str(record["schemeId"])
+        self.partner_id = str(record.get("partnerId") or self.partner_id or "")
+        bank = master.get("loanCoLenderBank") or {}
+        self.co_lender_bank_id = str(bank["id"]) if bank.get("id") else ""
+        self.auto_assigned_co_lender_id = None        # nothing to override: the co-lender is fixed
+        self.secured_processing_charge = num(record.get("processingCharge"), num(master.get("processingCharge")))
+        if record.get("posExposureAgainstScheme") is not None:
+            self.secured_exposure = str(record["posExposureAgainstScheme"])
+        if renew:
+            self.repayment_kind = "renewal"
+            self.renewal_top_up = num(master.get("topUpAmount")) if master.get("isTopUpAdded") else 0.0
+            path = (f"/api/renewal/renewal-interest-data?masterLoanId={self.master_loan_id}"
+                    f"&securedSchemeId={self.scheme_id}&topUpAmount={self._plain_amount(self.renewal_top_up)}")
+            answer = (await self._make_authenticated_request('GET', path)).json()
+            data = answer.get("data") if isinstance(answer, dict) else None
+        else:
+            self.repayment_kind = "part-release"
+            path = (f"/api/jewellery-release/part-release-interest-data?masterLoanId={self.master_loan_id}"
+                    f"&securedSchemeId={self.scheme_id}")
+            answer = (await self._make_authenticated_request('GET', path)).json()
+            data = answer.get("calculationData") if isinstance(answer, dict) else None
+        if not isinstance(data, dict):
+            raise RuntimeError(f"{path} returned no calculation data: {self._short_error_body(str(answer), 200)}")
+        self._diagnostics['repayment_interest_data'] = data
+        scheme = data.get("securedScheme") if isinstance(data.get("securedScheme"), dict) else {}
+        if scheme:
+            self.secured_scheme = self.selected_scheme = scheme
+        if scheme.get("rpg") is not None:
+            self.secured_rpg = num(scheme["rpg"])
+        if scheme.get("ltv") is not None:
+            self.secured_ltv = num(scheme["ltv"])
+        self.upfront_interest_amount = data.get("upfrontInterestAmount") or 0
+        if data.get("loanAmount") is not None:
+            self.final_loan_amount = num(data["loanAmount"])
+        if data.get("tenure"):
+            self.tenure_months = int(num(data["tenure"]))
+        if data.get("interestRate") is not None:
+            self.interest_rate = data["interestRate"]
+        self.secured_loan_amount = data.get("securedLoanAmount")
+        self.secured_top_up_amount = data.get("securedTopUpAmount") or 0
+        self.unsecured_top_up_amount = data.get("unsecuredTopUpAmount") or 0
+        if data.get("loanStartDate"):
+            self.loan_start_date = str(data["loanStartDate"])[:10]
+        if data.get("loanEndDate"):
+            self.loan_end_date = str(data["loanEndDate"])[:10]
+        self.manual_charges = [{"chargeName": c.get("chargeName"), "charges": c.get("charges")}
+                               if isinstance(c, dict) else c for c in (data.get("manualCharges") or [])]
+        print(f"{self.repayment_kind.capitalize()} loan: scheme {self.scheme_id} kept from the record "
+              f"(partner {self.partner_id}, processing charge {self.secured_processing_charge}); "
+              f"loan amount {self.final_loan_amount}, top-up {self.renewal_top_up}, tenure {self.tenure_months}, "
+              f"rate {self.interest_rate}, upfront interest {self.upfront_interest_amount}, rpg {self.secured_rpg}.")
+        return True
+
+    @staticmethod
+    def _plain_amount(value) -> str:
+        """110982.48 -> '110982.48', 0.0 -> '0' (as the portal's Number() prints it)."""
+        text = f"{float(value or 0):.2f}".rstrip("0").rstrip(".")
+        return text or "0"
+
     async def check_loan_type(self):
         api_path = "/api/loan-process/check-loan-type"
+        if await self._repayment_scheme_step():
+            return
         await self._fetch_partner_scheme_amount()  # Builds the candidate scheme pool.
 
         loan_amount_to_use = float(os.getenv("GOLD_LOAN_AMOUNT", "400000"))
@@ -5583,6 +5697,10 @@ class GoldLoanApiTest:
         it skips the check (part release, transfer, renewal without top-up)."""
         kind = (self.loan_type or "Fresh Loan").lower()
         top_up = float(self.secured_top_up_amount or 0) + float(self.unsecured_top_up_amount or 0)
+        if self.repayment_kind == "part-release":
+            return None
+        if self.repayment_kind == "renewal":       # checkBureau: topUp = the calculator's topUpAmount
+            return ("RENEWAL_TOP_UP", float(self.renewal_top_up)) if self.renewal_top_up > 0 else None
         if "part" in kind or "transfer" in kind:
             return None
         if "renewal" in kind:
@@ -5732,7 +5850,7 @@ class GoldLoanApiTest:
             "otherAmount": None,
             "loanTransferExtraAmount": None,
             "upfrontInterestAmount": self.upfront_interest_amount or 0,  # from check-loan-type
-            "topUpAmount": 0,
+            "topUpAmount": self.renewal_top_up or 0,   # a renewal's top-up (0 otherwise)
             "securedTopUpAmount": self.secured_top_up_amount,
             "unsecuredTopUpAmount": self.unsecured_top_up_amount,
             "manualCharges": self.manual_charges,   # check-loan-type manualCharges
@@ -5854,7 +5972,7 @@ class GoldLoanApiTest:
             "otherAmount": None,
             "loanTransferExtraAmount": None,
             "upfrontInterestAmount": self.upfront_interest_amount,  # from check-loan-type
-            "topUpAmount": 0,
+            "topUpAmount": self.renewal_top_up or 0,   # a renewal's top-up (0 otherwise)
             "securedTopUpAmount": self.secured_top_up_amount,
             "unsecuredTopUpAmount": self.unsecured_top_up_amount,
             "manualCharges": self.manual_charges,   # check-loan-type manualCharges
@@ -6103,6 +6221,36 @@ class GoldLoanApiTest:
                     receiptName=upload.get("originalname") or os.path.basename(receipt_file))
         print(f"Cash receipt {plan['receiptNumber'] or '(no number)'} issued and uploaded.")
 
+    @staticmethod
+    def repayment_bank_not_needed(master: dict, to_be_paid=None, upfront_interest=0.0) -> str:
+        """Why a renewal / part-release loan needs NO real bank account, or '' when it does.
+        BankDetailsComponent.calculateToBePaidAmount: a part-release loan, or a renewal with no
+        top-up (only the loan date moves, no new money) unless isLoanAmountToDisbursed with
+        something to pay, gets addDummyDetails() and no bank form; a renewal with a top-up
+        (renewal-topup) pays out the top-up and needs the account unless nothing is left to pay.
+        A top-up loan / fresh loan always shows the bank form here (its to-be-paid <= 0 case is
+        the cash rule in store_bank_details). `to_be_paid` None = not known yet (penny-drop
+        decides before the amount is computed)."""
+        master = master or {}
+        if master.get("isNewLoanFromPartRelease"):
+            return "part-release loan (no new money)"
+        if not master.get("isNewLoanFromRenew"):
+            return ""
+        top_up = bool(master.get("isTopUpAdded"))
+        payout = bool(master.get("isLoanAmountToDisbursed"))
+        known = to_be_paid is not None
+        if not top_up and (not payout or (known and to_be_paid <= 0)):
+            return "renewal without a top-up (only the loan period is extended, no new amount)"
+        if not known:
+            return ""
+        if to_be_paid > 0 and payout:
+            return ""
+        if top_up and to_be_paid <= 0:
+            return "renewal top-up with nothing left to pay by bank"
+        if not top_up and float(upfront_interest or 0) > 0:
+            return "renewal with upfront interest and no top-up"
+        return ""
+
     async def store_bank_details(self):
         api_path = "/api/loan-process/bank-details"
         # ARVOG: the server's stamp duty must be known before toBePaid is computed below.
@@ -6184,7 +6332,11 @@ class GoldLoanApiTest:
             print(f"Advance cash {cash['advanceCash']} (appraiser charges {cash['appraiserCharges']}); "
                   f"to be paid by bank {to_be_paid}.")
         self.cash_given = cash["advanceCash"]
-        self.bank_dummy_details = cash["advanceCash"] > 0 and to_be_paid <= 0
+        no_bank_reason = self.repayment_bank_not_needed(master, to_be_paid, upfront_interest)
+        self.bank_dummy_details = bool(no_bank_reason) or (cash["advanceCash"] > 0 and to_be_paid <= 0)
+        if no_bank_reason:
+            print(f"Bank details not needed: {no_bank_reason} -- sending the portal's dummy details "
+                  "(TO PAID ZERO / AUGM0000000), no account or passbook.")
         if self.bank_dummy_details:
             # addDummyDetails(): nothing goes by bank, so the portal fills a placeholder account
             # and no passbook proof.
@@ -6547,7 +6699,7 @@ class GoldLoanApiTest:
         detail record does not exist yet and the retried bank-details call is the real check.
         """
         if not force and self.bank_dummy_details:
-            print("Manual bank verification skipped: nothing is paid by bank (full cash, dummy details).")
+            print("Manual bank verification skipped: nothing is paid by bank (dummy bank details).")
             return
         if not force and self.bank_manually_verified and not self.bank_for_ops_approval:
             print("Manual bank verification skipped: account is already manually verified.")
@@ -7445,6 +7597,14 @@ class GoldLoanApiTest:
         if self.cash_amount_choice == "full":
             print("Penny-drop skipped: the whole loan is paid in cash (--cash-amount full).")
             return
+        try:
+            master = (await self._loan_record()).get("masterLoan") or {}
+        except httpx.HTTPStatusError:
+            master = {}
+        reason = self.repayment_bank_not_needed(master)
+        if reason:
+            print(f"Penny-drop skipped: {reason} -- the bank details are the portal's dummy ones.")
+            return
         api_path = "/api/loan-process/validate-account"
         # Passbook proof is a cheque IMAGE (PNG), matching the real call; penny-drop verifies by
         # account/IFSC, not the image. Upload it ONCE, not per candidate, and only when needed:
@@ -8098,7 +8258,7 @@ class GoldLoanApiTest:
             detail = await self.fetch_disbursement_bank_detail()
             await self.validate_account()          # HAR re-runs penny-drop before disbursing
             await self._partner_disbursement_status(detail)  # partner APPROVES, then disburses
-            if await self._loan_already_complete("Disbursement"):
+            if await self._loan_already_complete("Disbursement", past_disbursement=True):
                 return
             await self._post_partner_disbursement(detail)
         finally:
@@ -8107,16 +8267,27 @@ class GoldLoanApiTest:
     # A loan at one of these stages is finished (packet in branch / submitted / branch out /
     # collect packet).
     COMPLETED_STAGE_IDS = (12, 13, 14, 20)
+    # Stages a loan only reaches once it is disbursed (disbursed / check out / submit packet).
+    PAST_DISBURSEMENT_STAGE_IDS = (5, 10, 11)
 
-    async def _loan_already_complete(self, step: str) -> bool:
+    async def _loan_already_complete(self, step: str, past_disbursement: bool = False) -> bool:
         """True when the server already completed the loan, so `step` has nothing left to do.
 
         A RENEWAL loan moves no money and its packet never leaves the partner branch: the partner
         approval alone takes it to stage 13 "packet submitted" (live TEST, loan 14298), and
-        partner-wise-disbursement then answers 400 "Packet has already been submitted"."""
+        partner-wise-disbursement then answers 400 "Packet has already been submitted".
+        `past_disbursement`: also True once the loan is past disbursement -- a part-release loan
+        with nothing to pay by bank goes from the partner approval straight to stage 11 "submit
+        packet" (live TEST 24 Nov, loan 14581), and partner-wise-disbursement then answers 400
+        "Loan Stage has been changed to: submit packet"."""
         master = (await self._loan_record()).get('masterLoan') or {}
         stage_id = master.get('loanStageId')
-        if master.get('isLoanCompleted') or stage_id in self.COMPLETED_STAGE_IDS:
+        try:
+            stage_id = int(stage_id) if stage_id is not None else None
+        except (TypeError, ValueError):
+            pass
+        done = self.COMPLETED_STAGE_IDS + (self.PAST_DISBURSEMENT_STAGE_IDS if past_disbursement else ())
+        if master.get('isLoanCompleted') or stage_id in done:
             stage = (master.get('loanStage') or {}).get('name') or stage_id
             print(f"{step} not needed: the server already completed this loan (stage {stage}).")
             return True
@@ -8729,7 +8900,7 @@ class GoldLoanApiTest:
         "secured_exposure", "secured_rebate_interest", "loan_start_date", "loan_end_date",
         "max_loan_limit", "min_loan_amount", "max_loan_amount", "purpose_id", "purpose_type",
         "nominee_relation_id", "ornament_type_id", "karat_id", "reference_code",
-        "lead_converter_id", "cash_given", "bank_dummy_details", "reuploaded_cpv",
+        "lead_converter_id", "cash_given", "bank_dummy_details", "reuploaded_cpv", "renewal_top_up", "repayment_kind",
     )
 
     def _reset_for_next_loan(self) -> None:
